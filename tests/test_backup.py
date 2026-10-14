@@ -12,12 +12,13 @@ from common import (
     ChecksumError,
     Config,
     RemoteCommandError,
+    backup_id,
     checksum_name,
     db_archive_name,
     files_archive_name,
     parse_sha256sum_output,
     staging_dir_for,
-    utc_timestamp,
+    WPSSHBackupError,
 )
 from tests.fakes import FakeSSHClient
 
@@ -32,6 +33,7 @@ def make_config(tmp_path: Path, **overrides: str) -> Config:
         "ssh_user": "user",
         "ssh_key_path": None,
         "ssh_password": None,
+        "ssh_known_hosts": None,
         "wp_site_root": SITE_ROOT,
         "wp_cli_path": None,
         "backup_dir": tmp_path / "backups",
@@ -127,6 +129,48 @@ def test_create_db_dump_mysqldump_failure_removes_cnf(
     assert cnf_path not in client.remote_fs
 
 
+def test_create_db_dump_site_path_with_spaces(
+    tmp_path: Path, backup_dir: Path
+) -> None:
+    """Regression: a spaced site path must not break the trap action."""
+    spaced_root = "/home/user/my site/public_html"
+    client = FakeSSHClient(spaced_root, wp_cli=None)
+    config = make_config(tmp_path, wp_site_root=spaced_root)
+    staging = staging_dir_for(spaced_root, TS)
+    client.remote_fs[posixpath.join(spaced_root, "wp-config.php")] = (
+        "define( 'DB_NAME', 'wpdb' );\n"
+        "define( 'DB_USER', 'u' );\n"
+        "define( 'DB_PASSWORD', 'p' );\n"
+        "define( 'DB_HOST', 'localhost' );\n"
+    ).encode()
+
+    archive = backup.create_db_dump(client, config, staging, TS)
+
+    # The dump was produced and tarred despite the space in the path.
+    assert archive == db_archive_name(TS)
+    assert posixpath.join(staging, archive) in client.remote_fs
+    # The trap action reached the shell as ONE argument containing the
+    # quoted path, not as several broken arguments.
+    trap_commands = [c for c in client.commands if "trap" in c]
+    assert len(trap_commands) == 1
+    action = trap_commands[0].split("trap ", 1)[1].split(" EXIT")[0]
+    import shlex
+
+    words = shlex.split(f"trap {action} EXIT")
+    assert len(words) == 3
+    assert words[0] == "trap" and words[2] == "EXIT"
+    # Re-evaluating the action yields rm with the spaced path as one arg.
+    rm_words = shlex.split(words[1])
+    assert rm_words == [
+        "rm",
+        "-f",
+        posixpath.join(staging, f"my-{TS}.cnf"),
+    ]
+    # The credentials file was cleaned up.
+    cnf_path = posixpath.join(staging, f"my-{TS}.cnf")
+    assert cnf_path not in client.remote_fs
+
+
 # ---------------------------------------------------------------------------
 # Files archive creation
 # ---------------------------------------------------------------------------
@@ -159,7 +203,7 @@ def test_run_backup_files_only_round_trip(
     staging = staging_dir_for(SITE_ROOT, TS)
 
     local_paths = backup.run_backup(
-        client, config, include_files=True, include_database=False, ts=TS
+        client, config, include_files=True, include_database=False, bid=TS
     )
 
     archive = files_archive_name(TS)
@@ -184,7 +228,7 @@ def test_run_backup_database_only_round_trip(
     config = make_config(tmp_path)
 
     local_paths = backup.run_backup(
-        client, config, include_files=False, include_database=True, ts=TS
+        client, config, include_files=False, include_database=True, bid=TS
     )
 
     archive = db_archive_name(TS)
@@ -200,7 +244,7 @@ def test_run_backup_all_creates_both_archives(
     config = make_config(tmp_path)
 
     local_paths = backup.run_backup(
-        client, config, include_files=True, include_database=True, ts=TS
+        client, config, include_files=True, include_database=True, bid=TS
     )
 
     assert files_archive_name(TS) in local_paths
@@ -225,7 +269,7 @@ def test_run_backup_checksum_mismatch_keeps_staging(
 
     with pytest.raises(ChecksumError):
         backup.run_backup(
-            client, config, include_files=True, include_database=False, ts=TS
+            client, config, include_files=True, include_database=False, bid=TS
         )
 
     # Remote staging must be kept for retry.
@@ -242,17 +286,81 @@ def test_run_backup_remote_failure_removes_staging(
 
     with pytest.raises(RemoteCommandError):
         backup.run_backup(
-            client, config, include_files=True, include_database=False, ts=TS
+            client, config, include_files=True, include_database=False, bid=TS
         )
 
     assert not any(path.startswith(staging) for path in client.remote_fs)
 
 
-def test_run_backup_uses_provided_timestamp(
+def test_run_backup_invalid_wp_cli_path_removes_staging(
+    tmp_path: Path, backup_dir: Path
+) -> None:
+    """A base WPSSHBackupError (bad WP_CLI_PATH) must not leak staging."""
+    client = FakeSSHClient(SITE_ROOT, wp_cli=None)
+    config = make_config(tmp_path, wp_cli_path="/nonexistent/wp")
+    staging = staging_dir_for(SITE_ROOT, TS)
+
+    with pytest.raises(WPSSHBackupError, match="WP_CLI_PATH"):
+        backup.run_backup(
+            client, config, include_files=False, include_database=True, bid=TS
+        )
+
+    assert staging not in client.directories
+    assert not any(path.startswith(staging) for path in client.remote_fs)
+
+
+def test_run_backup_uses_provided_backup_id(
     tmp_path: Path, backup_dir: Path
 ) -> None:
     client = FakeSSHClient(SITE_ROOT)
     config = make_config(tmp_path)
-    ts = utc_timestamp()
-    backup.run_backup(client, config, True, False, ts)
-    assert files_archive_name(ts) in [p.name for p in backup_dir.iterdir()]
+    bid = backup_id()
+    backup.run_backup(client, config, True, False, bid)
+    assert files_archive_name(bid) in [p.name for p in backup_dir.iterdir()]
+
+
+def test_run_backup_staging_dir_is_exclusive(
+    tmp_path: Path, backup_dir: Path
+) -> None:
+    """A second run with the same id must fail, not share the staging dir."""
+    client = FakeSSHClient(SITE_ROOT)
+    config = make_config(tmp_path)
+    staging = staging_dir_for(SITE_ROOT, TS)
+
+    backup.run_backup(client, config, True, False, TS)
+    # The fake's bare mkdir now fails on an existing directory; simulate a
+    # second run that somehow derived the same staging dir.
+    client.directories.add(staging)
+
+    with pytest.raises(Exception, match="Could not create staging"):
+        backup.run_backup(client, config, True, False, TS)
+
+
+def test_main_reports_sftp_failure_as_error(
+    tmp_path: Path,
+    backup_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """An SFTP failure must print ERROR: and exit 1, not a traceback."""
+    import paramiko
+
+    client = FakeSSHClient(SITE_ROOT)
+    config = make_config(tmp_path)
+
+    def failing_open_sftp() -> object:
+        raise paramiko.SSHException("SFTP subsystem failed")
+
+    client.open_sftp = failing_open_sftp  # type: ignore[method-assign]
+    monkeypatch.setattr(backup, "load_config", lambda: config)
+    monkeypatch.setattr(backup, "connect", lambda cfg: client)
+    monkeypatch.setattr(
+        backup, "backup_id", lambda now=None: TS
+    )
+
+    exit_code = backup.main([])
+
+    assert exit_code == 1
+    err = capsys.readouterr().err
+    assert err.startswith("ERROR: ")
+    assert "SFTP subsystem failed" in err

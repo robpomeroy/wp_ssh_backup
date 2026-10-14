@@ -16,6 +16,8 @@ from pathlib import Path
 import pytest
 
 from common import (
+    allocate_remote_dir,
+    backup_id,
     checksum_name,
     connect,
     files_archive_name,
@@ -23,8 +25,6 @@ from common import (
     run_remote_cmd_checked,
     shquote,
     sha256_file,
-    staging_dir_for,
-    utc_timestamp,
     verify_local_checksum,
 )
 
@@ -58,18 +58,20 @@ def test_live_backup_and_restore_round_trip(
 ) -> None:
     """Full backup -> verify -> restore into a scratch directory."""
     client, config = live_client
-    ts = utc_timestamp()
-    staging = staging_dir_for(config.wp_site_root, ts)
+    bid = backup_id()
 
-    # A scratch directory to restore into, so the live site is untouched.
-    scratch_parent = posixpath.dirname(config.wp_site_root)
-    scratch = posixpath.join(scratch_parent, "restore-scratch")
-    run_remote_cmd_checked(client, f"mkdir -p {shquote(scratch)}")
+    # Exclusive remote directories: the allocator returns the only paths we
+    # may delete, so a pre-existing or foreign directory is never touched.
+    scratch = allocate_remote_dir(
+        client, config.wp_site_root, "restore-scratch-"
+    )
+    staging = allocate_remote_dir(
+        client, config.wp_site_root, "wp-ssh-backup-staging-"
+    )
 
     try:
         # --- Backup -------------------------------------------------------
-        run_remote_cmd_checked(client, f"mkdir -p {shquote(staging)}")
-        archive = files_archive_name(ts)
+        archive = files_archive_name(bid)
         run_remote_cmd_checked(
             client,
             f"tar czf {shquote(posixpath.join(staging, archive))} "
@@ -112,5 +114,6 @@ def test_live_backup_and_restore_round_trip(
         listing = run_remote_cmd_checked(client, f"ls {shquote(scratch)}")
         assert listing.strip(), "scratch directory should not be empty"
     finally:
+        # Delete only the paths the allocator returned.
         run_remote_cmd_checked(client, f"rm -rf {shquote(scratch)}")
         run_remote_cmd_checked(client, f"rm -rf {shquote(staging)}")

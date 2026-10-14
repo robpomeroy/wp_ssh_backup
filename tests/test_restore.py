@@ -17,6 +17,7 @@ from common import (
     db_archive_name,
     files_archive_name,
     staging_dir_for,
+    WPSSHBackupError,
     write_remote_file,
 )
 from tests.fakes import FakeSSHClient
@@ -32,6 +33,7 @@ def make_config(tmp_path: Path, **overrides: str) -> Config:
         "ssh_user": "user",
         "ssh_key_path": None,
         "ssh_password": None,
+        "ssh_known_hosts": None,
         "wp_site_root": SITE_ROOT,
         "wp_cli_path": None,
         "backup_dir": tmp_path / "backups",
@@ -42,9 +44,11 @@ def make_config(tmp_path: Path, **overrides: str) -> Config:
 
 
 def make_local_set(
-    backup_dir: Path, ts: str, wp_cli: bool = True
+    backup_dir: Path,
+    ts: str,
+    kinds: tuple[str, ...] = ("files", "db"),
 ) -> dict[str, Path]:
-    """Create a complete local backup set with valid checksums."""
+    """Create a local backup set with valid checksums for the given kinds."""
     import io
     import tarfile
 
@@ -61,16 +65,13 @@ def make_local_set(
                 tar.addfile(info, io.BytesIO(data))
         return buffer.getvalue()
 
-    if wp_cli:
+    if "files" in kinds:
         payloads[files_archive_name(ts)] = tarball(
             {"wp-config.php": b"<?php // site\n", "index.php": b"<?php\n"}
         )
+    if "db" in kinds:
         payloads[db_archive_name(ts)] = tarball(
             {f"wp-db-{ts}.sql": b"-- SQL dump\n"}
-        )
-    else:
-        payloads[files_archive_name(ts)] = tarball(
-            {"wp-config.php": b"<?php // site\n"}
         )
     for name, payload in payloads.items():
         path = backup_dir / name
@@ -127,11 +128,74 @@ def test_choose_set_no_sets(tmp_path: Path) -> None:
 
 def test_choose_set_missing_db_artifact(tmp_path: Path) -> None:
     backup_dir = tmp_path / "backups"
-    make_local_set(backup_dir, "20261014T0000Z", wp_cli=False)
+    make_local_set(backup_dir, "20261014T0000Z", kinds=("files",))
     sets = restore.list_backup_sets(backup_dir)
 
     with pytest.raises(MissingArtifactError, match="missing required"):
-        restore.choose_set(sets, None, True, True, backup_dir)
+        restore.choose_set(sets, "20261014T0000Z", False, True, backup_dir)
+
+
+def test_choose_set_files_skips_newer_db_only_set(tmp_path: Path) -> None:
+    """Regression: a newer db-only set must not block a files restore."""
+    backup_dir = tmp_path / "backups"
+    # Newer set: database only (the documented split schedules produce this).
+    make_local_set(backup_dir, "20261014T0900Z", kinds=("db",))
+    # Older set: files only.
+    make_local_set(backup_dir, "20261013T0000Z", kinds=("files",))
+    sets = restore.list_backup_sets(backup_dir)
+
+    chosen = restore.choose_set(sets, None, True, False, backup_dir)
+
+    assert restore.ts_of(chosen) == "20261013T0000Z"
+
+
+def test_choose_set_database_skips_newer_files_only_set(
+    tmp_path: Path,
+) -> None:
+    backup_dir = tmp_path / "backups"
+    # Newer set: files only.
+    make_local_set(backup_dir, "20261014T0900Z", kinds=("files",))
+    # Older set: database only.
+    make_local_set(backup_dir, "20261013T0000Z", kinds=("db",))
+    sets = restore.list_backup_sets(backup_dir)
+
+    chosen = restore.choose_set(sets, None, False, True, backup_dir)
+
+    assert restore.ts_of(chosen) == "20261013T0000Z"
+
+
+def test_choose_set_latest_matching_when_both_kinds_exist(
+    tmp_path: Path,
+) -> None:
+    backup_dir = tmp_path / "backups"
+    make_local_set(backup_dir, "20261012T0000Z")
+    make_local_set(backup_dir, "20261013T0000Z", kinds=("files",))
+    make_local_set(backup_dir, "20261014T0000Z")  # complete, newest
+    sets = restore.list_backup_sets(backup_dir)
+
+    chosen = restore.choose_set(sets, None, True, True, backup_dir)
+
+    assert restore.ts_of(chosen) == "20261014T0000Z"
+
+
+def test_choose_set_no_matching_candidates(tmp_path: Path) -> None:
+    backup_dir = tmp_path / "backups"
+    make_local_set(backup_dir, "20261014T0000Z", kinds=("files",))
+    sets = restore.list_backup_sets(backup_dir)
+
+    with pytest.raises(MissingArtifactError, match="No backup set contains"):
+        restore.choose_set(sets, None, False, True, backup_dir)
+
+
+def test_choose_set_explicit_timestamp_stays_strict(tmp_path: Path) -> None:
+    """An explicit timestamp must not fall back to an older complete set."""
+    backup_dir = tmp_path / "backups"
+    make_local_set(backup_dir, "20261014T0900Z", kinds=("files",))
+    make_local_set(backup_dir, "20261013T0000Z")  # complete, older
+    sets = restore.list_backup_sets(backup_dir)
+
+    with pytest.raises(MissingArtifactError, match="missing required"):
+        restore.choose_set(sets, "20261014T0900Z", False, True, backup_dir)
 
 
 # ---------------------------------------------------------------------------
@@ -147,7 +211,7 @@ def test_run_restore_files_round_trip(tmp_path: Path) -> None:
     staging = staging_dir_for(SITE_ROOT, "20261014T1000Z")
 
     restore.run_restore(
-        client, config, set_files, True, False, ts="20261014T1000Z"
+        client, config, set_files, True, False, staging_bid="20261014T1000Z"
     )
 
     # The files tarball's contents were extracted into the site root.
@@ -170,7 +234,7 @@ def test_run_restore_database_round_trip(tmp_path: Path) -> None:
     config = make_config(tmp_path)
 
     restore.run_restore(
-        client, config, set_files, False, True, ts="20261014T1000Z"
+        client, config, set_files, False, True, staging_bid="20261014T1000Z"
     )
 
     import_commands = [c for c in client.commands if "db import" in c]
@@ -190,7 +254,7 @@ def test_run_restore_mysqldump_fallback_uses_cnf(tmp_path: Path) -> None:
     ).encode()
 
     restore.run_restore(
-        client, config, set_files, False, True, ts="20261014T1000Z"
+        client, config, set_files, False, True, staging_bid="20261014T1000Z"
     )
 
     mysql_commands = [c for c in client.commands if "mysql " in c]
@@ -215,10 +279,39 @@ def test_run_restore_checksum_failure_removes_staging(tmp_path: Path) -> None:
 
     with pytest.raises(ChecksumError):
         restore.run_restore(
-            client, config, set_files, True, False, ts="20261014T1000Z"
+            client,
+            config,
+            set_files,
+            True,
+            False,
+            staging_bid="20261014T1000Z",
         )
 
     staging = staging_dir_for(SITE_ROOT, "20261014T1000Z")
+    assert not any(path.startswith(staging) for path in client.remote_fs)
+
+
+def test_run_restore_invalid_wp_cli_path_removes_staging(
+    tmp_path: Path,
+) -> None:
+    """A base WPSSHBackupError (bad WP_CLI_PATH) must not leak staging."""
+    backup_dir = tmp_path / "backups"
+    set_files = make_local_set(backup_dir, TS)
+    client = FakeSSHClient(SITE_ROOT, wp_cli=None)
+    config = make_config(tmp_path, wp_cli_path="/nonexistent/wp")
+
+    with pytest.raises(WPSSHBackupError, match="WP_CLI_PATH"):
+        restore.run_restore(
+            client,
+            config,
+            set_files,
+            False,
+            True,
+            staging_bid="20261014T1000Z",
+        )
+
+    staging = staging_dir_for(SITE_ROOT, "20261014T1000Z")
+    assert staging not in client.directories
     assert not any(path.startswith(staging) for path in client.remote_fs)
 
 
@@ -226,3 +319,77 @@ def test_write_remote_file_sets_mode_600(tmp_path: Path) -> None:
     client = FakeSSHClient(SITE_ROOT)
     write_remote_file(client.sftp, "/tmp/secret.cnf", "[client]\n", mode=0o600)
     assert client.sftp.modes["/tmp/secret.cnf"] == 0o600
+
+
+def test_main_reports_ssh_failure_as_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """An SSH failure during restore must print ERROR: and exit 1."""
+    import paramiko
+
+    backup_dir = tmp_path / "backups"
+    make_local_set(backup_dir, TS)
+    client = FakeSSHClient(SITE_ROOT, wp_cli="/usr/bin/wp")
+    config = make_config(tmp_path)
+
+    def failing_exec_command(
+        command: str, timeout: float | None = None
+    ) -> object:
+        raise paramiko.SSHException("transport died")
+
+    client.exec_command = failing_exec_command  # type: ignore[method-assign]
+    monkeypatch.setattr(restore, "load_config", lambda: config)
+    monkeypatch.setattr(restore, "connect", lambda cfg: client)
+
+    exit_code = restore.main([])
+
+    assert exit_code == 1
+    err = capsys.readouterr().err
+    assert err.startswith("ERROR: ")
+    assert "transport died" in err
+
+
+def test_import_database_site_path_with_spaces(tmp_path: Path) -> None:
+    """Regression: a spaced site path must not break the mysql trap action."""
+    import shlex
+
+    spaced_root = "/home/user/my site/public_html"
+    backup_dir = tmp_path / "backups"
+    set_files = make_local_set(backup_dir, TS)
+    client = FakeSSHClient(spaced_root, wp_cli=None)
+    config = make_config(tmp_path, wp_site_root=spaced_root)
+    client.remote_fs[posixpath.join(spaced_root, "wp-config.php")] = (
+        "define( 'DB_NAME', 'wpdb' );\n"
+        "define( 'DB_USER', 'u' );\n"
+        "define( 'DB_PASSWORD', 'p' );\n"
+        "define( 'DB_HOST', 'localhost' );\n"
+    ).encode()
+
+    restore.run_restore(
+        client,
+        config,
+        set_files,
+        False,
+        True,
+        staging_bid="20261014T1000Z",
+    )
+
+    staging = staging_dir_for(spaced_root, "20261014T1000Z")
+    # The trap action reached the shell as ONE argument containing the
+    # quoted cnf path, not as several broken arguments.
+    trap_commands = [c for c in client.commands if "trap" in c]
+    assert len(trap_commands) == 1
+    action = trap_commands[0].split("trap ", 1)[1].split(" EXIT")[0]
+    words = shlex.split(f"trap {action} EXIT")
+    assert len(words) == 3
+    assert words[0] == "trap" and words[2] == "EXIT"
+    # Re-evaluating the action yields rm with the spaced path as one arg.
+    cnf_path = posixpath.join(staging, f"my-{TS}.cnf")
+    assert shlex.split(words[1]) == ["rm", "-f", cnf_path]
+    # The import ran and the credentials file was cleaned up.
+    mysql_commands = [c for c in client.commands if "mysql " in c]
+    assert len(mysql_commands) == 1
+    assert "--defaults-extra-file" in mysql_commands[0]
+    assert cnf_path not in client.remote_fs

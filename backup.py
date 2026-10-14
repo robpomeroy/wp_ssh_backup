@@ -19,8 +19,8 @@ from common import (
     ChecksumError,
     Config,
     MissingArtifactError,
-    RemoteCommandError,
     WPSSHBackupError,
+    backup_id,
     checksum_name,
     connect,
     db_archive_name,
@@ -38,9 +38,9 @@ from common import (
     shquote,
     sftp_download,
     split_db_host,
-    write_remote_file,
     staging_dir_for,
-    utc_timestamp,
+    trap_rm_action,
+    write_remote_file,
     verify_local_checksum,
 )
 
@@ -138,7 +138,7 @@ def create_db_dump(
     # trap guarantees the credentials file is removed even if mysqldump fails.
     command = (
         f"cd {shquote(staging)} && "
-        f"trap 'rm -f {shquote(cnf_path)}' EXIT && "
+        f"trap {trap_rm_action(cnf_path)} EXIT && "
         f"mysqldump --defaults-extra-file={shquote(cnf_path)} "
         f"{shquote(settings['DB_NAME'])} > {shquote(dump_path)}"
     )
@@ -280,12 +280,46 @@ def verify_downloads(
 # ---------------------------------------------------------------------------
 
 
+def create_staging_dir(
+    client: paramiko.SSHClient, config: Config, bid: str
+) -> str:
+    """
+    Create this run's exclusive remote staging directory.
+
+    Uses a bare mkdir (no -p) so the command fails if the directory already
+    exists: two concurrent runs in the same minute have different backup ids
+    and therefore different directories, and a collision (astronomically
+    unlikely) aborts instead of sharing artifacts.
+
+    Args:
+        client: An active SSH client connected to the remote host.
+        config: The backup configuration.
+        bid: This run's backup identifier.
+
+    Returns:
+        The staging directory path.
+
+    Raises:
+        WPSSHBackupError: If the staging directory already exists.
+    """
+    staging = staging_dir_for(config.wp_site_root, bid)
+    code, _, err = run_remote_cmd(
+        client, f"mkdir {shquote(staging)}"
+    )
+    if code != 0:
+        raise WPSSHBackupError(
+            f"Could not create staging directory {staging}: "
+            f"{err.strip() or 'already exists?'}"
+        )
+    return staging
+
+
 def run_backup(
     client: paramiko.SSHClient,
     config: Config,
     include_files: bool,
     include_database: bool,
-    ts: str,
+    bid: str,
 ) -> dict[str, Path]:
     """
     Run the full backup flow; return local artifact paths by name.
@@ -296,30 +330,28 @@ def run_backup(
         include_files: Whether to include the WordPress files in the backup.
         include_database: Whether to include the WordPress database in the
             backup.
-        ts: A timestamp string used for naming the backup artifacts.
+        bid: This run's unique backup identifier.
 
     Returns:
         A dictionary mapping each archive and its checksum filename to the
         corresponding local Path object.
     """
-    staging = staging_dir_for(config.wp_site_root, ts)
+    staging = create_staging_dir(client, config, bid)
     backup_dir = config.backup_dir
-
-    run_remote_cmd_checked(client, f"mkdir -p {shquote(staging)}")
     print(f"Remote staging directory: {staging}")
 
     archive_names: list[str] = []
     try:
         if include_database:
             started = time.monotonic()
-            db_archive = create_db_dump(client, config, staging, ts)
+            db_archive = create_db_dump(client, config, staging, bid)
             archive_names.append(db_archive)
             elapsed = time.monotonic() - started
             print(f"Database archive created ({elapsed:.1f}s)")
 
         if include_files:
             started = time.monotonic()
-            files_archive = create_files_archive(client, config, staging, ts)
+            files_archive = create_files_archive(client, config, staging, bid)
             archive_names.append(files_archive)
             elapsed = time.monotonic() - started
             print(f"Files archive created ({elapsed:.1f}s)")
@@ -341,11 +373,13 @@ def run_backup(
         )
         raise
     except (
-        RemoteCommandError,
-        MissingArtifactError,
+        WPSSHBackupError,
         OSError,
         paramiko.SSHException,
     ):
+        # Any other failure — including base WPSSHBackupError raised by, for
+        # example, an invalid WP_CLI_PATH — must not leave staging behind.
+        # ChecksumError is handled above and keeps staging for retry.
         remove_remote_staging(client, staging)
         raise
 
@@ -381,7 +415,7 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         config = load_config()
-        ts = utc_timestamp()
+        bid = backup_id()
         client = connect(config)
     except WPSSHBackupError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
@@ -389,9 +423,11 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         local_paths = run_backup(
-            client, config, include_files, include_database, ts
+            client, config, include_files, include_database, bid
         )
-    except WPSSHBackupError as exc:
+    except (WPSSHBackupError, OSError, paramiko.SSHException) as exc:
+        # run_backup cleans up staging and re-raises transport/SFTP failures;
+        # report them here rather than letting them escape as a traceback.
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
     finally:
@@ -402,7 +438,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Pruned local backup sets: {', '.join(removed)}")
 
     total = sum(p.stat().st_size for p in local_paths.values())
-    print(f"Backup complete: {ts} ({human_size(total)} downloaded).")
+    print(f"Backup complete: {bid} ({human_size(total)} downloaded).")
     return 0
 
 

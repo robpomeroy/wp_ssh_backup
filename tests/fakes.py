@@ -98,6 +98,12 @@ class FakeSSHClient:
         self.wp_cli = wp_cli
         self.commands: list[str] = []
         self.fail_on: dict[str, int] = {}
+        self.directories: set[str] = set()
+        # Host-key simulation: the key the "server" presents, and the set of
+        # fingerprints the "client" already trusts.
+        self.server_key: object | None = None
+        self.trusted_fingerprints: set[str] = set()
+        self.connect_calls: list[dict] = []
 
     # -- paramiko API -------------------------------------------------------
 
@@ -106,6 +112,31 @@ class FakeSSHClient:
 
     def close(self) -> None:
         pass
+
+    def load_system_host_keys(self) -> None:
+        pass
+
+    def load_host_keys(self, filename: str) -> None:
+        pass
+
+    def set_missing_host_key_policy(self, policy: object) -> None:
+        self._policy = policy
+
+    def connect(self, **kwargs: object) -> None:
+        """Simulate the host-key check performed by paramiko.connect()."""
+        self.connect_calls.append(kwargs)
+        if self.server_key is None:
+            return
+        import paramiko
+
+        from common import fingerprint
+
+        fp = fingerprint(self.server_key)  # type: ignore[arg-type]
+        if fp not in self.trusted_fingerprints:
+            # Same message paramiko's RejectPolicy raises.
+            raise paramiko.SSHException(
+                "Server {!r} not found in known_hosts".format("fake")
+            )
 
     def exec_command(self, command: str, timeout: float | None = None):
         self.commands.append(command)
@@ -138,8 +169,12 @@ class FakeSSHClient:
             cwd = compound.group(1)
             command = compound.group(2)
 
+        if command.startswith("mkdir ") and not command.startswith(
+            "mkdir -p "
+        ):
+            return self._mkdir(command, stderr)
         if command.startswith("mkdir -p "):
-            return 0
+            return self._mkdir_p(command)
         if command.startswith("rm -rf "):
             return self._rm_rf(command)
         if command.startswith("rm -f "):
@@ -178,12 +213,33 @@ class FakeSSHClient:
     def _quoted(self, command: str) -> list[str]:
         return re.findall(r"'([^']*)'", command)
 
+    def _mkdir(self, command: str, stderr: io.BytesIO) -> int:
+        """Bare mkdir: fails if the directory already exists."""
+        target = re.search(r"mkdir\s+'([^']+)'", command)
+        if target:
+            path = target.group(1).rstrip("/")
+            if path in self.directories:
+                stderr.write(
+                    f"mkdir: cannot create directory {path!r}: "
+                    "File exists\n".encode()
+                )
+                return 1
+            self.directories.add(path)
+        return 0
+
+    def _mkdir_p(self, command: str) -> int:
+        target = re.search(r"mkdir -p\s+'([^']+)'", command)
+        if target:
+            self.directories.add(target.group(1).rstrip("/"))
+        return 0
+
     def _rm_rf(self, command: str) -> int:
         target = re.search(r"rm -rf\s+'([^']+)'", command)
         if target:
             prefix = target.group(1).rstrip("/") + "/"
             for path in [p for p in self.remote_fs if p.startswith(prefix)]:
                 del self.remote_fs[path]
+            self.directories.discard(target.group(1).rstrip("/"))
         return 0
 
     def _rm_f(self, command: str) -> int:

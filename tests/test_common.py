@@ -8,12 +8,17 @@ from pathlib import Path
 import pytest
 
 from common import (
+    ChecksumError,
     ConfigError,
+    RemoteCommandError,
+    backup_id,
+    backup_id_from_archive_name,
     checksum_name,
     find_backup_sets,
     human_size,
     load_config,
     mysql_client_config,
+    parse_backup_id,
     parse_sha256sum_output,
     parse_timestamp,
     parse_wp_config,
@@ -22,8 +27,10 @@ from common import (
     shquote,
     split_db_host,
     staging_dir_for,
-    timestamp_from_archive_name,
+    strip_php_comments,
+    trap_rm_action,
     utc_timestamp,
+    remove_remote_staging,
 )
 
 
@@ -57,6 +64,45 @@ def test_parse_wp_config_handles_escaped_quotes() -> None:
     assert settings["DB_PASSWORD"] == 's3cret"pass\'with quotes'
 
 
+def test_parse_wp_config_preserves_unknown_escapes() -> None:
+    """Regression: PHP keeps the backslash for unrecognised escapes."""
+    lines = [
+        "<?php",
+        r"define( 'DB_PASSWORD', 'p\q' );",
+        r"define( 'DB_NAME', 'db' );",
+        r"define( 'DB_USER', 'u' );",
+        r"define( 'DB_HOST', 'h' );",
+    ]
+    settings = parse_wp_config("\n".join(lines) + "\n")
+    assert settings["DB_PASSWORD"] == r"p\q"
+
+
+def test_parse_wp_config_single_quoted_escapes() -> None:
+    lines = [
+        "<?php",
+        r"define( 'DB_PASSWORD', 'a\'b\\c\"d' );",
+        r"define( 'DB_NAME', 'db' );",
+        r"define( 'DB_USER', 'u' );",
+        r"define( 'DB_HOST', 'h' );",
+    ]
+    settings = parse_wp_config("\n".join(lines) + "\n")
+    # \' -> ', \\ -> \\, but \" keeps its backslash in single quotes.
+    assert settings["DB_PASSWORD"] == "a'b\\c\\\"d"
+
+
+def test_parse_wp_config_double_quoted_escapes() -> None:
+    lines = [
+        "<?php",
+        r'define( "DB_PASSWORD", "a\tb\"q\$z\x41" );',
+        r'define( "DB_NAME", "db" );',
+        r'define( "DB_USER", "u" );',
+        r'define( "DB_HOST", "h" );',
+    ]
+    settings = parse_wp_config("\n".join(lines) + "\n")
+    # \t -> tab, \" -> ", \$ -> $, \x41 -> A.
+    assert settings["DB_PASSWORD"] == 'a\tb"q$zA'
+
+
 def test_parse_wp_config_missing_keys() -> None:
     settings = parse_wp_config("define( 'DB_NAME', 'only-name' );")
     assert settings == {"DB_NAME": "only-name"}
@@ -65,6 +111,94 @@ def test_parse_wp_config_missing_keys() -> None:
 def test_parse_wp_config_dynamic_values_ignored() -> None:
     settings = parse_wp_config("define( 'DB_USER', DB_USER_ENV );")
     assert "DB_USER" not in settings
+
+
+# ---------------------------------------------------------------------------
+# PHP comment handling
+# ---------------------------------------------------------------------------
+
+
+def test_parse_wp_config_commented_define_does_not_shadow_real() -> None:
+    """Regression: a commented-out define must not win the first-match race."""
+    text = (
+        "<?php\n"
+        "// define( 'DB_PASSWORD', 'old-password' );\n"
+        "define( 'DB_NAME', 'wp_database' );\n"
+        "define( 'DB_USER', 'wp_user' );\n"
+        "define( 'DB_PASSWORD', 'real-password' );\n"
+        "define( 'DB_HOST', 'localhost' );\n"
+    )
+    settings = parse_wp_config(text)
+    assert settings["DB_PASSWORD"] == "real-password"
+
+
+def test_parse_wp_config_block_commented_define_ignored() -> None:
+    text = (
+        "<?php\n"
+        "/*\n"
+        " * define( 'DB_PASSWORD', 'old-password' );\n"
+        " */\n"
+        "define( 'DB_PASSWORD', 'real-password' );\n"
+    )
+    settings = parse_wp_config(text)
+    assert settings["DB_PASSWORD"] == "real-password"
+
+
+def test_parse_wp_config_hash_commented_define_ignored() -> None:
+    text = (
+        "<?php\n"
+        "# define( 'DB_PASSWORD', 'old-password' );\n"
+        "define( 'DB_PASSWORD', 'real-password' );\n"
+    )
+    settings = parse_wp_config(text)
+    assert settings["DB_PASSWORD"] == "real-password"
+
+
+def test_parse_wp_config_value_containing_slashes_preserved() -> None:
+    """Comment-like text inside string literals must survive."""
+    text = (
+        "<?php\n"
+        "define( 'DB_PASSWORD', 'p//ss/*word' );\n"
+        "define( 'DB_NAME', 'db' );\n"
+        "define( 'DB_USER', 'u' );\n"
+        "define( 'DB_HOST', 'h' );\n"
+    )
+    settings = parse_wp_config(text)
+    assert settings["DB_PASSWORD"] == "p//ss/*word"
+
+
+def test_parse_wp_config_define_inside_string_ignored() -> None:
+    text = (
+        "<?php\n"
+        "$note = \"define( 'DB_PASSWORD', 'fake' );\";\n"
+        "define( 'DB_PASSWORD', 'real-password' );\n"
+    )
+    settings = parse_wp_config(text)
+    assert settings["DB_PASSWORD"] == "real-password"
+
+
+def test_strip_php_comments_preserves_strings_and_code() -> None:
+    source = (
+        "$a = 'keep // this';\n"
+        "// remove this\n"
+        "$b = \"keep /* this */ too\";\n"
+        "/* remove\nthis */ $c = 1;\n"
+    )
+    stripped, in_string = strip_php_comments(source)
+    assert "'keep // this'" in stripped
+    assert '"keep /* this */ too"' in stripped
+    assert "remove this" not in stripped
+    assert "remove\nthis" not in stripped
+    assert "$c = 1;" in stripped
+    # Positions of surviving string content are marked as in-string.
+    assert in_string[stripped.index("keep // this")] is True
+
+
+def test_strip_php_comments_escaped_quote_does_not_end_string() -> None:
+    source = r"$a = 'it\'s // not a comment';"
+    stripped, _ = strip_php_comments(source)
+    assert "not a comment" in stripped
+    assert "//" not in stripped.replace("'it\\'s // not a comment'", "")
 
 
 # ---------------------------------------------------------------------------
@@ -119,6 +253,23 @@ def test_utc_timestamp_format() -> None:
     assert utc_timestamp(now) == "20261014T0930Z"
 
 
+def test_backup_id_format_and_uniqueness() -> None:
+    now = datetime(2026, 10, 14, 9, 30, tzinfo=timezone.utc)
+    first = backup_id(now)
+    second = backup_id(now)
+    assert first.startswith("20261014T0930Z-")
+    assert len(first) == len("20261014T0930Z-") + 6
+    # Same minute, different runs -> different ids.
+    assert first != second
+    int(first.rsplit("-", 1)[1], 16)  # suffix is hex
+
+
+def test_parse_backup_id_with_and_without_suffix() -> None:
+    parsed = parse_backup_id("20261014T0930Z-a1b2c3")
+    assert parsed == datetime(2026, 10, 14, 9, 30, tzinfo=timezone.utc)
+    assert parse_backup_id("20261014T0930Z") == parsed
+
+
 def test_parse_timestamp_roundtrip() -> None:
     ts = "20261014T0930Z"
     parsed = parse_timestamp(ts)
@@ -128,8 +279,12 @@ def test_parse_timestamp_roundtrip() -> None:
 
 
 def test_staging_dir_is_sibling_of_site_root() -> None:
-    staging = staging_dir_for("/home/user/public_html", "20261014T0930Z")
-    assert staging == "/home/user/wp-ssh-backup-staging-20261014T0930Z"
+    staging = staging_dir_for(
+        "/home/user/public_html", "20261014T0930Z-a1b2c3"
+    )
+    assert staging == (
+        "/home/user/wp-ssh-backup-staging-20261014T0930Z-a1b2c3"
+    )
 
 
 def test_staging_dir_for_root_site() -> None:
@@ -138,19 +293,59 @@ def test_staging_dir_for_root_site() -> None:
 
 
 def test_archive_names() -> None:
-    ts = "20261014T0930Z"
-    assert checksum_name("wp-db-" + ts + ".tar.gz") == (
-        "wp-db-" + ts + ".tar.gz.sha256"
+    bid = "20261014T0930Z-a1b2c3"
+    assert checksum_name("wp-db-" + bid + ".tar.gz") == (
+        "wp-db-" + bid + ".tar.gz.sha256"
     )
-    assert timestamp_from_archive_name("wp-files-" + ts + ".tar.gz") == ts
-    assert timestamp_from_archive_name(
-        "wp-db-" + ts + ".tar.gz.sha256"
-    ) is None
-    assert timestamp_from_archive_name("random.txt") is None
+    assert backup_id_from_archive_name("wp-files-" + bid + ".tar.gz") == bid
+    assert (
+        backup_id_from_archive_name("wp-db-" + bid + ".tar.gz.sha256")
+        is None
+    )
+    assert backup_id_from_archive_name("random.txt") is None
+    # Legacy names without a run suffix still parse.
+    assert (
+        backup_id_from_archive_name("wp-db-20261014T0930Z.tar.gz")
+        == "20261014T0930Z"
+    )
 
 
 def test_shquote_escapes_single_quotes() -> None:
     assert shquote("/home/it's") == "'/home/it'\\''s'"
+
+
+def test_trap_rm_action_is_single_shell_word() -> None:
+    """'trap <action> EXIT' must parse as exactly three shell words."""
+    import shlex
+
+    action = trap_rm_action("/home/user/my cnf.cnf")
+    words = shlex.split(f"trap {action} EXIT")
+    assert len(words) == 3
+    assert words[0] == "trap"
+    assert words[2] == "EXIT"
+    # When the trap fires, the shell re-evaluates the action string; the
+    # path with its space must come out as ONE rm argument.
+    rm_words = shlex.split(words[1])
+    assert rm_words == ["rm", "-f", "/home/user/my cnf.cnf"]
+
+
+def test_trap_rm_action_escapes_quotes_in_path() -> None:
+    """A single quote in the path must survive both quoting layers."""
+    import shlex
+
+    action = trap_rm_action("/home/it's/my cnf")
+    words = shlex.split(f"trap {action} EXIT")
+    assert len(words) == 3
+    rm_words = shlex.split(words[1])
+    assert rm_words == ["rm", "-f", "/home/it's/my cnf"]
+
+
+def test_trap_rm_action_simple_path() -> None:
+    import shlex
+
+    action = trap_rm_action("/tmp/simple.cnf")
+    words = shlex.split(f"trap {action} EXIT")
+    assert shlex.split(words[1]) == ["rm", "-f", "/tmp/simple.cnf"]
 
 
 # ---------------------------------------------------------------------------
@@ -310,3 +505,90 @@ def test_human_size() -> None:
     assert human_size(1023) == "1023 B"
     assert human_size(1024) == "1.0 KiB"
     assert human_size(5 * 1024 * 1024) == "5.0 MiB"
+
+
+# ---------------------------------------------------------------------------
+# remove_remote_staging (best-effort cleanup)
+# ---------------------------------------------------------------------------
+
+
+class _RaisingClient:
+    """Stand-in whose exec_command raises the given exception."""
+
+    def __init__(self, exc: Exception) -> None:
+        self._exc = exc
+
+    def exec_command(self, command: str, timeout: float | None = None):
+        raise self._exc
+
+
+def test_remove_remote_staging_swallows_command_failure(
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """A failing rm command is reported as a warning, not raised."""
+    import common as _common
+
+    original = _common.run_remote_cmd_checked
+
+    def failing_checked(
+        cl: object, command: str, timeout: object = None
+    ) -> str:
+        raise RemoteCommandError(command, 1, "permission denied")
+
+    _common.run_remote_cmd_checked = failing_checked  # type: ignore
+    try:
+        client = _RaisingClient(RuntimeError("unused"))
+        remove_remote_staging(client, "/tmp/s")  # type: ignore[arg-type]
+    finally:
+        _common.run_remote_cmd_checked = original  # type: ignore
+    err = capsys.readouterr().err
+    assert "WARNING: could not remove remote staging" in err
+    assert "permission denied" in err
+
+
+def test_remove_remote_staging_swallows_transport_failure(
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """A dropped SSH connection must not raise from the cleanup path."""
+    import paramiko
+
+    client = _RaisingClient(paramiko.SSHException("connection dropped"))
+    remove_remote_staging(client, "/tmp/staging")  # type: ignore[arg-type]
+    err = capsys.readouterr().err
+    assert "WARNING: could not remove remote staging" in err
+    assert "connection dropped" in err
+
+
+def test_remove_remote_staging_swallows_oserror(
+    capsys: pytest.CaptureFixture,
+) -> None:
+    client = _RaisingClient(OSError("socket closed"))
+    remove_remote_staging(client, "/tmp/staging")  # type: ignore[arg-type]
+    err = capsys.readouterr().err
+    assert "WARNING: could not remove remote staging" in err
+    assert "socket closed" in err
+
+
+def test_original_error_survives_failed_cleanup(
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """The masking scenario: cleanup failure must not replace the error."""
+    import paramiko
+
+    client = _RaisingClient(paramiko.SSHException("connection dropped"))
+    try:
+        try:
+            raise ChecksumError("checksum mismatch for backup.tar.gz")
+        except ChecksumError:
+            # This is what run_backup's handler does on cleanup.
+            remove_remote_staging(
+                client, "/tmp/staging"  # type: ignore[arg-type]
+            )
+            raise
+    except ChecksumError as exc:
+        assert "checksum mismatch" in str(exc)
+        assert "connection dropped" not in str(exc)
+    else:
+        pytest.fail("original error was lost")
+    err = capsys.readouterr().err
+    assert "WARNING" in err

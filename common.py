@@ -7,10 +7,12 @@ restore.py.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import os
 import posixpath
 import re
+import secrets
 import sys
 import threading
 from dataclasses import dataclass
@@ -32,6 +34,10 @@ class WPSSHBackupError(Exception):
 
 class ConfigError(WPSSHBackupError):
     """Raised when .env configuration is missing or invalid."""
+
+
+class UnknownHostKeyError(WPSSHBackupError):
+    """Raised when the server presents a host key that is not trusted."""
 
 
 class RemoteCommandError(WPSSHBackupError):
@@ -69,6 +75,7 @@ class Config:
     ssh_user: str
     ssh_key_path: str | None
     ssh_password: str | None
+    ssh_known_hosts: str | None
     wp_site_root: str
     wp_cli_path: str | None
     backup_dir: Path
@@ -162,6 +169,7 @@ def load_config(env_file: str | os.PathLike | None = None) -> Config:
         ssh_user=os.getenv("SSH_USER", "").strip(),
         ssh_key_path=os.getenv("SSH_KEY_PATH", "").strip() or None,
         ssh_password=os.getenv("SSH_PASSWORD", "") or None,
+        ssh_known_hosts=os.getenv("SSH_KNOWN_HOSTS", "").strip() or None,
         wp_site_root=site_root.rstrip("/") or "/",
         wp_cli_path=os.getenv("WP_CLI_PATH", "").strip() or None,
         backup_dir=Path(os.getenv("BACKUP_DIR", "").strip()).expanduser(),
@@ -178,6 +186,11 @@ def connect(config: Config) -> paramiko.SSHClient:
     """
     Open an SSH connection using the configured credentials.
 
+    The server's host key must already be trusted: it is looked up in the
+    file named by SSH_KNOWN_HOSTS (if set) and in the user's system
+    known_hosts file. Unknown keys are rejected — see authorize_host.py for
+    provisioning the trust before the first connection.
+
     Args:
         config: The configuration object containing SSH connection details.
 
@@ -185,11 +198,21 @@ def connect(config: Config) -> paramiko.SSHClient:
         An active paramiko.SSHClient connected to the remote host.
 
     Raises:
-        WPSSHBackupError: If the SSH connection or authentication fails.
+        WPSSHBackupError: If the SSH connection or authentication fails, or
+            the server's host key is not trusted.
     """
     client = paramiko.SSHClient()
     client.load_system_host_keys()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    if config.ssh_known_hosts:
+        known_hosts_path = Path(config.ssh_known_hosts).expanduser()
+        if not known_hosts_path.is_file():
+            raise WPSSHBackupError(
+                f"SSH_KNOWN_HOSTS file not found: {known_hosts_path}. "
+                "Run authorize_host.py to create it."
+            )
+        client.load_host_keys(str(known_hosts_path))
+    # Unknown host keys are always rejected; there is no auto-add.
+    client.set_missing_host_key_policy(paramiko.RejectPolicy())
 
     kwargs: dict[str, object] = {
         "hostname": config.ssh_host,
@@ -214,8 +237,26 @@ def connect(config: Config) -> paramiko.SSHClient:
             "SSH authentication failed. Check SSH_USER, SSH_KEY_PATH and "
             "SSH_PASSWORD in .env."
         ) from exc
+    except paramiko.BadHostKeyException as exc:
+        client.close()
+        raise WPSSHBackupError(
+            f"HOST KEY MISMATCH for {exc.hostname}: the server presented a "
+            "different key than the trusted one. This can indicate a "
+            "man-in-the-middle attack, or a legitimate server rebuild. "
+            "Verify the new fingerprint out-of-band, then update the entry "
+            "with authorize_host.py."
+        ) from exc
     except paramiko.SSHException as exc:
         client.close()
+        message = str(exc)
+        rejected = "key was rejected" in message
+        not_found = "not found in known_hosts" in message
+        if rejected or not_found:
+            raise UnknownHostKeyError(
+                "The server's host key is not trusted. Run "
+                "'python authorize_host.py' to review and authorise it "
+                f"before connecting. ({message})"
+            ) from exc
         raise WPSSHBackupError(
             f"SSH connection to {config.ssh_host} failed: {exc}"
         ) from exc
@@ -398,35 +439,196 @@ def read_remote_file(sftp: paramiko.SFTPClient, remote_path: str) -> str:
 
 WP_DB_KEYS = ("DB_NAME", "DB_USER", "DB_PASSWORD", "DB_HOST")
 
+# Escape sequences PHP recognises, per string delimiter. Anything else
+# keeps its backslash, matching PHP's behaviour.
+_SINGLE_ESCAPES = {"'", "\\"}
+
+_DOUBLE_ESCAPES = {
+    "n": "\n",
+    "r": "\r",
+    "t": "\t",
+    "v": "\v",
+    "f": "\f",
+    "e": "\x1b",
+    "\\": "\\",
+    '"': '"',
+    "$": "$",
+}
+
 WP_DEFINE_RE = re.compile(
-    r"define\s*\(\s*['\"](?P<name>DB_[A-Za-z_]+)['\"]\s*,\s*"
+    r"\bdefine\s*\(\s*['\"](?P<name>DB_[A-Za-z_]+)['\"]\s*,\s*"
     r"(?P<q>['\"])(?P<value>(?:\\.|(?!(?P=q)).)*)(?P=q)\s*\)\s*;",
     re.DOTALL,
 )
 
 
-def _unescape_php(value: str) -> str:
+def strip_php_comments(source: str) -> tuple[str, list[bool]]:
     """
-    Unescape PHP string literals by converting escaped characters to their
-    literal form.
+    Remove PHP comments from source while preserving string literals.
+
+    A single pass tracks whether the scanner is inside a single- or
+    double-quoted string (honouring backslash escapes) or inside a line
+    ('//' or '#') or block ('/* ... */') comment. Comment openers are only
+    recognised in code, so comment-like text inside string literals — for
+    example a password containing '//' or '/*' — is preserved verbatim.
+    Each comment is replaced by a single space, mirroring the PHP
+    tokenizer, which treats comments as whitespace.
 
     Args:
-        value: The PHP string literal to unescape.
+        source: The PHP source text.
 
     Returns:
-        The unescaped string.
+        A tuple of (stripped, in_string): stripped is the source with
+        comments removed, and in_string[i] is True when stripped[i] lies
+        inside a string literal. Heredocs and the '?>' HTML mode are not
+        tracked; wp-config.php does not use them.
     """
-    return re.sub(r"\\(.)", r"\1", value)
+    out: list[str] = []
+    in_string: list[bool] = []
+    i = 0
+    n = len(source)
+    state = "code"
+    while i < n:
+        ch = source[i]
+        nxt = source[i + 1] if i + 1 < n else ""
+        if state == "code":
+            if ch == "'":
+                state = "single"
+                out.append(ch)
+                in_string.append(False)
+                i += 1
+            elif ch == '"':
+                state = "double"
+                out.append(ch)
+                in_string.append(False)
+                i += 1
+            elif ch == "/" and nxt == "/":
+                state = "line"
+                out.append(" ")
+                in_string.append(False)
+                i += 2
+            elif ch == "#":
+                state = "line"
+                out.append(" ")
+                in_string.append(False)
+                i += 1
+            elif ch == "/" and nxt == "*":
+                state = "block"
+                out.append(" ")
+                in_string.append(False)
+                i += 2
+            else:
+                out.append(ch)
+                in_string.append(False)
+                i += 1
+        elif state == "single" or state == "double":
+            quote = "'" if state == "single" else '"'
+            if ch == "\\" and nxt:
+                out.append(ch)
+                in_string.append(True)
+                out.append(nxt)
+                in_string.append(True)
+                i += 2
+            else:
+                if ch == quote:
+                    state = "code"
+                out.append(ch)
+                in_string.append(ch != quote)
+                i += 1
+        elif state == "line":
+            if ch == "\n":
+                state = "code"
+                out.append(ch)
+                in_string.append(False)
+            i += 1
+        else:  # block comment
+            if ch == "*" and nxt == "/":
+                state = "code"
+                i += 2
+            else:
+                i += 1
+    return "".join(out), in_string
+
+
+def _unescape_php(value: str, quote: str) -> str:
+    r"""
+    Decode PHP escape sequences in the raw text of a string literal.
+
+    PHP retains the backslash for escape sequences it does not recognise,
+    so 'p\q' denotes p\q rather than pq; only sequences PHP recognises
+    are decoded here. Single-quoted strings recognise only \' and \\;
+    double-quoted strings additionally recognise \n, \r, \t, \v, \f,
+    \e, \$, octal, hex and \u{...} sequences.
+
+    Args:
+        value: The raw text between the string delimiters.
+        quote: The delimiter the literal was written with (' or ").
+
+    Returns:
+        The decoded string value.
+    """
+    out: list[str] = []
+    i = 0
+    n = len(value)
+    while i < n:
+        ch = value[i]
+        if ch != "\\" or i + 1 >= n:
+            out.append(ch)
+            i += 1
+            continue
+        nxt = value[i + 1]
+        if quote == "'":
+            if nxt in _SINGLE_ESCAPES:
+                out.append(nxt)
+            else:
+                out.append(ch + nxt)
+            i += 2
+            continue
+        simple = _DOUBLE_ESCAPES.get(nxt)
+        if simple is not None:
+            out.append(simple)
+            i += 2
+            continue
+        if nxt == "x":
+            hexa = re.match(r"[0-9A-Fa-f]{1,2}", value[i+2:])
+            if hexa:
+                out.append(chr(int(hexa.group(0), 16)))
+                i += 2 + len(hexa.group(0))
+                continue
+        elif nxt == "u":
+            uni = re.match(r"\{[0-9A-Fa-f]+\}", value[i+2:])
+            if uni:
+                out.append(chr(int(uni.group(0)[1:-1], 16)))
+                i += 2 + len(uni.group(0))
+                continue
+        elif nxt in "01234567":
+            octal = re.match(r"[0-7]{1,2}", value[i+2:])
+            digits = 1 + (len(octal.group(0)) if octal else 0)
+            octal_value = int(value[i+1:i+1+digits], 8) % 256
+            out.append(chr(octal_value))
+            continue
+        # Unrecognised escape: PHP keeps the backslash.
+        out.append(ch + nxt)
+        i += 2
+    return "".join(out)
 
 
 def parse_wp_config(text: str) -> dict[str, str]:
     """
     Extract WordPress DB connection settings from wp-config.php source.
 
+    PHP comments are removed before definitions are selected, so a
+    commented-out define can no longer shadow the real one; comment-like
+    text inside string literals is preserved, so values containing '//' or
+    '/*' survive intact. A define appearing inside a string literal is not
+    treated as code.
+
     Note:
         Only literal string values are recognised; wp-config files that build
         values dynamically (e.g. from getenv) will yield missing keys, which
-        callers report as a clear error.
+        callers report as a clear error. Heredoc strings and the '?>' HTML
+        mode are not tracked. Escape sequences are decoded per PHP rules;
+        unrecognised escapes keep their backslash.
 
     Args:
         text: The content of the wp-config.php file as a string.
@@ -436,11 +638,16 @@ def parse_wp_config(text: str) -> dict[str, str]:
         being the setting names (e.g., "DB_NAME") and values being the
         corresponding values from the wp-config.php file.
     """
+    stripped, in_string = strip_php_comments(text)
     found: dict[str, str] = {}
-    for match in WP_DEFINE_RE.finditer(text):
+    for match in WP_DEFINE_RE.finditer(stripped):
+        if in_string[match.start()]:
+            continue
         name = match.group("name").upper()
         if name in WP_DB_KEYS and name not in found:
-            found[name] = _unescape_php(match.group("value"))
+            found[name] = _unescape_php(
+                match.group("value"), match.group("q")
+            )
     return found
 
 
@@ -545,6 +752,8 @@ def mysql_client_config(
 
 TS_FORMAT = "%Y%m%dT%H%MZ"
 TS_PATTERN = r"\d{8}T\d{4}Z"
+RUN_SUFFIX_RE = r"(?:-[0-9a-f]{6})?"
+BACKUP_ID_PATTERN = TS_PATTERN + RUN_SUFFIX_RE
 STAGING_PREFIX = "wp-ssh-backup-staging-"
 
 
@@ -561,6 +770,23 @@ def utc_timestamp(now: datetime | None = None) -> str:
     return (now or datetime.now(timezone.utc)).strftime(TS_FORMAT)
 
 
+def backup_id(now: datetime | None = None) -> str:
+    """
+    Return a unique backup identifier: UTC timestamp plus a random suffix.
+
+    The suffix makes concurrent runs in the same minute exclusive: each run
+    stages, transfers and names its artifacts independently, so two backups
+    can never overwrite or delete one another's files.
+
+    Args:
+        now: The current datetime. If None, the current UTC time is used.
+
+    Returns:
+        An identifier such as '20261014T0930Z-a1b2c3'.
+    """
+    return f"{utc_timestamp(now)}-{secrets.token_hex(3)}"
+
+
 def parse_timestamp(ts: str) -> datetime:
     """
     Parse a timestamp string produced by utc_timestamp().
@@ -574,22 +800,42 @@ def parse_timestamp(ts: str) -> datetime:
     return datetime.strptime(ts, TS_FORMAT).replace(tzinfo=timezone.utc)
 
 
-def staging_dir_for(site_root: str, ts: str) -> str:
+def parse_backup_id(bid: str) -> datetime:
+    """
+    Parse a backup identifier into its UTC datetime.
+
+    Accepts both plain timestamps ('20261014T0930Z') and identifiers with a
+    run suffix ('20261014T0930Z-a1b2c3'), so older backups without suffixes
+    remain valid.
+
+    Args:
+        bid: The backup identifier to parse.
+
+    Returns:
+        A datetime object representing the parsed UTC timestamp.
+    """
+    ts_part = bid.split("-", 1)[0]
+    return parse_timestamp(ts_part)
+
+
+def staging_dir_for(site_root: str, bid: str) -> str:
     """
     Sibling directory of the site root used to stage remote artifacts.
 
     A sibling (rather than a directory inside the site root) keeps the staging
     files out of the file tarball and on the same filesystem for fast tars.
+    The directory name embeds the backup identifier, making it exclusive to
+    one run.
 
     Args:
         site_root: The root directory of the WordPress site.
-        ts: The timestamp string to include in the staging directory name.
+        bid: The backup identifier to include in the directory name.
 
     Returns:
         The path to the staging directory.
     """
     parent = posixpath.dirname(site_root.rstrip("/")) or "/"
-    return posixpath.join(parent, STAGING_PREFIX + ts)
+    return posixpath.join(parent, STAGING_PREFIX + bid)
 
 
 def db_archive_name(ts: str) -> str:
@@ -632,19 +878,20 @@ def checksum_name(archive_name: str) -> str:
     return archive_name + ".sha256"
 
 
-def timestamp_from_archive_name(name: str) -> str | None:
+def backup_id_from_archive_name(name: str) -> str | None:
     """
-    Return the backup timestamp encoded in an archive filename.
+    Return the backup identifier encoded in an archive filename.
 
     Args:
         name: The name of the archive file.
 
     Returns:
-        The timestamp string if found, otherwise None.
+        The backup identifier (timestamp plus optional run suffix) if found,
+        otherwise None.
     """
     match = BACKUP_FILE_RE.match(name)
     if match and name.endswith(".tar.gz"):
-        return match.group("ts")
+        return match.group("bid")
     return None
 
 
@@ -717,7 +964,8 @@ def parse_sha256sum_output(text: str) -> dict[str, str]:
 # ---------------------------------------------------------------------------
 
 BACKUP_FILE_RE = re.compile(
-    r"^wp-(?P<kind>db|files)-(?P<ts>" + TS_PATTERN + r")\.tar\.gz(\.sha256)?$"
+    r"^wp-(?P<kind>db|files)-(?P<bid>" + BACKUP_ID_PATTERN + r")\.tar\.gz"
+    r"(\.sha256)?$"
 )
 
 
@@ -740,7 +988,7 @@ def find_backup_sets(backup_dir: Path) -> dict[str, list[Path]]:
             continue
         match = BACKUP_FILE_RE.match(path.name)
         if match:
-            sets.setdefault(match.group("ts"), []).append(path)
+            sets.setdefault(match.group("bid"), []).append(path)
     return sets
 
 
@@ -766,15 +1014,15 @@ def prune_local_backups(
     now_dt = now or datetime.now(timezone.utc)
     cutoff = now_dt - timedelta(days=retention_days)
     removed: list[str] = []
-    for ts, files in find_backup_sets(backup_dir).items():
+    for bid, files in find_backup_sets(backup_dir).items():
         try:
-            ts_dt = parse_timestamp(ts)
+            bid_dt = parse_backup_id(bid)
         except ValueError:
             continue
-        if ts_dt < cutoff:
+        if bid_dt < cutoff:
             for path in files:
                 path.unlink(missing_ok=True)
-            removed.append(ts)
+            removed.append(bid)
     return removed
 
 
@@ -816,18 +1064,71 @@ def remove_remote_staging(client: paramiko.SSHClient, staging: str) -> None:
     """
     Best-effort removal of the remote staging directory.
 
+    Transport failures (a dropped SSH connection raises OSError or
+    paramiko.SSHException) are caught as well as command failures, so a
+    cleanup problem can never replace the original error that triggered
+    the cleanup; it is reported as a warning instead.
+
     Args:
         client: An active Paramiko SSHClient connected to the remote host.
         staging: The path to the remote staging directory.
     """
     try:
         run_remote_cmd_checked(client, f"rm -rf {shquote(staging)}")
-    except WPSSHBackupError as exc:
+    except (WPSSHBackupError, OSError, paramiko.SSHException) as exc:
         print(
             "WARNING: could not remove remote staging directory "
             f"{staging}: {exc}",
             file=sys.stderr,
         )
+
+
+def allocate_remote_dir(
+    client: paramiko.SSHClient,
+    site_root: str,
+    prefix: str,
+    attempts: int = 5,
+) -> str:
+    """
+    Create an exclusive remote directory as a sibling of site_root.
+
+    The directory name is the prefix plus a fresh backup id, and it is
+    created with a bare mkdir so an existing directory is a collision
+    rather than shared use; on collision the allocation retries with a new
+    id. Callers must recursively delete only the returned path, never a
+    fixed name, so unrelated remote data cannot be destroyed.
+
+    Args:
+        client: An active Paramiko SSHClient connected to the remote host.
+        site_root: The directory the new directory is created alongside.
+        prefix: Name prefix for the directory; must not contain '/'.
+        attempts: How many distinct ids to try before giving up.
+
+    Returns:
+        The allocated directory path.
+
+    Raises:
+        WPSSHBackupError: If no exclusive directory could be created, or
+            the prefix contains '/'.
+    """
+    if "/" in prefix:
+        raise WPSSHBackupError(
+            f"Directory prefix must not contain '/': {prefix!r}"
+        )
+    parent = posixpath.dirname(site_root.rstrip("/")) or "/"
+    last_error = ""
+    for _ in range(max(1, attempts)):
+        candidate = posixpath.join(parent, prefix + backup_id())
+        code, _, err = run_remote_cmd(
+            client, f"mkdir {shquote(candidate)}"
+        )
+        if code == 0:
+            return candidate
+        last_error = err.strip()
+    raise WPSSHBackupError(
+        f"Could not allocate an exclusive remote directory under {parent} "
+        f"with prefix {prefix!r}: {last_error or 'target already exists'}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -846,6 +1147,61 @@ def shquote(path: str) -> str:
         The single-quoted path as a string.
     """
     return "'" + path.replace("'", "'\\''") + "'"
+
+
+def trap_rm_action(path: str) -> str:
+    """
+    Build a trap action that removes a file, quoted as one shell argument.
+
+    The path is single-quoted inside the action, and the complete action is
+    single-quoted again, so the shell hands trap exactly one argument and
+    re-evaluates it safely when the signal fires. Nesting the quotes the
+    other way round (quoting the action but letting the path's quotes
+    terminate it) splits the action into several arguments: trap then
+    rejects the bogus signal name, the cleanup never runs, and shell
+    metacharacters in the path would be re-evaluated.
+
+    Args:
+        path: The path of the file the trap should remove.
+
+    Returns:
+        A fully-quoted trap action, ready for 'trap <action> EXIT'.
+    """
+    return shquote(f"rm -f {shquote(path)}")
+
+
+def fingerprint(key: paramiko.PKey) -> str:
+    """
+    Return the OpenSSH-style SHA-256 fingerprint of a host key.
+
+    Args:
+        key: The paramiko host key object.
+
+    Returns:
+        A fingerprint string such as
+        'SHA256:7f9tLuJMScst0ObcMi3DVb+Rjy/S/lR+gSSHeZq7Pds'.
+    """
+    digest = hashlib.sha256(key.asbytes()).digest()
+    return "SHA256:" + base64.b64encode(digest).decode().rstrip("=")
+
+
+def known_hosts_entry(hostname: str, port: int, key: paramiko.PKey) -> str:
+    """
+    Build a known_hosts line for the given host and key.
+
+    Non-standard ports use the OpenSSH [host]:port form, matching how
+    paramiko looks up keys for them.
+
+    Args:
+        hostname: The host name or IP address.
+        port: The SSH port.
+        key: The host key object.
+
+    Returns:
+        A single known_hosts line ending with a newline.
+    """
+    name = hostname if port == 22 else f"[{hostname}]:{port}"
+    return f"{name} {key.get_name()} {key.get_base64()}\n"
 
 
 def human_size(num_bytes: int | float) -> str:

@@ -68,10 +68,58 @@ The following settings are read from the `.env` file:
 | `SSH_USER` | SSH user to log in as. |
 | `SSH_KEY_PATH` | Path to a private key file. Leave empty to use your SSH agent. |
 | `SSH_PASSWORD` | Optional password authentication. Prefer keys where possible. |
+| `SSH_KNOWN_HOSTS` | Optional path to a known_hosts file with trusted server keys. Leave empty to use `~/.ssh/known_hosts`. |
 | `WP_SITE_ROOT` | Absolute path to the WordPress root directory on the server. |
 | `WP_CLI_PATH` | Optional explicit path to `wp` if it is not on the server PATH. |
 | `BACKUP_DIR` | Local directory where backups are stored. |
 | `RETENTION_DAYS` | Delete local backup sets older than this many days (0 disables pruning). |
+
+## Host key verification
+
+WP SSH Backup **rejects servers whose host key is not already trusted** — it
+never silently accepts a new key. This protects your backups and database
+credentials from man-in-the-middle attacks.
+
+Before connecting to a server for the first time, authorise its host key:
+
+```bash
+python authorize_host.py
+```
+
+This connects to the bare SSH transport (no username, password or key file is
+sent — the server learns nothing about you beyond your IP), fetches the
+server's public host key and displays its SHA-256 fingerprint:
+
+```
+The fingerprint of example.com:22 is:
+    SHA256:7f9tLuJMScst0ObcMi3DVb+Rjy/S/lR+gSSHeZq7Pds
+```
+
+Compare this fingerprint against a trusted source — your hosting control panel,
+or the output of `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` run on the
+server itself — and type `y` to save it. The key is recorded in
+`~/.ssh/known_hosts` (or the file named by `SSH_KNOWN_HOSTS`), where the OpenSSH
+client and WP SSH Backup will both trust it.
+
+For scripted provisioning, pin the expected fingerprint instead of
+confirming interactively:
+
+```bash
+python authorize_host.py --fingerprint SHA256:7f9tLuJMScst0ObcMi3DVb+Rjy/S/lR+gSSHeZq7Pds
+```
+
+To display the fingerprint without saving anything:
+
+```bash
+python authorize_host.py --show
+```
+
+If you have already connected to the server with the `ssh` command, its key is
+already in your `~/.ssh/known_hosts` and no authorisation step is needed.
+
+If a connection later fails with a host key mismatch, the server's key has
+changed — either it was rebuilt, or something is impersonating it. Verify the
+new fingerprint out-of-band before re-authorising.
 
 ## Usage
 
@@ -92,8 +140,10 @@ often but you rarely upload new files.
 
 ### How a backup works
 
-1. A staging directory (`wp-ssh-backup-staging-<timestamp>`) is created as a
-   **sibling** of the WordPress site root on the server.
+1. A staging directory (`wp-ssh-backup-staging-<backup-id>`) is created as a
+   **sibling** of the WordPress site root on the server. The directory is
+   created with a bare `mkdir`, so it is exclusive to this run: concurrent
+   runs never share or overwrite one another's staging files.
 2. The database is dumped with WP-CLI (`wp db export`) if it is installed;
    otherwise the database credentials are read from `wp-config.php` and
    `mysqldump` is used. In the fallback path, credentials are passed via a
@@ -109,9 +159,13 @@ often but you rarely upload new files.
    deleted.
 7. Local backup sets older than `RETENTION_DAYS` are pruned.
 
-Backups are named `wp-db-<timestamp>.tar.gz` and `wp-files-<timestamp>.tar.gz`,
-where `<timestamp>` is in UTC in the form `20261014T0930Z`. A backup *set* is
-all the files sharing one timestamp.
+Backups are named `wp-db-<backup-id>.tar.gz` and `wp-files-<backup-id>.tar.gz`,
+where `<backup-id>` is a UTC timestamp plus a random run suffix, in the form
+`20261014T0930Z-a1b2c3`. The suffix makes each run's artifacts unique, so two
+backups started in the same minute cannot overwrite one another. A backup
+*set* is all the files sharing one backup id. Older backups created before
+this scheme (plain timestamps, no suffix) remain valid for restore and
+retention.
 
 ## Restoring
 
@@ -120,8 +174,13 @@ To restore from a backup set, run:
 python restore.py [--timestamp <ts>] [--files] [--database] [--all]
 ```
 
-- Without `--timestamp`, the most recent backup set is used.
+- Without `--timestamp`, the most recent backup set **containing the
+  requested artifacts** is used — so a newer database-only set does not block
+  restoring files from an older set (the split schedules below can produce
+  this).
 - `--files` / `--database` / `--all` select what to restore (default: both).
+- An explicit `--timestamp` is strict: the set must exist and contain the
+  requested artifacts; there is no fallback to older sets.
 
 The restore process uploads the chosen tarballs to the server, verifies their
 checksums there, extracts the files into `WP_SITE_ROOT` and imports the database
@@ -197,6 +256,8 @@ host or credentials are available there.
 ## Security notes
 
 - Prefer SSH key authentication over passwords.
+- Unknown SSH host keys are always rejected; authorise a server explicitly with
+  `authorize_host.py` before first use (see *Host key verification*).
 - Database credentials are never passed on remote command lines; they are
   supplied through a temporary option file that is deleted immediately after
   use.
