@@ -32,6 +32,7 @@ from common import (
     parse_sha256sum_output,
     prune_local_backups,
     read_wp_db_settings,
+    remove_remote_file,
     remove_remote_staging,
     run_remote_cmd,
     run_remote_cmd_checked,
@@ -145,8 +146,10 @@ def create_db_dump(
     try:
         run_remote_cmd_checked(client, command, timeout=1800)
     finally:
-        # Belt and braces: remove the cnf even if the shell above died oddly.
-        run_remote_cmd(client, f"rm -f {shquote(cnf_path)}")
+        # Belt and braces: remove the cnf even if the shell above died
+        # oddly. Best-effort: if the connection dropped, the removal must
+        # not mask the original mysqldump failure.
+        remove_remote_file(client, cnf_path)
 
     return tar_db_dump(client, staging, dump_name, ts)
 

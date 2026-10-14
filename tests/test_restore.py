@@ -100,6 +100,22 @@ def test_choose_set_latest_when_no_timestamp(tmp_path: Path) -> None:
     assert restore.ts_of(chosen) == "20261014T0000Z"
 
 
+def test_choose_set_ignores_newer_checksum_only_group(
+    tmp_path: Path,
+) -> None:
+    """An orphaned .sha256 group must not block a valid older set."""
+    backup_dir = tmp_path / "backups"
+    make_local_set(backup_dir, "20261013T0000Z")
+    # A newer checksum-only group: no archives, just orphaned checksums.
+    (backup_dir / "wp-db-20261014T0930Z.tar.gz.sha256").write_text("d  f\n")
+    (backup_dir / "wp-files-20261014T0930Z.tar.gz.sha256").write_text("d  f\n")
+    sets = restore.list_backup_sets(backup_dir)
+
+    chosen = restore.choose_set(sets, None, True, True, backup_dir)
+
+    assert restore.ts_of(chosen) == "20261013T0000Z"
+
+
 def test_choose_set_explicit_timestamp(tmp_path: Path) -> None:
     backup_dir = tmp_path / "backups"
     make_local_set(backup_dir, "20261013T0000Z")
@@ -196,6 +212,146 @@ def test_choose_set_explicit_timestamp_stays_strict(tmp_path: Path) -> None:
 
     with pytest.raises(MissingArtifactError, match="missing required"):
         restore.choose_set(sets, "20261014T0900Z", False, True, backup_dir)
+
+
+# ---------------------------------------------------------------------------
+# Timestamp resolution (full backup id or bare timestamp)
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_timestamp_accepts_full_backup_id(tmp_path: Path) -> None:
+    backup_dir = tmp_path / "backups"
+    make_local_set(backup_dir, "20261014T0930Z-a1b2c3")
+    sets = restore.list_backup_sets(backup_dir)
+
+    assert (
+        restore.resolve_timestamp(sets, "20261014T0930Z-a1b2c3")
+        == "20261014T0930Z-a1b2c3"
+    )
+
+
+def test_choose_set_with_full_backup_id(tmp_path: Path) -> None:
+    """Regression: the documented bare form must not be the only option."""
+    backup_dir = tmp_path / "backups"
+    make_local_set(backup_dir, "20261014T0930Z-a1b2c3")
+    sets = restore.list_backup_sets(backup_dir)
+
+    chosen = restore.choose_set(
+        sets, "20261014T0930Z-a1b2c3", True, True, backup_dir
+    )
+
+    assert restore.ts_of(chosen) == "20261014T0930Z-a1b2c3"
+
+
+def test_choose_set_with_bare_timestamp(tmp_path: Path) -> None:
+    """A bare timestamp resolves when exactly one set matches the minute."""
+    backup_dir = tmp_path / "backups"
+    make_local_set(backup_dir, "20261014T0930Z-a1b2c3")
+    make_local_set(backup_dir, "20261013T0000Z")
+    sets = restore.list_backup_sets(backup_dir)
+
+    chosen = restore.choose_set(sets, "20261014T0930Z", True, True, backup_dir)
+
+    assert restore.ts_of(chosen) == "20261014T0930Z-a1b2c3"
+
+
+def test_choose_set_with_bare_timestamp_legacy_set(tmp_path: Path) -> None:
+    """Bare timestamps also resolve legacy sets without a suffix."""
+    backup_dir = tmp_path / "backups"
+    make_local_set(backup_dir, "20261014T0930Z")
+    sets = restore.list_backup_sets(backup_dir)
+
+    chosen = restore.choose_set(sets, "20261014T0930Z", True, True, backup_dir)
+
+    assert restore.ts_of(chosen) == "20261014T0930Z"
+
+
+def test_resolve_timestamp_ambiguous_minute_lists_ids(
+    tmp_path: Path,
+) -> None:
+    """Several sets in one minute must be rejected with their full ids."""
+    backup_dir = tmp_path / "backups"
+    make_local_set(backup_dir, "20261014T0930Z-a1b2c3")
+    make_local_set(backup_dir, "20261014T0930Z-9f8e7d")
+    sets = restore.list_backup_sets(backup_dir)
+
+    with pytest.raises(MissingArtifactError) as excinfo:
+        restore.choose_set(sets, "20261014T0930Z", True, True, backup_dir)
+
+    message = str(excinfo.value)
+    assert "Several backup sets share the timestamp" in message
+    assert "20261014T0930Z-a1b2c3" in message
+    assert "20261014T0930Z-9f8e7d" in message
+
+
+def test_resolve_timestamp_unknown_value(tmp_path: Path) -> None:
+    backup_dir = tmp_path / "backups"
+    make_local_set(backup_dir, "20261014T0930Z-a1b2c3")
+    sets = restore.list_backup_sets(backup_dir)
+
+    with pytest.raises(MissingArtifactError, match="No backup set"):
+        restore.choose_set(sets, "20200101T0000Z", True, True, backup_dir)
+
+
+# ---------------------------------------------------------------------------
+# Default (no --timestamp) selection with same-minute sets
+# ---------------------------------------------------------------------------
+
+
+def test_latest_set_picks_newer_minute(tmp_path: Path) -> None:
+    """Sets in different minutes resolve by timestamp as before."""
+    backup_dir = tmp_path / "backups"
+    make_local_set(backup_dir, "20261014T0930Z-a1b2c3")
+    make_local_set(backup_dir, "20261014T0931Z-b2c3d4")
+    sets = restore.list_backup_sets(backup_dir)
+
+    chosen = restore.choose_set(sets, None, True, True, backup_dir)
+
+    assert restore.ts_of(chosen) == "20261014T0931Z-b2c3d4"
+
+
+def test_latest_set_rejects_same_minute_ambiguity(tmp_path: Path) -> None:
+    """Two complete sets in one minute must not be resolved by suffix."""
+    backup_dir = tmp_path / "backups"
+    make_local_set(backup_dir, "20261014T0930Z-ffffff")  # sorts "latest"
+    make_local_set(backup_dir, "20261014T0930Z-000000")
+    sets = restore.list_backup_sets(backup_dir)
+
+    with pytest.raises(MissingArtifactError) as excinfo:
+        restore.choose_set(sets, None, True, True, backup_dir)
+
+    message = str(excinfo.value)
+    assert "share the newest timestamp" in message
+    assert "20261014T0930Z-ffffff" in message
+    assert "20261014T0930Z-000000" in message
+    assert "Specify a full backup id" in message
+
+
+def test_latest_set_ignores_older_incomplete_set(tmp_path: Path) -> None:
+    """An older same-minute set missing artifacts does not block choice."""
+    backup_dir = tmp_path / "backups"
+    make_local_set(backup_dir, "20261014T0930Z-000000", kinds=("files",))
+    make_local_set(backup_dir, "20261014T0930Z-ffffff")
+    sets = restore.list_backup_sets(backup_dir)
+
+    chosen = restore.choose_set(sets, None, True, True, backup_dir)
+
+    assert restore.ts_of(chosen) == "20261014T0930Z-ffffff"
+
+
+def test_latest_set_ambiguity_only_among_candidates(
+    tmp_path: Path,
+) -> None:
+    """Same-minute sets lacking the requested artifacts are not candidates."""
+    backup_dir = tmp_path / "backups"
+    make_local_set(backup_dir, "20261014T0930Z-000000", kinds=("db",))
+    make_local_set(backup_dir, "20261014T0930Z-111111", kinds=("db",))
+    make_local_set(backup_dir, "20261014T0929Z-222222")
+    sets = restore.list_backup_sets(backup_dir)
+
+    chosen = restore.choose_set(sets, None, True, False, backup_dir)
+
+    assert restore.ts_of(chosen) == "20261014T0929Z-222222"
 
 
 # ---------------------------------------------------------------------------

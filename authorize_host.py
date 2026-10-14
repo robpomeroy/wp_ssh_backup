@@ -45,8 +45,12 @@ def fetch_host_key(config: Config) -> paramiko.PKey:
     Raises:
         WPSSHBackupError: If the transport cannot be established.
     """
-    transport = paramiko.Transport((config.ssh_host, config.ssh_port))
+    transport: paramiko.Transport | None = None
     try:
+        # Transport() performs socket creation and may raise OSError (e.g.
+        # DNS failure, connection refused) before start_client() is ever
+        # reached, so construction must happen inside the guarded block.
+        transport = paramiko.Transport((config.ssh_host, config.ssh_port))
         transport.start_client(timeout=30)
         return transport.get_remote_server_key()
     except (paramiko.SSHException, OSError) as exc:
@@ -55,28 +59,47 @@ def fetch_host_key(config: Config) -> paramiko.PKey:
             f"its host key: {exc}"
         ) from exc
     finally:
-        transport.close()
+        if transport is not None:
+            transport.close()
 
 
-def load_existing_fingerprints(known_hosts_path: Path) -> set[str]:
+def is_host_trusted(
+    known_hosts_path: Path,
+    hostname: str,
+    port: int,
+    key: paramiko.PKey,
+) -> bool:
     """
-    Return the set of fingerprints already present in a known_hosts file.
+    True if known_hosts already trusts this host/port with this key.
+
+    The fingerprint alone is not enough: the same key may be recorded
+    under a different host name or port, and skipping the append in that
+    case would leave the configured host untrusted (connect() would then
+    reject it). Both the host/port entry and the key must match.
 
     Args:
         known_hosts_path: Path to the known_hosts file (may not exist).
+        hostname: The host name or IP address.
+        port: The SSH port.
+        key: The server's host key.
 
     Returns:
-        A set of 'SHA256:...' fingerprint strings.
+        True if an entry for this host/port exists whose key matches.
     """
     if not known_hosts_path.is_file():
-        return set()
-    fingerprints: set[str] = set()
+        return False
+    # Reuse known_hosts_entry's naming ([host]:port for non-standard
+    # ports) so the lookup key cannot drift from what we write.
+    name = known_hosts_entry(hostname, port, key).split(" ", 1)[0]
     host_keys = paramiko.HostKeys(str(known_hosts_path))
     for entry in host_keys._entries:
-        key = entry.key
-        if key is not None:
-            fingerprints.add(fingerprint(key))
-    return fingerprints
+        if name not in entry.hostnames:
+            continue
+        if entry.key is not None and fingerprint(entry.key) == fingerprint(
+            key
+        ):
+            return True
+    return False
 
 
 def append_to_known_hosts(
@@ -186,8 +209,9 @@ def main(argv: list[str] | None = None) -> int:
             print("Aborted; nothing was saved.")
             return 1
 
-    existing = load_existing_fingerprints(known_hosts_path)
-    if fp in existing:
+    if is_host_trusted(
+        known_hosts_path, config.ssh_host, config.ssh_port, key
+    ):
         print(f"Already trusted in {known_hosts_path}; nothing to do.")
         return 0
 

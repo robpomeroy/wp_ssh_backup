@@ -606,6 +606,9 @@ def _unescape_php(value: str, quote: str) -> str:
             digits = 1 + (len(octal.group(0)) if octal else 0)
             octal_value = int(value[i+1:i+1+digits], 8) % 256
             out.append(chr(octal_value))
+            # Advance past the backslash and every consumed octal digit;
+            # forgetting this leaves i unchanged and loops forever.
+            i += 1 + digits
             continue
         # Unrecognised escape: PHP keeps the backslash.
         out.append(ch + nxt)
@@ -973,6 +976,11 @@ def find_backup_sets(backup_dir: Path) -> dict[str, list[Path]]:
     """
     Map each backup timestamp to the local files belonging to that set.
 
+    Groups that contain no archive (e.g. an orphaned .sha256 file left
+    behind after its tarball was deleted) are omitted: such a group has
+    no backup id extractable from an archive name, and including it would
+    make set selection fail on a group that can never be restored.
+
     Args:
         backup_dir: The directory containing the backup files.
 
@@ -989,7 +997,11 @@ def find_backup_sets(backup_dir: Path) -> dict[str, list[Path]]:
         match = BACKUP_FILE_RE.match(path.name)
         if match:
             sets.setdefault(match.group("bid"), []).append(path)
-    return sets
+    return {
+        bid: files
+        for bid, files in sets.items()
+        if any(backup_id_from_archive_name(path.name) for path in files)
+    }
 
 
 def prune_local_backups(
@@ -1079,6 +1091,29 @@ def remove_remote_staging(client: paramiko.SSHClient, staging: str) -> None:
         print(
             "WARNING: could not remove remote staging directory "
             f"{staging}: {exc}",
+            file=sys.stderr,
+        )
+
+
+def remove_remote_file(client: paramiko.SSHClient, path: str) -> None:
+    """
+    Best-effort removal of a single remote file.
+
+    Used for credential files (e.g. the temporary MySQL cnf) that must be
+    cleaned up even when the command that used them failed. Like
+    remove_remote_staging, transport failures and command failures are
+    caught and reported as a warning, so cleanup can never mask the
+    original error that triggered it.
+
+    Args:
+        client: An active Paramiko SSHClient connected to the remote host.
+        path: The path to the remote file.
+    """
+    try:
+        run_remote_cmd_checked(client, f"rm -f {shquote(path)}")
+    except (WPSSHBackupError, OSError, paramiko.SSHException) as exc:
+        print(
+            f"WARNING: could not remove remote file {path}: {exc}",
             file=sys.stderr,
         )
 

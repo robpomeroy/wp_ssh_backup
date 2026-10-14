@@ -292,17 +292,134 @@ def test_authorize_host_skips_already_trusted_key(
     assert len(known_hosts.read_text().strip().splitlines()) == 1
 
 
-def test_load_existing_fingerprints(tmp_path: Path) -> None:
+def test_authorize_host_appends_when_key_saved_under_other_host(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """A fingerprint match under another host must not skip the append."""
     key = make_key()
+    known_hosts = tmp_path / "known_hosts"
+    known_hosts.parent.mkdir(parents=True, exist_ok=True)
+    # Same key, but recorded for a different host name.
+    known_hosts.write_text(known_hosts_entry("other.example.net", 22, key))
+    config = make_config(tmp_path, ssh_known_hosts=str(known_hosts))
+
+    monkeypatch.setattr(authorize_host, "load_config", lambda: config)
+    monkeypatch.setattr(authorize_host, "fetch_host_key", lambda cfg: key)
+    monkeypatch.setattr(
+        authorize_host, "confirm_interactive", lambda *a, **k: True
+    )
+
+    exit_code = authorize_host.main([])
+
+    assert exit_code == 0
+    out = capsys.readouterr().out
+    assert "Already trusted" not in out
+    assert "Host key saved" in out
+    lines = known_hosts.read_text().strip().splitlines()
+    assert len(lines) == 2
+    assert lines[1].startswith("example.com ")
+
+
+def test_authorize_host_appends_when_key_saved_under_other_port(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """A fingerprint match under another port must not skip the append."""
+    key = make_key()
+    known_hosts = tmp_path / "known_hosts"
+    known_hosts.parent.mkdir(parents=True, exist_ok=True)
+    # Same key, but recorded for the same host on a different port.
+    known_hosts.write_text(known_hosts_entry("example.com", 2222, key))
+    config = make_config(tmp_path, ssh_known_hosts=str(known_hosts))
+
+    monkeypatch.setattr(authorize_host, "load_config", lambda: config)
+    monkeypatch.setattr(authorize_host, "fetch_host_key", lambda cfg: key)
+    monkeypatch.setattr(
+        authorize_host, "confirm_interactive", lambda *a, **k: True
+    )
+
+    exit_code = authorize_host.main([])
+
+    assert exit_code == 0
+    out = capsys.readouterr().out
+    assert "Already trusted" not in out
+    assert "Host key saved" in out
+    lines = known_hosts.read_text().strip().splitlines()
+    assert len(lines) == 2
+    # The configured port is 22, so the new entry uses the plain form.
+    assert lines[1].startswith("example.com ")
+
+
+def test_is_host_trusted(tmp_path: Path) -> None:
+    key = make_key()
+    other = make_key()
     known_hosts = tmp_path / "known_hosts"
     known_hosts.write_text(known_hosts_entry("example.com", 22, key))
 
-    fps = authorize_host.load_existing_fingerprints(known_hosts)
+    assert authorize_host.is_host_trusted(
+        known_hosts, "example.com", 22, key
+    )
+    # Wrong key for the right host.
+    assert not authorize_host.is_host_trusted(
+        known_hosts, "example.com", 22, other
+    )
+    # Right key under a different host or port.
+    assert not authorize_host.is_host_trusted(
+        known_hosts, "other.example.net", 22, key
+    )
+    assert not authorize_host.is_host_trusted(
+        known_hosts, "example.com", 2222, key
+    )
 
-    assert fps == {fingerprint(key)}
+
+def test_is_host_trusted_missing_file(tmp_path: Path) -> None:
+    key = make_key()
+    assert not authorize_host.is_host_trusted(
+        tmp_path / "nope", "example.com", 22, key
+    )
 
 
-def test_load_existing_fingerprints_missing_file(tmp_path: Path) -> None:
-    assert authorize_host.load_existing_fingerprints(
-        tmp_path / "nope"
-    ) == set()
+# ---------------------------------------------------------------------------
+# fetch_host_key error handling
+# ---------------------------------------------------------------------------
+
+
+def test_fetch_host_key_unreachable_host(tmp_path: Path) -> None:
+    """A socket-level failure must surface as ERROR:, not a traceback."""
+    config = make_config(tmp_path)
+
+    def failing_transport(address: object) -> object:
+        raise OSError(65, "No route to host")
+
+    monkey_transport = pytest.MonkeyPatch()
+    with monkey_transport.context() as m:
+        m.setattr(authorize_host.paramiko, "Transport", failing_transport)
+        with pytest.raises(WPSSHBackupError, match="Could not reach"):
+            authorize_host.fetch_host_key(config)
+    monkey_transport.undo()
+
+
+def test_main_reports_unreachable_host_as_error(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """main() must print ERROR: and exit 2 when the host is unreachable."""
+    config = make_config(tmp_path)
+
+    def failing_transport(address: object) -> object:
+        raise OSError(65, "No route to host")
+
+    monkey_transport = pytest.MonkeyPatch()
+    with monkey_transport.context() as m:
+        m.setattr(authorize_host.paramiko, "Transport", failing_transport)
+        m.setattr(authorize_host, "load_config", lambda: config)
+        exit_code = authorize_host.main([])
+    monkey_transport.undo()
+
+    captured = capsys.readouterr()
+    assert exit_code == 2
+    assert captured.err.startswith("ERROR: ")
+    assert "No route to host" in captured.err

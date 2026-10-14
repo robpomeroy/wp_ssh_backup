@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -11,6 +12,7 @@ from common import (
     ChecksumError,
     ConfigError,
     RemoteCommandError,
+    _unescape_php,
     backup_id,
     backup_id_from_archive_name,
     checksum_name,
@@ -30,6 +32,7 @@ from common import (
     strip_php_comments,
     trap_rm_action,
     utc_timestamp,
+    remove_remote_file,
     remove_remote_staging,
 )
 
@@ -101,6 +104,43 @@ def test_parse_wp_config_double_quoted_escapes() -> None:
     settings = parse_wp_config("\n".join(lines) + "\n")
     # \t -> tab, \" -> ", \$ -> $, \x41 -> A.
     assert settings["DB_PASSWORD"] == 'a\tb"q$zA'
+
+
+# ---------------------------------------------------------------------------
+# _unescape_php direct tests (escape decoder edge cases)
+# ---------------------------------------------------------------------------
+
+
+def test_unescape_php_octal_escape_advances_index() -> None:
+    """Regression: a lost index advance in the octal branch hung forever."""
+    # \\101 is octal 65 = 'A'; the digits must all be consumed.
+    assert _unescape_php(r"\101", '"') == "A"
+    assert _unescape_php(r"\101B", '"') == "AB"
+    # Up to three digits total: \\1015 -> chr(0o101) + literal '5'.
+    assert _unescape_php(r"\1015", '"') == "A5"
+    # Two-digit form: \\12 is octal 10 = newline.
+    assert _unescape_php(r"\12x", '"') == "\nx"
+
+
+def test_unescape_php_octal_no_hang() -> None:
+    """The octal branch must always advance i; guard with a timeout."""
+
+    def run() -> None:
+        _unescape_php(r"\101\102\7", '"')
+
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    worker.join(timeout=5)
+    assert not worker.is_alive(), "_unescape_php hung on octal escapes"
+
+
+def test_unescape_php_trailing_backslash() -> None:
+    assert _unescape_php(r"trailing" + "\\", "'") == "trailing\\"
+
+
+def test_unescape_php_unknown_escapes_keep_backslash() -> None:
+    assert _unescape_php(r"p\q", "'") == r"p\q"
+    assert _unescape_php(r"\q\w", '"') == r"\q\w"
 
 
 def test_parse_wp_config_missing_keys() -> None:
@@ -479,6 +519,30 @@ def test_find_backup_sets_ignores_other_files(tmp_path: Path) -> None:
     assert find_backup_sets(tmp_path) == {}
 
 
+def test_find_backup_sets_ignores_checksum_only_group(
+    tmp_path: Path,
+) -> None:
+    """An orphaned .sha256 group must not shadow a valid older set."""
+    make_set(tmp_path, "20261013T0000Z")
+    # A newer checksum-only group: no archive, just an orphaned checksum.
+    (tmp_path / "wp-db-20261014T0930Z.tar.gz.sha256").write_text("d  f\n")
+    (tmp_path / "wp-files-20261014T0930Z.tar.gz.sha256").write_text("d  f\n")
+    sets = find_backup_sets(tmp_path)
+
+    assert set(sets) == {"20261013T0000Z"}
+
+
+def test_find_backup_sets_keeps_checksums_with_archives(
+    tmp_path: Path,
+) -> None:
+    """Checksums belonging to a real archive stay in the set."""
+    make_set(tmp_path, "20261014T0930Z", kinds=("db",))
+    sets = find_backup_sets(tmp_path)
+
+    assert set(sets) == {"20261014T0930Z"}
+    assert len(sets["20261014T0930Z"]) == 2
+
+
 def test_prune_removes_only_old_sets(tmp_path: Path) -> None:
     now = datetime(2026, 10, 14, 12, 0, tzinfo=timezone.utc)
     # 40 days old -> removed; 29 days old -> kept.
@@ -592,3 +656,56 @@ def test_original_error_survives_failed_cleanup(
         pytest.fail("original error was lost")
     err = capsys.readouterr().err
     assert "WARNING" in err
+
+
+# ---------------------------------------------------------------------------
+# remove_remote_file (best-effort credential-file cleanup)
+# ---------------------------------------------------------------------------
+
+
+def test_remove_remote_file_swallows_transport_failure(
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """A dropped connection during cnf cleanup must not raise."""
+    import paramiko
+
+    client = _RaisingClient(paramiko.SSHException("connection dropped"))
+    remove_remote_file(client, "/tmp/staging/my.cnf")  # type: ignore[arg-type]
+    err = capsys.readouterr().err
+    assert "WARNING: could not remove remote file" in err
+    assert "connection dropped" in err
+
+
+def test_remove_remote_file_swallows_oserror(
+    capsys: pytest.CaptureFixture,
+) -> None:
+    client = _RaisingClient(OSError("socket closed"))
+    remove_remote_file(client, "/tmp/staging/my.cnf")  # type: ignore[arg-type]
+    err = capsys.readouterr().err
+    assert "WARNING: could not remove remote file" in err
+    assert "socket closed" in err
+
+
+def test_remove_remote_file_swallows_command_failure(
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """A failing rm command is reported as a warning, not raised."""
+    import common as _common
+
+    original = _common.run_remote_cmd_checked
+
+    def failing_checked(
+        cl: object, command: str, timeout: object = None
+    ) -> str:
+        raise RemoteCommandError(command, 1, "permission denied")
+
+    _common.run_remote_cmd_checked = failing_checked  # type: ignore
+    try:
+        client = _RaisingClient(RuntimeError("unused"))
+        # type: ignore[arg-type]
+        remove_remote_file(client, "/tmp/staging/my.cnf")
+    finally:
+        _common.run_remote_cmd_checked = original  # type: ignore
+    err = capsys.readouterr().err
+    assert "WARNING: could not remove remote file" in err
+    assert "permission denied" in err

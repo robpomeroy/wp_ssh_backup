@@ -30,7 +30,9 @@ from common import (
     find_backup_sets,
     load_config,
     mysql_client_config,
+    parse_backup_id,
     read_wp_db_settings,
+    remove_remote_file,
     remove_remote_staging,
     run_remote_cmd,
     run_remote_cmd_checked,
@@ -38,6 +40,7 @@ from common import (
     split_db_host,
     staging_dir_for,
     trap_rm_action,
+    utc_timestamp,
     write_remote_file,
 )
 
@@ -81,6 +84,44 @@ def set_is_complete(
     )
 
 
+def resolve_timestamp(
+    sets: dict[str, dict[str, Path]],
+    timestamp: str,
+) -> str:
+    """
+    Resolve a --timestamp value to an exact backup id in sets.
+
+    Accepts a full backup id ('20261014T0930Z-a1b2c3') or a bare timestamp
+    ('20261014T0930Z'). A bare timestamp resolves only when exactly one set
+    matches; if several backups share the minute, the error lists their
+    full ids so the caller can disambiguate. Raises MissingArtifactError
+    when nothing matches.
+
+    Args:
+        sets: The available backup sets, keyed by backup id.
+        timestamp: The user-supplied value.
+
+    Returns:
+        The exact backup id of the requested set.
+    """
+    if timestamp in sets:
+        return timestamp
+    matches = [bid for bid in sets if bid.split("-", 1)[0] == timestamp]
+    if not matches:
+        available = ", ".join(sorted(sets)) or "(none)"
+        raise MissingArtifactError(
+            f"No backup set with timestamp {timestamp}. "
+            f"Available: {available}"
+        )
+    if len(matches) > 1:
+        raise MissingArtifactError(
+            f"Several backup sets share the timestamp {timestamp}; "
+            "specify a full backup id instead. Available ids: "
+            + ", ".join(sorted(matches))
+        )
+    return matches[0]
+
+
 def choose_set(
     sets: dict[str, dict[str, Path]],
     timestamp: str | None,
@@ -91,23 +132,20 @@ def choose_set(
     """
     Pick the backup set to restore, validating required artifacts exist.
 
-    Without an explicit timestamp, sets are filtered to those containing
-    the requested artifacts before the latest is chosen — the documented
-    schedules can produce a database-only set newer than the latest files
-    set, and that newer set must not block a files restore. An explicit
-    timestamp is strict: it must exist and contain the requested
-    artifacts, with no fallback to older sets.
+    The timestamp argument accepts a full backup id
+    ('20261014T0930Z-a1b2c3') or a bare timestamp ('20261014T0930Z'); a
+    bare timestamp must match exactly one set. Without an explicit
+    timestamp, sets are filtered to those containing the requested
+    artifacts before the latest is chosen — the documented schedules can
+    produce a database-only set newer than the latest files set, and that
+    newer set must not block a files restore. An explicit timestamp is
+    strict: it must exist and contain the requested artifacts, with no
+    fallback to older sets.
     """
     if not sets:
         raise MissingArtifactError(f"No backup sets found in {backup_dir}.")
     if timestamp:
-        if timestamp not in sets:
-            available = ", ".join(sorted(sets)) or "(none)"
-            raise MissingArtifactError(
-                f"No backup set with timestamp {timestamp}. "
-                f"Available: {available}"
-            )
-        chosen = sets[timestamp]
+        chosen = sets[resolve_timestamp(sets, timestamp)]
     else:
         candidates = [
             files
@@ -123,7 +161,7 @@ def choose_set(
                 f"({wanted or 'none'}). "
                 f"Searched {len(sets)} set(s) in {backup_dir}."
             )
-        chosen = max(candidates, key=ts_of)
+        chosen = latest_set(candidates, backup_dir)
         print(
             f"No --timestamp given; using latest matching backup set: "
             f"{ts_of(chosen)}"
@@ -149,6 +187,47 @@ def ts_of(set_files: dict[str, Path]) -> str:
         if bid:
             return bid
     raise MissingArtifactError("Backup set contains no archive files.")
+
+
+def latest_set(
+    candidates: list[dict[str, Path]],
+    backup_dir: Path,
+) -> dict[str, Path]:
+    """
+    Pick the most recent candidate set, rejecting same-minute ambiguity.
+
+    The backup id's timestamp has minute resolution, so two complete sets
+    can share it while differing only by their random run suffix. The
+    suffix is random, not chronological, so comparing ids (or suffixes)
+    cannot tell which run finished last. Rather than silently guessing,
+    this raises and asks for an explicit full backup id.
+
+    Args:
+        candidates: Complete candidate sets.
+        backup_dir: The backup directory, for the error message.
+
+    Returns:
+        The single most recent candidate set.
+
+    Raises:
+        MissingArtifactError: If two or more candidates share the newest
+            timestamp.
+    """
+    newest = max(parse_backup_id(ts_of(files)) for files in candidates)
+    newest_ids = [
+        ts_of(files)
+        for files in candidates
+        if parse_backup_id(ts_of(files)) == newest
+    ]
+    if len(newest_ids) > 1:
+        raise MissingArtifactError(
+            f"Several backup sets in {backup_dir} share the newest "
+            f"timestamp {utc_timestamp(newest)}; the run suffix is random, "
+            "so recency cannot be determined. Specify a full backup id "
+            "with --timestamp. Available ids: "
+            + ", ".join(sorted(newest_ids))
+        )
+    return next(files for files in candidates if ts_of(files) == newest_ids[0])
 
 
 # ---------------------------------------------------------------------------
@@ -271,7 +350,9 @@ def import_database(
     try:
         run_remote_cmd_checked(client, command, timeout=3600)
     finally:
-        run_remote_cmd(client, f"rm -f {shquote(cnf_path)}")
+        # Best-effort: if the connection dropped, the removal must not
+        # mask the original mysql import failure.
+        remove_remote_file(client, cnf_path)
 
 
 # ---------------------------------------------------------------------------
@@ -358,8 +439,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--timestamp",
-        help="Backup set timestamp to restore (e.g. 20261014T0930Z). "
-        "Defaults to the latest set.",
+        help="Backup set to restore: a full backup id (e.g. "
+        "20261014T0930Z-a1b2c3) or a bare timestamp (e.g. 20261014T0930Z, "
+        "which must match exactly one set). Defaults to the latest "
+        "matching set.",
     )
     group = parser.add_mutually_exclusive_group()
     group.add_argument(

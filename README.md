@@ -177,8 +177,15 @@ python restore.py [--timestamp <ts>] [--files] [--database] [--all]
 - Without `--timestamp`, the most recent backup set **containing the
   requested artifacts** is used — so a newer database-only set does not block
   restoring files from an older set (the split schedules below can produce
-  this).
+  this). If two complete sets share the newest timestamp (same-minute runs
+  with different random suffixes), the run fails and lists their full ids:
+  the suffix is random, so recency cannot be inferred — pass an explicit
+  full backup id instead.
 - `--files` / `--database` / `--all` select what to restore (default: both).
+- `--timestamp` accepts either a full backup id (`20261014T0930Z-a1b2c3`)
+  or a bare timestamp (`20261014T0930Z`). A bare timestamp is accepted only
+  when it matches exactly one set; if several backups share the minute,
+  the run fails and lists the full ids so you can pick one.
 - An explicit `--timestamp` is strict: the set must exist and contain the
   requested artifacts; there is no fallback to older sets.
 
