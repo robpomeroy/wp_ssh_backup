@@ -981,6 +981,11 @@ def find_backup_sets(backup_dir: Path) -> dict[str, list[Path]]:
     no backup id extractable from an archive name, and including it would
     make set selection fail on a group that can never be restored.
 
+    Groups whose backup id parses to an invalid date (e.g. month 13 in
+    '20261301T0000Z' — the filename regex only checks the shape) are also
+    omitted, so an unparseable id can never reach date-based selection
+    logic and crash it.
+
     Args:
         backup_dir: The directory containing the backup files.
 
@@ -997,11 +1002,18 @@ def find_backup_sets(backup_dir: Path) -> dict[str, list[Path]]:
         match = BACKUP_FILE_RE.match(path.name)
         if match:
             sets.setdefault(match.group("bid"), []).append(path)
-    return {
-        bid: files
-        for bid, files in sets.items()
-        if any(backup_id_from_archive_name(path.name) for path in files)
-    }
+    result: dict[str, list[Path]] = {}
+    for bid, files in sets.items():
+        if not any(
+            backup_id_from_archive_name(path.name) for path in files
+        ):
+            continue
+        try:
+            parse_backup_id(bid)
+        except ValueError:
+            continue
+        result[bid] = files
+    return result
 
 
 def prune_local_backups(

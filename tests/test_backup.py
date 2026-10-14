@@ -179,15 +179,37 @@ def test_create_db_dump_site_path_with_spaces(
 def test_create_files_archive_excludes_cache(
     tmp_path: Path, backup_dir: Path
 ) -> None:
+    """The cache exclusion must actually keep cache files out of the tar."""
     client = FakeSSHClient(SITE_ROOT)
     config = make_config(tmp_path)
     staging = staging_dir_for(SITE_ROOT, TS)
+    # Seed the fake remote FS with a cache file that must be excluded.
+    client.remote_fs[posixpath.join(SITE_ROOT, "wp-content/cache/junk.js")] = (
+        b"cached"
+    )
+    client.remote_fs[posixpath.join(SITE_ROOT, "index.php")] = b"<?php\n"
 
     archive = backup.create_files_archive(client, config, staging, TS)
 
     assert archive == files_archive_name(TS)
     tar_command = next(c for c in client.commands if c.startswith("tar czf"))
     assert "--exclude=./wp-content/cache" in tar_command
+    # GNU tar treats options after the member operand as positional: they
+    # have no effect and it exits with status 2. The exclude must come
+    # before the "." member.
+    assert tar_command.rstrip().endswith(" .")
+    assert tar_command.index("--exclude=") < tar_command.rindex(" .")
+    # The fake tar honours --exclude, so verify the archive contents.
+    import io
+    import tarfile
+
+    with tarfile.open(
+        fileobj=io.BytesIO(client.remote_fs[posixpath.join(staging, archive)]),
+        mode="r:gz",
+    ) as tar:
+        names = tar.getnames()
+    assert "index.php" in names
+    assert not any("wp-content/cache" in name for name in names)
 
 
 # ---------------------------------------------------------------------------

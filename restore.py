@@ -31,6 +31,8 @@ from common import (
     load_config,
     mysql_client_config,
     parse_backup_id,
+    parse_sha256sum_output,
+    read_remote_file,
     read_wp_db_settings,
     remove_remote_file,
     remove_remote_staging,
@@ -93,9 +95,10 @@ def resolve_timestamp(
 
     Accepts a full backup id ('20261014T0930Z-a1b2c3') or a bare timestamp
     ('20261014T0930Z'). A bare timestamp resolves only when exactly one set
-    matches; if several backups share the minute, the error lists their
-    full ids so the caller can disambiguate. Raises MissingArtifactError
-    when nothing matches.
+    matches; if several backups share the minute — including a legacy
+    suffix-less set alongside suffixed ones — the error lists their full
+    ids so the caller can disambiguate. Raises MissingArtifactError when
+    nothing matches.
 
     Args:
         sets: The available backup sets, keyed by backup id.
@@ -104,8 +107,16 @@ def resolve_timestamp(
     Returns:
         The exact backup id of the requested set.
     """
-    if timestamp in sets:
-        return timestamp
+    if "-" in timestamp:
+        # A full id can only match itself; the bare-timestamp path below
+        # would also match it, but the exact shortcut is unambiguous.
+        if timestamp in sets:
+            return timestamp
+        available = ", ".join(sorted(sets)) or "(none)"
+        raise MissingArtifactError(
+            f"No backup set with timestamp {timestamp}. "
+            f"Available: {available}"
+        )
     matches = [bid for bid in sets if bid.split("-", 1)[0] == timestamp]
     if not matches:
         available = ", ".join(sorted(sets)) or "(none)"
@@ -265,19 +276,73 @@ def verify_remote_checksums(
     staging: str,
     archive_names: list[str],
 ) -> None:
-    """Run `sha256sum -c` remotely for each uploaded archive."""
-    for name in archive_names:
-        # sha256sum -c expects the filename relative to the checksum file.
-        command = (
-            f"cd {shquote(staging)} && "
-            f"sha256sum -c {shquote(checksum_name(name))}"
-        )
-        code, _, err = run_remote_cmd(client, command)
-        if code != 0:
-            raise ChecksumError(
-                f"Remote checksum verification failed for {name}: "
-                f"{err.strip()}"
+    """
+    Verify each uploaded archive against its uploaded .sha256 manifest.
+
+    The manifest is not trusted blindly: `sha256sum -c` checks whatever
+    filename the manifest names, so a manifest pointing at another file
+    with a matching digest would pass while the requested archive stays
+    corrupt. Instead the manifest is read and must contain exactly one
+    entry naming exactly the requested archive (no path separators, so no
+    traversal), and the archive's bytes are then hashed directly with
+    `sha256sum` and compared to the manifest's digest.
+    """
+    sftp = client.open_sftp()
+    try:
+        for name in archive_names:
+            checksum_remote = posixpath.join(staging, checksum_name(name))
+            try:
+                text = read_remote_file(sftp, checksum_remote)
+            except FileNotFoundError as exc:
+                raise ChecksumError(
+                    f"Remote checksum file missing: {checksum_remote}"
+                ) from exc
+            entries = parse_sha256sum_output(text)
+            # Reject any path component in ANY entry name before anything
+            # else: a manifest may only reference plain filenames inside
+            # the staging directory, never paths (no traversal).
+            for entry_name in entries:
+                if (
+                    "/" in entry_name
+                    or "\\" in entry_name
+                    or posixpath.basename(entry_name) != entry_name
+                    or entry_name in (".", "..")
+                ):
+                    raise ChecksumError(
+                        f"{checksum_name(name)} names a path outside the "
+                        f"staging directory: {entry_name}"
+                    )
+            if len(entries) != 1:
+                raise ChecksumError(
+                    f"{checksum_name(name)} must contain exactly one "
+                    f"entry, found {len(entries)}"
+                )
+            if name not in entries:
+                raise ChecksumError(
+                    f"{checksum_name(name)} does not name {name}; the "
+                    "manifest cannot be trusted for this archive"
+                )
+            # Hash the archive's bytes directly; the manifest only supplies
+            # the expected digest.
+            command = (
+                f"cd {shquote(staging)} && "
+                f"sha256sum {shquote(name)}"
             )
+            code, out, err = run_remote_cmd(client, command)
+            if code != 0:
+                raise ChecksumError(
+                    f"Could not hash {name} on the remote host: "
+                    f"{err.strip()}"
+                )
+            actual = parse_sha256sum_output(out)
+            if actual.get(name) != entries[name]:
+                raise ChecksumError(
+                    f"Remote checksum verification failed for {name}: "
+                    f"expected {entries[name]}, got "
+                    f"{actual.get(name, '(none)')}"
+                )
+    finally:
+        sftp.close()
 
 
 def extract_files(

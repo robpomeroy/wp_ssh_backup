@@ -543,6 +543,25 @@ def test_find_backup_sets_keeps_checksums_with_archives(
     assert len(sets["20261014T0930Z"]) == 2
 
 
+def test_find_backup_sets_skips_invalid_dates(tmp_path: Path) -> None:
+    """A well-shaped but impossible date must not enter selection."""
+    make_set(tmp_path, "20261301T0000Z")  # month 13
+    make_set(tmp_path, "20261014T0930Z")
+    sets = find_backup_sets(tmp_path)
+
+    assert set(sets) == {"20261014T0930Z"}
+
+
+def test_prune_skips_invalid_dates(tmp_path: Path) -> None:
+    """Pruning must not crash on an unparseable backup id."""
+    make_set(tmp_path, "20261301T0000Z")
+    removed = prune_local_backups(tmp_path, 30)
+
+    assert removed == []
+    # The invalid set is left on disk rather than crashing the run.
+    assert (tmp_path / "wp-db-20261301T0000Z.tar.gz").exists()
+
+
 def test_prune_removes_only_old_sets(tmp_path: Path) -> None:
     now = datetime(2026, 10, 14, 12, 0, tzinfo=timezone.utc)
     # 40 days old -> removed; 29 days old -> kept.

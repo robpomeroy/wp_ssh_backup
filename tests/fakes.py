@@ -8,6 +8,7 @@ FakeSFTPClient moves bytes between that filesystem and local disk.
 
 from __future__ import annotations
 
+import fnmatch
 import hashlib
 import io
 import posixpath
@@ -256,7 +257,46 @@ class FakeSSHClient:
         else:
             cwd = posixpath.dirname(archive_path)
             member = "."
-        members = self._members_for(cwd, member)
+        # GNU tar treats options after the member operand as positional:
+        # they have no effect and it exits with status 2. Reproduce that
+        # so a mis-ordered command fails here exactly as it would on the
+        # real host.
+        exclude_matches = list(re.finditer(r"--exclude=(\S+)", command))
+        if command.rstrip().endswith(" ."):
+            member_pos = command.rfind(" .")
+        elif quoted:
+            member_pos = command.rfind(quoted[-1])
+        else:
+            member_pos = len(command)
+        for match in exclude_matches:
+            if match.start() > member_pos:
+                stderr.write(
+                    "tar: The following options were used after non-option "
+                    "arguments. These options are positional and affect "
+                    "only arguments that follow them. Please, rearrange "
+                    "them properly.\n".encode()
+                )
+                stderr.write(
+                    f"tar: --exclude {match.group(1)} has no effect\n".encode()
+                )
+                return 2
+        # Honour --exclude patterns like GNU tar: a member is left out
+        # when its name matches the pattern, or when the pattern names a
+        # directory the member lives under.
+        excludes = [match.group(1) for match in exclude_matches]
+
+        def excluded(name: str) -> bool:
+            for pattern in excludes:
+                pat = pattern.lstrip("./").rstrip("/")
+                if fnmatch.fnmatch(name, pat) or name.startswith(pat + "/"):
+                    return True
+            return False
+
+        members = {
+            name: data
+            for name, data in self._members_for(cwd, member).items()
+            if not excluded(name)
+        }
         if not members and member != ".":
             stderr.write(f"tar: {member}: not found\n".encode())
             return 1
@@ -317,21 +357,35 @@ class FakeSSHClient:
         stderr: io.BytesIO,
         cwd: str | None,
     ) -> int:
-        # Form: sha256sum '<name>' > '<out>'   (cd prefix already stripped)
+        # Two forms (cd prefix already stripped):
+        #   sha256sum '<name>' > '<out>'   (checksum generation)
+        #   sha256sum '<name>'             (plain hashing, no redirect)
         match = re.search(r"sha256sum\s+'([^']+)'\s*>\s*'([^']+)'", command)
-        if not match:
-            stderr.write(f"unparsable sha256sum: {command}\n".encode())
-            return 2
-        name = self._resolve(match.group(1), cwd)
-        out_path = self._resolve(match.group(2), cwd)
-        if name not in self.remote_fs:
-            stderr.write(f"sha256sum: {name}: not found\n".encode())
-            return 1
-        digest = hashlib.sha256(self.remote_fs[name]).hexdigest()
-        base = posixpath.basename(name)
-        self.remote_fs[out_path] = f"{digest}  {base}\n".encode()
-        stdout.write(f"{digest}  {base}\n".encode())
-        return 0
+        if match:
+            name = self._resolve(match.group(1), cwd)
+            out_path = self._resolve(match.group(2), cwd)
+            if name not in self.remote_fs:
+                stderr.write(f"sha256sum: {name}: not found\n".encode())
+                return 1
+            digest = hashlib.sha256(self.remote_fs[name]).hexdigest()
+            base = posixpath.basename(name)
+            self.remote_fs[out_path] = f"{digest}  {base}\n".encode()
+            stdout.write(f"{digest}  {base}\n".encode())
+            return 0
+        match = re.search(r"sha256sum\s+'([^']+)'$", command)
+        if match:
+            name = self._resolve(match.group(1), cwd)
+            if name not in self.remote_fs:
+                stderr.write(
+                    f"sha256sum: {name}: No such file or directory\n".encode()
+                )
+                return 1
+            digest = hashlib.sha256(self.remote_fs[name]).hexdigest()
+            base = posixpath.basename(name)
+            stdout.write(f"{digest}  {base}\n".encode())
+            return 0
+        stderr.write(f"unparsable sha256sum: {command}\n".encode())
+        return 2
 
     def _sha256sum_check(
         self, command: str, stderr: io.BytesIO, cwd: str | None

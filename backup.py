@@ -177,9 +177,13 @@ def create_files_archive(
     archive_path = posixpath.join(staging, archive_name)
     # The staging dir is a sibling of the site root, so it is never included
     # in a tar of the site root's contents; only cache dirs need excluding.
+    # GNU tar treats options after the member operand as positional: they
+    # have no effect and it exits with status 2, so --exclude must come
+    # before the "." member.
     command = (
-        f"tar czf {shquote(archive_path)} -C {shquote(config.wp_site_root)} . "
-        f"--exclude=./wp-content/cache"
+        f"tar czf {shquote(archive_path)} "
+        f"--exclude=./wp-content/cache "
+        f"-C {shquote(config.wp_site_root)} ."
     )
     run_remote_cmd_checked(client, command, timeout=3600)
     return archive_name

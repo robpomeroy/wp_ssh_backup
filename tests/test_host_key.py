@@ -103,20 +103,46 @@ def test_connect_rejects_unknown_host_key(
 def test_connect_accepts_trusted_host_key(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """connect() must load the trusted entry and connect with it."""
     key = make_key()
+    known_hosts = tmp_path / "known_hosts"
+    known_hosts.write_text(known_hosts_entry("example.com", 22, key))
+    config = make_config(tmp_path, ssh_known_hosts=str(known_hosts))
+
+    fake = FakeSSHClient("/home/user/public_html")
+    fake.server_key = key
+    fake.trusted_fingerprints = {fingerprint(key)}
+
+    seen: dict[str, object] = {}
 
     def fake_connect(self: object, **kwargs: object) -> None:
-        from common import fingerprint
-
-        if fingerprint(key) not in {fingerprint(key)}:
-            raise AssertionError("should not happen")
+        # The client must have loaded our known_hosts entry before
+        # connecting, and must use RejectPolicy.
+        seen["host_keys"] = dict(self.get_host_keys().lookup("example.com"))
+        seen["policy"] = self._policy
+        FakeSSHClient.connect(fake, **kwargs)
 
     monkeypatch.setattr(common.paramiko.SSHClient, "connect", fake_connect)
+    monkeypatch.setattr(
+        common.paramiko.SSHClient,
+        "get_host_keys",
+        lambda self: self._host_keys,
+    )
 
-    config = make_config(tmp_path)
     connected = common.connect(config)
+
     assert connected is not None
     assert isinstance(connected, common.paramiko.SSHClient)
+    # The trusted key was loaded for the configured host.
+    loaded = seen["host_keys"]
+    assert len(loaded) == 1
+    assert fingerprint(next(iter(loaded.values()))) == fingerprint(key)
+    # Unknown keys are still rejected.
+    import paramiko
+
+    assert isinstance(seen["policy"], paramiko.RejectPolicy)
+    # The simulated server key passed the trust check.
+    assert fake.connect_calls, "connect() was never called"
 
 
 def test_connect_uses_reject_policy(

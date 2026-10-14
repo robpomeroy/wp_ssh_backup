@@ -17,7 +17,6 @@ from common import (
     db_archive_name,
     files_archive_name,
     staging_dir_for,
-    WPSSHBackupError,
     write_remote_file,
 )
 from tests.fakes import FakeSSHClient
@@ -109,6 +108,18 @@ def test_choose_set_ignores_newer_checksum_only_group(
     # A newer checksum-only group: no archives, just orphaned checksums.
     (backup_dir / "wp-db-20261014T0930Z.tar.gz.sha256").write_text("d  f\n")
     (backup_dir / "wp-files-20261014T0930Z.tar.gz.sha256").write_text("d  f\n")
+    sets = restore.list_backup_sets(backup_dir)
+
+    chosen = restore.choose_set(sets, None, True, True, backup_dir)
+
+    assert restore.ts_of(chosen) == "20261013T0000Z"
+
+
+def test_choose_set_ignores_invalid_date_sets(tmp_path: Path) -> None:
+    """A set with an impossible date must not crash default selection."""
+    backup_dir = tmp_path / "backups"
+    make_local_set(backup_dir, "20261301T0000Z")  # month 13
+    make_local_set(backup_dir, "20261013T0000Z")
     sets = restore.list_backup_sets(backup_dir)
 
     chosen = restore.choose_set(sets, None, True, True, backup_dir)
@@ -264,6 +275,24 @@ def test_choose_set_with_bare_timestamp_legacy_set(tmp_path: Path) -> None:
     chosen = restore.choose_set(sets, "20261014T0930Z", True, True, backup_dir)
 
     assert restore.ts_of(chosen) == "20261014T0930Z"
+
+
+def test_resolve_timestamp_legacy_plus_suffixed_is_ambiguous(
+    tmp_path: Path,
+) -> None:
+    """A legacy set must not bypass the ambiguity check for its minute."""
+    backup_dir = tmp_path / "backups"
+    make_local_set(backup_dir, "20261014T0930Z")  # legacy, no suffix
+    make_local_set(backup_dir, "20261014T0930Z-a1b2c3")
+    sets = restore.list_backup_sets(backup_dir)
+
+    with pytest.raises(MissingArtifactError) as excinfo:
+        restore.choose_set(sets, "20261014T0930Z", True, True, backup_dir)
+
+    message = str(excinfo.value)
+    assert "Several backup sets share the timestamp" in message
+    assert "20261014T0930Z" in message
+    assert "20261014T0930Z-a1b2c3" in message
 
 
 def test_resolve_timestamp_ambiguous_minute_lists_ids(
@@ -447,27 +476,136 @@ def test_run_restore_checksum_failure_removes_staging(tmp_path: Path) -> None:
     assert not any(path.startswith(staging) for path in client.remote_fs)
 
 
-def test_run_restore_invalid_wp_cli_path_removes_staging(
+def test_run_restore_manifest_naming_other_file_rejected(
     tmp_path: Path,
 ) -> None:
-    """A base WPSSHBackupError (bad WP_CLI_PATH) must not leak staging."""
+    """A manifest pointing at another file must not pass verification."""
     backup_dir = tmp_path / "backups"
     set_files = make_local_set(backup_dir, TS)
-    client = FakeSSHClient(SITE_ROOT, wp_cli=None)
-    config = make_config(tmp_path, wp_cli_path="/nonexistent/wp")
+    archive_path = set_files[files_archive_name(TS)]
+    # Corrupt the archive, then rewrite the manifest to name a different
+    # file whose digest matches what the manifest claims.
+    archive_path.write_bytes(b"corrupted")
+    checksum_path = set_files[checksum_name(files_archive_name(TS))]
+    decoy_digest = hashlib.sha256(b"decoy").hexdigest()
+    checksum_path.write_text(f"{decoy_digest}  wp-db-{TS}.tar.gz\n")
+    # Upload a decoy file so sha256sum would succeed if it followed the
+    # manifest's filename.
+    client = FakeSSHClient(SITE_ROOT, wp_cli="/usr/bin/wp")
+    config = make_config(tmp_path)
 
-    with pytest.raises(WPSSHBackupError, match="WP_CLI_PATH"):
+    with pytest.raises(ChecksumError, match="does not name"):
         restore.run_restore(
             client,
             config,
             set_files,
-            False,
             True,
+            False,
             staging_bid="20261014T1000Z",
         )
 
     staging = staging_dir_for(SITE_ROOT, "20261014T1000Z")
-    assert staging not in client.directories
+    assert not any(path.startswith(staging) for path in client.remote_fs)
+
+
+def test_run_restore_manifest_with_traversal_rejected(
+    tmp_path: Path,
+) -> None:
+    """A manifest naming a path outside staging must be rejected."""
+    backup_dir = tmp_path / "backups"
+    set_files = make_local_set(backup_dir, TS)
+    checksum_path = set_files[checksum_name(files_archive_name(TS))]
+    digest = hashlib.sha256(
+        set_files[files_archive_name(TS)].read_bytes()
+    ).hexdigest()
+    checksum_path.write_text(f"{digest}  ../../etc/passwd\n")
+    client = FakeSSHClient(SITE_ROOT, wp_cli="/usr/bin/wp")
+    config = make_config(tmp_path)
+
+    with pytest.raises(ChecksumError, match="outside the staging"):
+        restore.run_restore(
+            client,
+            config,
+            set_files,
+            True,
+            False,
+            staging_bid="20261014T1000Z",
+        )
+
+
+def test_run_restore_manifest_with_extra_entries_rejected(
+    tmp_path: Path,
+) -> None:
+    """A manifest with more than one entry must be rejected."""
+    backup_dir = tmp_path / "backups"
+    set_files = make_local_set(backup_dir, TS)
+    checksum_path = set_files[checksum_name(files_archive_name(TS))]
+    digest = hashlib.sha256(
+        set_files[files_archive_name(TS)].read_bytes()
+    ).hexdigest()
+    checksum_path.write_text(
+        f"{digest}  {files_archive_name(TS)}\n"
+        f"{digest}  wp-db-{TS}.tar.gz\n"
+    )
+    client = FakeSSHClient(SITE_ROOT, wp_cli="/usr/bin/wp")
+    config = make_config(tmp_path)
+
+    with pytest.raises(ChecksumError, match="exactly one"):
+        restore.run_restore(
+            client,
+            config,
+            set_files,
+            True,
+            False,
+            staging_bid="20261014T1000Z",
+        )
+
+
+def test_run_restore_manifest_missing_archive_entry_rejected(
+    tmp_path: Path,
+) -> None:
+    """A manifest that never names the requested archive must be rejected."""
+    backup_dir = tmp_path / "backups"
+    set_files = make_local_set(backup_dir, TS)
+    checksum_path = set_files[checksum_name(files_archive_name(TS))]
+    digest = hashlib.sha256(b"decoy").hexdigest()
+    checksum_path.write_text(f"{digest}  wp-db-{TS}.tar.gz\n")
+    client = FakeSSHClient(SITE_ROOT, wp_cli="/usr/bin/wp")
+    config = make_config(tmp_path)
+
+    with pytest.raises(ChecksumError, match="does not name"):
+        restore.run_restore(
+            client,
+            config,
+            set_files,
+            True,
+            False,
+            staging_bid="20261014T1000Z",
+        )
+
+
+def test_run_restore_honest_manifest_still_passes(tmp_path: Path) -> None:
+    """The strict manifest checks must not break the honest path."""
+    backup_dir = tmp_path / "backups"
+    set_files = make_local_set(backup_dir, TS)
+    client = FakeSSHClient(SITE_ROOT, wp_cli="/usr/bin/wp")
+    config = make_config(tmp_path)
+
+    restore.run_restore(
+        client,
+        config,
+        set_files,
+        True,
+        False,
+        staging_bid="20261014T1000Z",
+    )
+
+    staging = staging_dir_for(SITE_ROOT, "20261014T1000Z")
+    # The files archive was extracted into the site root.
+    extracted = posixpath.join(SITE_ROOT, "wp-config.php")
+    assert extracted in client.remote_fs
+    # Staging cleaned up after success.
+    assert not any(path.startswith(staging) for path in client.remote_fs)
     assert not any(path.startswith(staging) for path in client.remote_fs)
 
 

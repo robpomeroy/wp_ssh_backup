@@ -11,11 +11,14 @@ from __future__ import annotations
 
 import os
 import posixpath
+import sys
 from pathlib import Path
 
+import paramiko
 import pytest
 
 from common import (
+    WPSSHBackupError,
     allocate_remote_dir,
     backup_id,
     checksum_name,
@@ -62,21 +65,25 @@ def test_live_backup_and_restore_round_trip(
 
     # Exclusive remote directories: the allocator returns the only paths we
     # may delete, so a pre-existing or foreign directory is never touched.
+    # The cleanup guard starts immediately after the FIRST allocation and
+    # tracks only successfully allocated paths, so a failure allocating a
+    # later directory cannot leak the earlier ones.
     scratch = allocate_remote_dir(
         client, config.wp_site_root, "restore-scratch-"
     )
-    staging = allocate_remote_dir(
-        client, config.wp_site_root, "wp-ssh-backup-staging-"
-    )
-
+    allocated: list[str] = [scratch]
     try:
+        staging = allocate_remote_dir(
+            client, config.wp_site_root, "wp-ssh-backup-staging-"
+        )
+        allocated.append(staging)
         # --- Backup -------------------------------------------------------
         archive = files_archive_name(bid)
         run_remote_cmd_checked(
             client,
             f"tar czf {shquote(posixpath.join(staging, archive))} "
-            f"-C {shquote(config.wp_site_root)} . "
-            f"--exclude=./wp-content/cache",
+            f"--exclude=./wp-content/cache "
+            f"-C {shquote(config.wp_site_root)} .",
             timeout=3600,
         )
         run_remote_cmd_checked(
@@ -114,6 +121,15 @@ def test_live_backup_and_restore_round_trip(
         listing = run_remote_cmd_checked(client, f"ls {shquote(scratch)}")
         assert listing.strip(), "scratch directory should not be empty"
     finally:
-        # Delete only the paths the allocator returned.
-        run_remote_cmd_checked(client, f"rm -rf {shquote(scratch)}")
-        run_remote_cmd_checked(client, f"rm -rf {shquote(staging)}")
+        # Delete only the paths the allocator returned. Best-effort: a
+        # cleanup failure is reported as a warning and must not mask the
+        # original test failure.
+        for path in allocated:
+            try:
+                run_remote_cmd_checked(client, f"rm -rf {shquote(path)}")
+            except (WPSSHBackupError, OSError, paramiko.SSHException) as exc:
+                print(
+                    f"WARNING: could not remove remote directory "
+                    f"{path}: {exc}",
+                    file=sys.stderr,
+                )
