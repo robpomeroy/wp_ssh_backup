@@ -228,6 +228,51 @@ def test_connect_malformed_known_hosts_raises_wpssh_error(
         common.connect(config)
 
 
+def test_connect_undecodable_known_hosts_raises_wpssh_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Undecodable bytes in SSH_KNOWN_HOSTS must not leak a traceback."""
+    known_hosts = tmp_path / "known_hosts"
+    known_hosts.write_bytes(b"\xff\xfe\x00broken")
+
+    def failing_load(self: object, filename: str) -> None:
+        raise UnicodeDecodeError(
+            "utf-8", b"\xff\xfe\x00broken", 0, 1, "invalid start byte"
+        )
+
+    monkeypatch.setattr(
+        common.paramiko.SSHClient, "load_host_keys", failing_load
+    )
+    config = make_config(tmp_path, ssh_known_hosts=str(known_hosts))
+
+    with pytest.raises(
+        WPSSHBackupError, match="Could not load SSH_KNOWN_HOSTS"
+    ):
+        common.connect(config)
+
+
+def test_connect_malformed_system_host_keys_raises_wpssh_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A malformed default known_hosts file must not escape as a traceback."""
+
+    def failing_system_load(self: object) -> None:
+        raise UnicodeDecodeError(
+            "utf-8", b"\xff\xfe\x00broken", 0, 1, "invalid start byte"
+        )
+
+    monkeypatch.setattr(
+        common.paramiko.SSHClient, "load_system_host_keys",
+        failing_system_load,
+    )
+    config = make_config(tmp_path)
+
+    with pytest.raises(
+        WPSSHBackupError, match="Could not load the system known_hosts"
+    ):
+        common.connect(config)
+
+
 def test_main_reports_unreadable_known_hosts_as_error(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -322,6 +367,109 @@ def test_authorize_host_fingerprint_pin_match(
     assert known_hosts.read_text() == known_hosts_entry("example.com", 22, key)
 
 
+def test_authorize_host_unreadable_known_hosts_reports_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """A failing trust check must print ERROR: and exit 1, not traceback."""
+    key = make_key()
+    known_hosts = tmp_path / "known_hosts"
+    known_hosts.write_text(known_hosts_entry("example.com", 22, key))
+    config = make_config(tmp_path, ssh_known_hosts=str(known_hosts))
+
+    monkeypatch.setattr(authorize_host, "load_config", lambda: config)
+    monkeypatch.setattr(authorize_host, "fetch_host_key", lambda cfg: key)
+    monkeypatch.setattr(
+        authorize_host, "confirm_interactive", lambda *a, **k: True
+    )
+
+    def failing_trust(
+        path: object, hostname: str, port: int, k: object
+    ) -> bool:
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(authorize_host, "is_host_trusted", failing_trust)
+
+    exit_code = authorize_host.main([])
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert captured.err.startswith("ERROR: could not check ")
+    assert "Permission denied" in captured.err
+    # Nothing was saved and no success message was printed.
+    assert "Host key saved" not in captured.out
+
+
+def test_authorize_host_malformed_known_hosts_reports_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """A malformed known_hosts file must be reported, not traceback."""
+    key = make_key()
+    known_hosts = tmp_path / "known_hosts"
+    known_hosts.write_text("garbage line\n")
+    config = make_config(tmp_path, ssh_known_hosts=str(known_hosts))
+
+    monkeypatch.setattr(authorize_host, "load_config", lambda: config)
+    monkeypatch.setattr(authorize_host, "fetch_host_key", lambda cfg: key)
+    monkeypatch.setattr(
+        authorize_host, "confirm_interactive", lambda *a, **k: True
+    )
+
+    def failing_trust(
+        path: object, hostname: str, port: int, k: object
+    ) -> bool:
+        raise paramiko.SSHException("Invalid known_hosts entry")
+
+    monkeypatch.setattr(authorize_host, "is_host_trusted", failing_trust)
+
+    exit_code = authorize_host.main([])
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert captured.err.startswith("ERROR: could not check ")
+    assert "Invalid known_hosts entry" in captured.err
+
+
+def test_authorize_host_readonly_destination_reports_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """A read-only known_hosts destination must be reported, not saved."""
+    key = make_key()
+    known_hosts = tmp_path / "known_hosts"
+    known_hosts.parent.mkdir(parents=True, exist_ok=True)
+    known_hosts.write_text("")
+    config = make_config(tmp_path, ssh_known_hosts=str(known_hosts))
+
+    monkeypatch.setattr(authorize_host, "load_config", lambda: config)
+    monkeypatch.setattr(authorize_host, "fetch_host_key", lambda cfg: key)
+    monkeypatch.setattr(
+        authorize_host, "confirm_interactive", lambda *a, **k: True
+    )
+
+    def failing_append(
+        path: object, hostname: str, port: int, k: object
+    ) -> None:
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(
+        authorize_host, "append_to_known_hosts", failing_append
+    )
+
+    exit_code = authorize_host.main([])
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert captured.err.startswith("ERROR: could not save the host key to ")
+    assert "Permission denied" in captured.err
+    # The failure must not claim the host was saved.
+    assert "Host key saved" not in captured.out
+
+
 def test_authorize_host_fingerprint_pin_mismatch(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -387,6 +535,48 @@ def test_authorize_host_skips_already_trusted_key(
     assert "Already trusted" in out
     # Not duplicated.
     assert len(known_hosts.read_text().strip().splitlines()) == 1
+
+
+def test_append_to_known_hosts_inserts_missing_newline(
+    tmp_path: Path,
+) -> None:
+    """A file without a trailing newline must not swallow the new entry."""
+    key = make_key()
+    other = make_key()
+    known_hosts = tmp_path / "known_hosts"
+    known_hosts.parent.mkdir(parents=True, exist_ok=True)
+    # Existing entry WITHOUT a trailing newline.
+    existing = known_hosts_entry("other.example.net", 22, other)
+    known_hosts.write_text(existing.rstrip("\n"))
+
+    authorize_host.append_to_known_hosts(
+        known_hosts, "example.com", 22, key
+    )
+
+    lines = known_hosts.read_text().strip().splitlines()
+    assert len(lines) == 2
+    assert lines[0].startswith("other.example.net ")
+    assert lines[1].startswith("example.com ")
+    # Both entries must be parseable by paramiko.
+    host_keys = paramiko.HostKeys(str(known_hosts))
+    assert host_keys.lookup("example.com") is not None
+    assert host_keys.lookup("other.example.net") is not None
+
+
+def test_append_to_known_hosts_no_newline_for_empty_file(
+    tmp_path: Path,
+) -> None:
+    """An empty file must not gain a leading newline."""
+    key = make_key()
+    known_hosts = tmp_path / "known_hosts"
+    known_hosts.parent.mkdir(parents=True, exist_ok=True)
+    known_hosts.write_text("")
+
+    authorize_host.append_to_known_hosts(known_hosts, "example.com", 22, key)
+
+    content = known_hosts.read_text()
+    assert content == known_hosts_entry("example.com", 22, key)
+    assert not content.startswith("\n")
 
 
 def test_authorize_host_appends_when_key_saved_under_other_host(

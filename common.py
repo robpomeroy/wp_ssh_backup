@@ -162,6 +162,17 @@ def load_config(env_file: str | os.PathLike | None = None) -> Config:
             "WP_SITE_ROOT must be an absolute remote path "
             f"(starting with '/'), got {site_root!r}"
         )
+    if site_root.rstrip("/") == "":
+        # The staging dir is a sibling of the site root; for '/' it would
+        # be '/wp-ssh-backup-staging-...' — INSIDE the '.' being archived,
+        # so the backup would capture its own staging directory (including
+        # the database dump and the growing files archive).
+        raise ConfigError(
+            "WP_SITE_ROOT must not be '/': the staging directory would "
+            "sit inside the archived tree and the backup would capture "
+            "itself. Point WP_SITE_ROOT at the WordPress directory "
+            "(e.g. /home/user/public_html)."
+        )
 
     return Config(
         ssh_host=os.getenv("SSH_HOST", "").strip(),
@@ -202,7 +213,16 @@ def connect(config: Config) -> paramiko.SSHClient:
             the server's host key is not trusted.
     """
     client = paramiko.SSHClient()
-    client.load_system_host_keys()
+    try:
+        client.load_system_host_keys()
+    except (OSError, UnicodeDecodeError, paramiko.SSHException) as exc:
+        # A malformed default known_hosts file (e.g. undecodable bytes)
+        # would otherwise escape as a traceback before connect() is
+        # reached.
+        client.close()
+        raise WPSSHBackupError(
+            f"Could not load the system known_hosts file: {exc}"
+        ) from exc
     if config.ssh_known_hosts:
         known_hosts_path = Path(config.ssh_known_hosts).expanduser()
         if not known_hosts_path.is_file():
@@ -212,7 +232,11 @@ def connect(config: Config) -> paramiko.SSHClient:
             )
         try:
             client.load_host_keys(str(known_hosts_path))
-        except (OSError, paramiko.SSHException) as exc:
+        except (
+            OSError,
+            UnicodeDecodeError,
+            paramiko.SSHException,
+        ) as exc:
             # An unreadable or malformed known_hosts file raises before the
             # guarded connect() below; convert it so the CLIs report a
             # clear configuration error instead of a traceback.
@@ -982,16 +1006,40 @@ def parse_sha256sum_output(text: str) -> dict[str, str]:
     Parse `sha256sum` output into a dictionary mapping filenames to their
     SHA-256 digests.
 
+    Parsing is strict: every nonblank line must be a complete
+    `<digest> <name>` record (blank lines are allowed as separators), and
+    a filename may appear only once. Lenient parsing would let a manifest
+    with a malformed record or duplicate entries collapse into fewer
+    entries than it really contains, so callers relying on an exact entry
+    count could accept an invalid manifest.
+
     Args:
         text: The output of the `sha256sum` command as a string.
 
     Returns:
         A dictionary where the keys are filenames and the values are the
         corresponding SHA-256 digests.
+
+    Raises:
+        ChecksumError: If any nonblank line is malformed or a filename is
+            duplicated.
     """
     result: dict[str, str] = {}
-    for digest, name in SHA256SUM_LINE_RE.findall(text):
-        result[name.strip()] = digest.lower()
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        match = SHA256SUM_LINE_RE.match(line)
+        if not match:
+            raise ChecksumError(
+                f"Malformed checksum line: {line.strip()!r}"
+            )
+        digest, name = match.group(1), match.group(2)
+        name = name.strip()
+        if name in result:
+            raise ChecksumError(
+                f"Duplicate checksum entry for {name!r}"
+            )
+        result[name] = digest.lower()
     return result
 
 

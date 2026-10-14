@@ -14,6 +14,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
 import socket
 import sys
 from pathlib import Path
@@ -125,6 +126,10 @@ def append_to_known_hosts(
     """
     Append a host key entry to a known_hosts file, creating it if needed.
 
+    If the existing file does not end with a newline, one is inserted
+    first: appending directly would join the new entry to the last line,
+    leaving both entries unparseable while the CLI still reports success.
+
     Args:
         known_hosts_path: Path to the known_hosts file.
         hostname: The host name or IP address.
@@ -132,7 +137,16 @@ def append_to_known_hosts(
         key: The server's host key.
     """
     known_hosts_path.parent.mkdir(parents=True, exist_ok=True)
+    needs_newline = False
+    if known_hosts_path.is_file():
+        with open(known_hosts_path, "rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            if handle.seek(0, os.SEEK_CUR) > 0:
+                handle.seek(-1, os.SEEK_END)
+                needs_newline = handle.read(1) != b"\n"
     with open(known_hosts_path, "a", encoding="utf-8") as handle:
+        if needs_newline:
+            handle.write("\n")
         handle.write(known_hosts_entry(hostname, port, key))
 
 
@@ -226,15 +240,35 @@ def main(argv: list[str] | None = None) -> int:
             print("Aborted; nothing was saved.")
             return 1
 
-    if is_host_trusted(
-        known_hosts_path, config.ssh_host, config.ssh_port, key
-    ):
+    try:
+        trusted = is_host_trusted(
+            known_hosts_path, config.ssh_host, config.ssh_port, key
+        )
+    except (OSError, UnicodeDecodeError, paramiko.SSHException) as exc:
+        # An unreadable or malformed known_hosts file must not crash the
+        # CLI with a traceback.
+        print(
+            f"ERROR: could not check {known_hosts_path}: {exc}",
+            file=sys.stderr,
+        )
+        return 1
+    if trusted:
         print(f"Already trusted in {known_hosts_path}; nothing to do.")
         return 0
 
-    append_to_known_hosts(
-        known_hosts_path, config.ssh_host, config.ssh_port, key
-    )
+    try:
+        append_to_known_hosts(
+            known_hosts_path, config.ssh_host, config.ssh_port, key
+        )
+    except (OSError, UnicodeDecodeError, paramiko.SSHException) as exc:
+        # A read-only destination or a write failure must be reported
+        # without claiming the host was saved.
+        print(
+            f"ERROR: could not save the host key to {known_hosts_path}: "
+            f"{exc}",
+            file=sys.stderr,
+        )
+        return 1
     print(f"Host key saved to {known_hosts_path}.")
     print("backup.py and restore.py will now trust this host.")
     return 0

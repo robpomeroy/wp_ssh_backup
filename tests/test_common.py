@@ -438,6 +438,37 @@ def test_parse_sha256sum_output() -> None:
     }
 
 
+def test_parse_sha256sum_output_rejects_malformed_line() -> None:
+    """A malformed record must not be silently dropped."""
+    digest = "a" * 64
+    text = (
+        f"{digest}  wp-db-20261014T0930Z.tar.gz\n"
+        "this is not a checksum line\n"
+    )
+    with pytest.raises(ChecksumError, match="Malformed checksum line"):
+        parse_sha256sum_output(text)
+
+
+def test_parse_sha256sum_output_rejects_duplicate_names() -> None:
+    """Two entries for the same file must not collapse into one."""
+    digest_a = "a" * 64
+    digest_b = "b" * 64
+    text = (
+        f"{digest_a}  wp-db-20261014T0930Z.tar.gz\n"
+        f"{digest_b}  wp-db-20261014T0930Z.tar.gz\n"
+    )
+    with pytest.raises(ChecksumError, match="Duplicate checksum entry"):
+        parse_sha256sum_output(text)
+
+
+def test_parse_sha256sum_output_allows_blank_lines() -> None:
+    """Blank separator lines are permitted."""
+    digest = "a" * 64
+    text = f"\n{digest}  wp-db-20261014T0930Z.tar.gz\n\n"
+    result = parse_sha256sum_output(text)
+    assert result == {"wp-db-20261014T0930Z.tar.gz": digest}
+
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -499,6 +530,18 @@ def test_load_config_missing_required_key(tmp_path: Path) -> None:
 def test_load_config_relative_site_root_rejected(tmp_path: Path) -> None:
     with pytest.raises(ConfigError, match="absolute"):
         load_config(write_env(tmp_path, WP_SITE_ROOT="public_html"))
+
+
+def test_load_config_root_site_root_rejected(tmp_path: Path) -> None:
+    """WP_SITE_ROOT=/ would put staging inside the archived tree."""
+    with pytest.raises(ConfigError, match="must not be '/'"):
+        load_config(write_env(tmp_path, WP_SITE_ROOT="/"))
+
+
+def test_load_config_trailing_slash_root_rejected(tmp_path: Path) -> None:
+    """A trailing slash must not dodge the root check."""
+    with pytest.raises(ConfigError, match="must not be '/'"):
+        load_config(write_env(tmp_path, WP_SITE_ROOT="//"))
 
 
 def test_load_config_bad_port(tmp_path: Path) -> None:
