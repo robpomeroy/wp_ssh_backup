@@ -272,9 +272,17 @@ def verify_downloads(
                 f"Downloaded file missing: {local_path}"
             )
         checksum_file = local_paths[checksum_name(name)]
-        digests = parse_sha256sum_output(
-            checksum_file.read_text(encoding="utf-8")
-        )
+        try:
+            text = checksum_file.read_text(encoding="utf-8")
+        except UnicodeDecodeError as exc:
+            # An undecodable manifest is a checksum failure, not a crash:
+            # raising ChecksumError keeps the remote staging dir for retry
+            # and reports the problem through the normal error path.
+            raise ChecksumError(
+                f"{checksum_file} is not valid UTF-8 and cannot be parsed "
+                f"as a checksum manifest: {exc}"
+            ) from exc
+        digests = parse_sha256sum_output(text)
         if name not in digests:
             raise ChecksumError(
                 f"{checksum_file} contains no digest for {name}"

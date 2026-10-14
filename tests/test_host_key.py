@@ -6,6 +6,7 @@ import base64
 import hashlib
 from pathlib import Path
 
+import paramiko
 import pytest
 
 import authorize_host
@@ -183,6 +184,76 @@ def test_connect_with_existing_known_hosts_file(
     )
     connected = common.connect(config)
     assert connected is not None
+
+
+def test_connect_unreadable_known_hosts_raises_wpssh_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unreadable known_hosts file must raise WPSSHBackupError."""
+    known_hosts = tmp_path / "known_hosts"
+    known_hosts.write_text("")
+
+    def failing_load(self: object, filename: str) -> None:
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(
+        common.paramiko.SSHClient, "load_host_keys", failing_load
+    )
+    config = make_config(tmp_path, ssh_known_hosts=str(known_hosts))
+
+    with pytest.raises(
+        WPSSHBackupError, match="Could not load SSH_KNOWN_HOSTS"
+    ):
+        common.connect(config)
+
+
+def test_connect_malformed_known_hosts_raises_wpssh_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A malformed known_hosts file must raise WPSSHBackupError."""
+    known_hosts = tmp_path / "known_hosts"
+    known_hosts.write_text("this is not a valid known_hosts line\n")
+
+    def failing_load(self: object, filename: str) -> None:
+        raise paramiko.SSHException("Invalid known_hosts entry")
+
+    monkeypatch.setattr(
+        common.paramiko.SSHClient, "load_host_keys", failing_load
+    )
+    config = make_config(tmp_path, ssh_known_hosts=str(known_hosts))
+
+    with pytest.raises(
+        WPSSHBackupError, match="Could not load SSH_KNOWN_HOSTS"
+    ):
+        common.connect(config)
+
+
+def test_main_reports_unreadable_known_hosts_as_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The CLI must print ERROR: and exit 2, not a traceback."""
+    import backup
+
+    known_hosts = tmp_path / "known_hosts"
+    known_hosts.write_text("")
+
+    def failing_load(self: object, filename: str) -> None:
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(
+        common.paramiko.SSHClient, "load_host_keys", failing_load
+    )
+    config = make_config(tmp_path, ssh_known_hosts=str(known_hosts))
+    monkeypatch.setattr(backup, "load_config", lambda: config)
+
+    exit_code = backup.main([])
+
+    captured = capsys.readouterr()
+    assert exit_code == 2
+    assert captured.err.startswith("ERROR: ")
+    assert "Could not load SSH_KNOWN_HOSTS" in captured.err
 
 
 # ---------------------------------------------------------------------------
@@ -408,24 +479,180 @@ def test_is_host_trusted_missing_file(tmp_path: Path) -> None:
     )
 
 
+def test_is_host_trusted_hashed_entry(tmp_path: Path) -> None:
+    """OpenSSH hashed hostnames must be recognised as already trusted."""
+    key = make_key()
+    known_hosts = tmp_path / "known_hosts"
+    hashed = paramiko.HostKeys.hash_host("example.com")
+    known_hosts.write_text(f"{hashed} {key.get_name()} {key.get_base64()}\n")
+
+    assert authorize_host.is_host_trusted(
+        known_hosts, "example.com", 22, key
+    )
+    # A different key under the same hashed name is not trusted.
+    assert not authorize_host.is_host_trusted(
+        known_hosts, "example.com", 22, make_key()
+    )
+
+
+def test_authorize_host_skips_append_for_hashed_entry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """A hashed trusted entry must not gain a plaintext duplicate."""
+    key = make_key()
+    known_hosts = tmp_path / "known_hosts"
+    known_hosts.parent.mkdir(parents=True, exist_ok=True)
+    hashed = paramiko.HostKeys.hash_host("example.com")
+    known_hosts.write_text(f"{hashed} {key.get_name()} {key.get_base64()}\n")
+    config = make_config(tmp_path, ssh_known_hosts=str(known_hosts))
+
+    monkeypatch.setattr(authorize_host, "load_config", lambda: config)
+    monkeypatch.setattr(authorize_host, "fetch_host_key", lambda cfg: key)
+    monkeypatch.setattr(
+        authorize_host, "confirm_interactive", lambda *a, **k: True
+    )
+
+    exit_code = authorize_host.main([])
+
+    assert exit_code == 0
+    out = capsys.readouterr().out
+    assert "Already trusted" in out
+    # No plaintext duplicate was appended: still exactly one line, and it
+    # remains hashed.
+    lines = known_hosts.read_text().strip().splitlines()
+    assert len(lines) == 1
+    assert lines[0].startswith("|1|")
+
+
 # ---------------------------------------------------------------------------
 # fetch_host_key error handling
 # ---------------------------------------------------------------------------
+
+
+class _FakeTransport:
+    """Stand-in for paramiko.Transport taking a pre-opened socket."""
+
+    def __init__(self, sock: object) -> None:
+        self.sock = sock
+        self.closed = False
+
+    def start_client(self, timeout: float | None = None) -> None:
+        pass
+
+    def get_remote_server_key(self) -> object:
+        return make_key()
+
+    def close(self) -> None:
+        self.closed = True
 
 
 def test_fetch_host_key_unreachable_host(tmp_path: Path) -> None:
     """A socket-level failure must surface as ERROR:, not a traceback."""
     config = make_config(tmp_path)
 
-    def failing_transport(address: object) -> object:
+    def failing_connect(
+        address: object, timeout: float | None = None
+    ) -> object:
         raise OSError(65, "No route to host")
 
     monkey_transport = pytest.MonkeyPatch()
     with monkey_transport.context() as m:
+        m.setattr(authorize_host.socket, "create_connection", failing_connect)
+        with pytest.raises(WPSSHBackupError, match="Could not reach"):
+            authorize_host.fetch_host_key(config)
+    monkey_transport.undo()
+
+
+def test_fetch_host_key_connect_timeout(tmp_path: Path) -> None:
+    """The TCP connect must be bounded by an explicit socket timeout."""
+    config = make_config(tmp_path)
+    timeouts: list[float | None] = []
+
+    def hanging_connect(
+        address: object, timeout: float | None = None
+    ) -> object:
+        timeouts.append(timeout)
+        raise OSError("timed out")
+
+    monkey_transport = pytest.MonkeyPatch()
+    with monkey_transport.context() as m:
+        m.setattr(authorize_host.socket, "create_connection", hanging_connect)
+        with pytest.raises(WPSSHBackupError, match="Could not reach"):
+            authorize_host.fetch_host_key(config)
+    monkey_transport.undo()
+
+    # The connect was attempted with the explicit 30-second timeout.
+    assert timeouts == [30]
+
+
+def test_fetch_host_key_closes_socket_on_transport_failure(
+    tmp_path: Path,
+) -> None:
+    """A Transport failure must not leak the opened socket."""
+    config = make_config(tmp_path)
+    closed: list[bool] = []
+
+    class _FakeSock:
+        def settimeout(self, value: float | None) -> None:
+            pass
+
+        def close(self) -> None:
+            closed.append(True)
+
+    def failing_transport(sock: object) -> object:
+        raise paramiko.SSHException("handshake failed")
+
+    monkey_transport = pytest.MonkeyPatch()
+    with monkey_transport.context() as m:
+        m.setattr(
+            authorize_host.socket,
+            "create_connection",
+            lambda address, timeout=None: _FakeSock(),
+        )
         m.setattr(authorize_host.paramiko, "Transport", failing_transport)
         with pytest.raises(WPSSHBackupError, match="Could not reach"):
             authorize_host.fetch_host_key(config)
     monkey_transport.undo()
+
+    assert closed == [True]
+
+
+def test_fetch_host_key_success_uses_preopened_socket(
+    tmp_path: Path,
+) -> None:
+    """The happy path passes the socket to Transport and cleans up."""
+    config = make_config(tmp_path)
+    received: list[object] = []
+
+    class _FakeSock:
+        def settimeout(self, value: float | None) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    sock = _FakeSock()
+
+    monkey_transport = pytest.MonkeyPatch()
+    with monkey_transport.context() as m:
+        m.setattr(
+            authorize_host.socket,
+            "create_connection",
+            lambda address, timeout=None: sock,
+        )
+
+        def transport_factory(received_sock: object) -> _FakeTransport:
+            received.append(received_sock)
+            return _FakeTransport(received_sock)
+
+        m.setattr(authorize_host.paramiko, "Transport", transport_factory)
+        key = authorize_host.fetch_host_key(config)
+    monkey_transport.undo()
+
+    assert received == [sock]
+    assert key.get_name() == "ssh-rsa"
 
 
 def test_main_reports_unreachable_host_as_error(
@@ -435,12 +662,18 @@ def test_main_reports_unreachable_host_as_error(
     """main() must print ERROR: and exit 2 when the host is unreachable."""
     config = make_config(tmp_path)
 
-    def failing_transport(address: object) -> object:
+    def failing_transport(sock: object) -> object:
         raise OSError(65, "No route to host")
 
     monkey_transport = pytest.MonkeyPatch()
     with monkey_transport.context() as m:
-        m.setattr(authorize_host.paramiko, "Transport", failing_transport)
+        m.setattr(
+            authorize_host.socket,
+            "create_connection",
+            lambda address, timeout=None: (_ for _ in ()).throw(
+                OSError(65, "No route to host")
+            ),
+        )
         m.setattr(authorize_host, "load_config", lambda: config)
         exit_code = authorize_host.main([])
     monkey_transport.undo()

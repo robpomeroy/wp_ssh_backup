@@ -283,6 +283,28 @@ def test_split_db_host_variants() -> None:
     assert split_db_host(":3306") == ("localhost", "3306", None)
 
 
+def test_split_db_host_ipv6() -> None:
+    """IPv6 literals must not be mistaken for ports or socket paths."""
+    # Unbracketed IPv6 literals are returned whole.
+    assert split_db_host("::1") == ("::1", None, None)
+    assert split_db_host("2001:db8::1") == ("2001:db8::1", None, None)
+    # Bracketed IPv6 with a port.
+    assert split_db_host("[::1]:3306") == ("::1", "3306", None)
+    assert split_db_host("[2001:db8::1]:3307") == (
+        "2001:db8::1",
+        "3307",
+        None,
+    )
+    # Bracketed IPv6 with a socket path.
+    assert split_db_host("[::1]:/tmp/mysql.sock") == (
+        "::1",
+        None,
+        "/tmp/mysql.sock",
+    )
+    # Bracketed IPv6 with nothing after the closing bracket.
+    assert split_db_host("[::1]") == ("::1", None, None)
+
+
 # ---------------------------------------------------------------------------
 # Timestamps and naming
 # ---------------------------------------------------------------------------

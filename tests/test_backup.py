@@ -298,6 +298,51 @@ def test_run_backup_checksum_mismatch_keeps_staging(
     assert any(path.startswith(staging) for path in client.remote_fs)
 
 
+def test_verify_downloads_undecodable_manifest_raises_checksum_error(
+    tmp_path: Path,
+) -> None:
+    """An invalid-UTF-8 manifest must raise ChecksumError, not crash."""
+    archive = files_archive_name(TS)
+    archive_path = tmp_path / archive
+    archive_path.write_bytes(b"payload")
+    checksum_path = tmp_path / checksum_name(archive)
+    checksum_path.write_bytes(b"\xff\xfe\x00invalid-utf8")
+
+    with pytest.raises(ChecksumError, match="not valid UTF-8"):
+        backup.verify_downloads(
+            {
+                archive: archive_path,
+                checksum_name(archive): checksum_path,
+            },
+            [archive],
+        )
+
+
+def test_run_backup_undecodable_manifest_keeps_staging(
+    tmp_path: Path, backup_dir: Path
+) -> None:
+    """An undecodable manifest must keep staging for retry, like a mismatch."""
+    client = FakeSSHClient(SITE_ROOT, wp_cli="/usr/bin/wp")
+    original_get = client.sftp.get
+
+    def corrupting_get(remote_path: str, local_path: str) -> None:
+        original_get(remote_path, local_path)
+        if remote_path.endswith(".sha256"):
+            Path(local_path).write_bytes(b"\xff\xfe\x00invalid-utf8")
+
+    client.sftp.get = corrupting_get  # type: ignore[method-assign]
+    config = make_config(tmp_path)
+    staging = staging_dir_for(SITE_ROOT, TS)
+
+    with pytest.raises(ChecksumError, match="not valid UTF-8"):
+        backup.run_backup(
+            client, config, include_files=True, include_database=False, bid=TS
+        )
+
+    # Remote staging must be kept for retry.
+    assert any(path.startswith(staging) for path in client.remote_fs)
+
+
 def test_run_backup_remote_failure_removes_staging(
     tmp_path: Path, backup_dir: Path
 ) -> None:

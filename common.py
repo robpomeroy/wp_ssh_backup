@@ -210,7 +210,17 @@ def connect(config: Config) -> paramiko.SSHClient:
                 f"SSH_KNOWN_HOSTS file not found: {known_hosts_path}. "
                 "Run authorize_host.py to create it."
             )
-        client.load_host_keys(str(known_hosts_path))
+        try:
+            client.load_host_keys(str(known_hosts_path))
+        except (OSError, paramiko.SSHException) as exc:
+            # An unreadable or malformed known_hosts file raises before the
+            # guarded connect() below; convert it so the CLIs report a
+            # clear configuration error instead of a traceback.
+            client.close()
+            raise WPSSHBackupError(
+                f"Could not load SSH_KNOWN_HOSTS file "
+                f"{known_hosts_path}: {exc}"
+            ) from exc
     # Unknown host keys are always rejected; there is no auto-add.
     client.set_missing_host_key_policy(paramiko.RejectPolicy())
 
@@ -694,6 +704,12 @@ def split_db_host(db_host: str) -> tuple[str, str | None, str | None]:
     """
     Split a wp-config DB_HOST value into (host, port, socket path).
 
+    IPv6 literals are handled per MySQL conventions: an unbracketed
+    address such as '::1' is returned whole (it contains no port or
+    socket suffix), while a bracketed address such as '[::1]:3306' is
+    unwrapped before the port or socket path after the closing bracket is
+    parsed.
+
     Args:
         db_host: The DB_HOST value from wp-config.php.
 
@@ -701,6 +717,23 @@ def split_db_host(db_host: str) -> tuple[str, str | None, str | None]:
         A tuple of (host, port, socket path), where port and socket path may be
         None.
     """
+    # Bracketed IPv6 literal, optionally with :port or :/socket/path.
+    if db_host.startswith("["):
+        closing = db_host.find("]")
+        if closing != -1:
+            host = db_host[1:closing]
+            rest = db_host[closing + 1:]
+            if rest.startswith(":"):
+                rest = rest[1:]
+                if rest.isdigit():
+                    return host, rest, None
+                if rest:
+                    return host, None, rest
+            return host, None, None
+    # Unbracketed IPv6 literal ('::1', '2001:db8::1'): more than one
+    # colon means it cannot be a host:port or host:socket form.
+    if db_host.count(":") > 1:
+        return db_host, None, None
     if ":" not in db_host:
         return db_host, None, None
     host, _, rest = db_host.partition(":")

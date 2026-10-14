@@ -14,6 +14,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import socket
 import sys
 from pathlib import Path
 
@@ -36,6 +37,11 @@ def fetch_host_key(config: Config) -> paramiko.PKey:
     before authentication would begin, so nothing secret is transmitted and
     the server cannot learn anything about the caller beyond its IP.
 
+    The TCP connection itself is opened with an explicit socket timeout:
+    constructing Transport from an address would connect without one and
+    could block for the OS socket timeout before the handshake timer even
+    starts.
+
     Args:
         config: The configuration object with SSH host/port details.
 
@@ -45,14 +51,21 @@ def fetch_host_key(config: Config) -> paramiko.PKey:
     Raises:
         WPSSHBackupError: If the transport cannot be established.
     """
+    sock: socket.socket | None = None
     transport: paramiko.Transport | None = None
     try:
-        # Transport() performs socket creation and may raise OSError (e.g.
-        # DNS failure, connection refused) before start_client() is ever
-        # reached, so construction must happen inside the guarded block.
-        transport = paramiko.Transport((config.ssh_host, config.ssh_port))
-        transport.start_client(timeout=30)
-        return transport.get_remote_server_key()
+        # Bound the TCP connect explicitly; Transport(addr) would connect
+        # with no timeout and could hang for the OS default.
+        sock = socket.create_connection(
+            (config.ssh_host, config.ssh_port), timeout=30
+        )
+        sock.settimeout(None)
+        transport = paramiko.Transport(sock)
+        try:
+            transport.start_client(timeout=30)
+            return transport.get_remote_server_key()
+        finally:
+            transport.close()
     except (paramiko.SSHException, OSError) as exc:
         raise WPSSHBackupError(
             f"Could not reach {config.ssh_host}:{config.ssh_port} to fetch "
@@ -61,6 +74,8 @@ def fetch_host_key(config: Config) -> paramiko.PKey:
     finally:
         if transport is not None:
             transport.close()
+        if sock is not None:
+            sock.close()
 
 
 def is_host_trusted(
@@ -91,15 +106,17 @@ def is_host_trusted(
     # Reuse known_hosts_entry's naming ([host]:port for non-standard
     # ports) so the lookup key cannot drift from what we write.
     name = known_hosts_entry(hostname, port, key).split(" ", 1)[0]
+    # HostKeys.lookup resolves OpenSSH hashed hostnames ('|1|...' entries)
+    # as well as plaintext ones, so an already-trusted hashed entry is
+    # recognised instead of being duplicated as a new plaintext line that
+    # would expose the host name the user chose to hash.
     host_keys = paramiko.HostKeys(str(known_hosts_path))
-    for entry in host_keys._entries:
-        if name not in entry.hostnames:
-            continue
-        if entry.key is not None and fingerprint(entry.key) == fingerprint(
-            key
-        ):
-            return True
-    return False
+    matching = host_keys.lookup(name)
+    if not matching:
+        return False
+    return any(
+        fingerprint(pkey) == fingerprint(key) for pkey in matching.values()
+    )
 
 
 def append_to_known_hosts(
