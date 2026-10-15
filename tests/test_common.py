@@ -268,6 +268,37 @@ def test_mysql_client_config_socket_takes_precedence() -> None:
     assert "port=" not in body
 
 
+@pytest.mark.parametrize(
+    ("kwargs", "option"),
+    [
+        ({"host": "bad\nhost"}, "DB_HOST"),
+        ({"host": "bad\rhost"}, "DB_HOST"),
+        ({"user": "bad\nuser"}, "DB_USER"),
+        ({"password": "bad\npass"}, "DB_PASSWORD"),
+        ({"password": "bad\rpass"}, "DB_PASSWORD"),
+        ({"port": "3306\n"}, "DB_PORT"),
+        ({"socket": "/tmp/bad\nsock"}, "DB_HOST"),
+    ],
+    ids=[
+        "host-newline",
+        "host-carriage-return",
+        "user-newline",
+        "password-newline",
+        "password-carriage-return",
+        "port-newline",
+        "socket-newline",
+    ],
+)
+def test_mysql_client_config_rejects_control_characters(
+    kwargs: dict, option: str
+) -> None:
+    values = {"host": "h", "user": "u", "password": "p"}
+    values.update(kwargs)
+
+    with pytest.raises(ConfigError, match=option):
+        mysql_client_config(**values)
+
+
 def test_split_db_host_variants() -> None:
     assert split_db_host("localhost") == ("localhost", None, None)
     assert split_db_host("db.example.com:3306") == (

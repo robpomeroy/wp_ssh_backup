@@ -408,6 +408,10 @@ def create_staging_dir(
     and therefore different directories, and a collision (astronomically
     unlikely) aborts instead of sharing artifacts.
 
+    The directory is created with -m 700 so a permissive umask (e.g. a
+    shared-group 0002) never leaves it writable by other accounts between
+    creation and the later 0700 chmod.
+
     The 0700 chmod is issued separately by the caller (inside its cleanup
     scope): mkdir and chmod chained with && would leave an orphaned
     directory on the host if mkdir succeeded but chmod failed, before
@@ -426,7 +430,7 @@ def create_staging_dir(
     """
     staging = staging_dir_for(config.wp_site_root, bid)
     code, _, err = run_remote_cmd(
-        client, f"mkdir {shquote(staging)}"
+        client, f"mkdir -m 700 {shquote(staging)}"
     )
     if code != 0:
         raise WPSSHBackupError(

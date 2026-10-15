@@ -40,6 +40,10 @@ def test_allocate_creates_directory_with_bare_mkdir() -> None:
     assert len(mkdir_commands) == 1
     assert "mkdir -p" not in mkdir_commands[0]
     assert path in mkdir_commands[0]
+    # Created 0700 in the mkdir itself: a permissive umask must not leave
+    # the directory writable by others before any later chmod runs.
+    assert mkdir_commands[0].startswith("mkdir -m 700 ")
+    assert client.directory_modes[path] == 0o700
 
 
 def test_allocate_retries_on_collision_with_new_id() -> None:

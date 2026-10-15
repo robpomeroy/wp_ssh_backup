@@ -869,6 +869,9 @@ def test_run_backup_chmod_runs_before_any_artifacts(
     assert len(mkdir_commands) == 1
     assert len(chmod_commands) == 1
     assert "&&" not in mkdir_commands[0]
+    # The directory is created 0700 in the mkdir itself, so a permissive
+    # umask never leaves it writable by others before the chmod runs.
+    assert mkdir_commands[0].startswith("mkdir -m 700 ")
     assert chmod_commands[0].startswith(f"chmod 700 '{staging}'")
     assert client.commands.index(chmod_commands[0]) < client.commands.index(
         artifact_commands[0]

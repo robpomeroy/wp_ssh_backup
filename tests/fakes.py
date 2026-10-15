@@ -255,7 +255,7 @@ class FakeSSHClient:
 
     def _mkdir(self, command: str, stderr: io.BytesIO) -> int:
         """Bare mkdir: fails if the directory already exists."""
-        target = re.search(r"mkdir\s+'([^']+)'", command)
+        target = re.search(r"mkdir\s+(?:-m\s+\d{3,4}\s+)?'([^']+)'", command)
         if target:
             path = target.group(1).rstrip("/")
             if path in self.directories:
@@ -265,6 +265,9 @@ class FakeSSHClient:
                 )
                 return 1
             self.directories.add(path)
+            mode = re.search(r"-m\s+(\d{3,4})", command)
+            if mode:
+                self.directory_modes[path] = int(mode.group(1), 8)
         return 0
 
     def _chmod(self, command: str, stderr: io.BytesIO) -> int:

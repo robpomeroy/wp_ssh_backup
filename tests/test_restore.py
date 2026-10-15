@@ -414,6 +414,10 @@ def test_run_restore_files_round_trip(tmp_path: Path) -> None:
     # The staging directory was restricted to the owner (0700) so other
     # host users cannot reach the credentials file inside it.
     assert client.directory_modes[staging] == 0o700
+    # Created 0700 in the mkdir itself: a permissive umask must not leave
+    # the directory writable by others before the chmod runs.
+    mkdir_commands = [c for c in client.commands if c.startswith("mkdir ")]
+    assert mkdir_commands[0].startswith("mkdir -m 700 ")
 
 
 def test_import_database_rejects_traversal_member(tmp_path: Path) -> None:

@@ -822,12 +822,14 @@ def run_restore(
 
     # Bare mkdir (no -p): the staging dir is exclusive to this run, and a
     # collision aborts instead of sharing artifacts with another run.
+    # -m 700 creates it owner-only in the mkdir itself, so a permissive
+    # umask never leaves it writable by others before the later chmod.
     # The 0700 chmod is issued separately INSIDE the try block below:
     # chained 'mkdir && chmod' would orphan the directory if mkdir
     # succeeded but chmod failed, before the cleanup block was entered.
     code, _, err = run_remote_cmd(
         client,
-        f"mkdir {shquote(staging)}",
+        f"mkdir -m 700 {shquote(staging)}",
     )
     if code != 0:
         raise WPSSHBackupError(

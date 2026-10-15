@@ -845,11 +845,31 @@ def mysql_client_config(
 
     Returns:
         A string containing the [client] option-file body.
+
+    Raises:
+        ConfigError: If any option value contains a line break or other
+            control character, which would corrupt the option file.
     """
 
     def escape(value: str) -> str:
         return value.replace("\\", "\\\\").replace('"', '\\"')
 
+    def check(value: str, option: str) -> str:
+        if any(ord(ch) < 0x20 or ch == "\x7f" for ch in value):
+            raise ConfigError(
+                f"wp-config.php DB_{option} contains a line break or "
+                "control character; it cannot be written to a MySQL "
+                "option file."
+            )
+        return value
+
+    check(host, "HOST")
+    check(user, "USER")
+    check(password, "PASSWORD")
+    if port:
+        check(port, "PORT")
+    if socket:
+        check(socket, "HOST")
     lines = ["[client]"]
     if socket:
         lines.append(f'socket="{escape(socket)}"')
@@ -1303,8 +1323,12 @@ def allocate_remote_dir(
     last_error = ""
     for _ in range(max(1, attempts)):
         candidate = posixpath.join(parent, prefix + backup_id())
+        # -m 700 creates the directory with owner-only permissions in the
+        # mkdir itself: under a permissive umask (e.g. 0002) a bare mkdir
+        # would leave it group/world-writable until any later chmod, and
+        # another account could plant files inside it.
         code, _, err = run_remote_cmd(
-            client, f"mkdir {shquote(candidate)}"
+            client, f"mkdir -m 700 {shquote(candidate)}"
         )
         if code == 0:
             return candidate
