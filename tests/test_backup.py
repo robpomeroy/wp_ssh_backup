@@ -657,6 +657,116 @@ def test_run_backup_sftp_failure_discards_temp_downloads(
     assert not any(path.startswith(staging) for path in client.remote_fs)
 
 
+@pytest.mark.parametrize("artifact", ["archive", "checksum"])
+@pytest.mark.parametrize("kind", ["file", "directory", "symlink"])
+def test_run_backup_preserves_existing_temp_paths(
+    tmp_path: Path,
+    backup_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    artifact: str,
+    kind: str,
+) -> None:
+    import os
+
+    if kind == "symlink" and os.name == "nt":
+        pytest.skip("symlink creation requires privileges on Windows")
+
+    archive = files_archive_name(TS)
+    name = archive if artifact == "archive" else checksum_name(archive)
+    existing = backup_dir / (name + ".part")
+    target = tmp_path / "target"
+    if kind == "directory":
+        existing.mkdir()
+        (existing / "keep").write_bytes(b"prior-content")
+    elif kind == "symlink":
+        target.write_bytes(b"prior-content")
+        existing.symlink_to(target)
+    else:
+        existing.write_bytes(b"prior-content")
+
+    original_unlink = Path.unlink
+    attempted: list[Path] = []
+
+    def unlink(path: Path, missing_ok: bool = False) -> None:
+        attempted.append(path)
+        original_unlink(path, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", unlink)
+    client = FakeSSHClient(SITE_ROOT, wp_cli="/usr/bin/wp")
+    with pytest.raises(OSError) as caught:
+        backup.run_backup(
+            client, make_config(tmp_path),
+            include_files=True, include_database=False, bid=TS,
+        )
+
+    assert not isinstance(caught.value, IsADirectoryError)
+    assert existing not in attempted
+    assert list(backup_dir.iterdir()) == [existing]
+    if kind == "directory":
+        assert (existing / "keep").read_bytes() == b"prior-content"
+    else:
+        assert existing.read_bytes() == b"prior-content"
+    if kind == "symlink":
+        assert existing.is_symlink()
+        assert target.read_bytes() == b"prior-content"
+    assert staging_dir_for(SITE_ROOT, TS) not in client.directories
+
+
+@pytest.mark.parametrize("failure", ["transfer", "checksum"])
+def test_run_backup_cleanup_failure_preserves_original_exception(
+    tmp_path: Path,
+    backup_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+    failure: str,
+) -> None:
+    import paramiko
+
+    client = FakeSSHClient(SITE_ROOT, wp_cli="/usr/bin/wp")
+    original_getfo = client.sftp.getfo
+    original_error = paramiko.SSHException("original transfer failure")
+    archive = backup_dir / (files_archive_name(TS) + ".part")
+    original_unlink = Path.unlink
+    attempted: list[Path] = []
+
+    def getfo(remote_path, local_file):
+        original_getfo(remote_path, local_file)
+        if failure == "transfer":
+            raise original_error
+        if remote_path.endswith(".sha256"):
+            local_file.seek(0)
+            local_file.write(b"\xff")
+
+    def unlink(path: Path, missing_ok: bool = False) -> None:
+        attempted.append(path)
+        if path == archive:
+            raise PermissionError("cleanup denied")
+        original_unlink(path, missing_ok=missing_ok)
+
+    monkeypatch.setattr(client.sftp, "getfo", getfo)
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "unlink", unlink)
+        expected = paramiko.SSHException if failure == "transfer" else ChecksumError
+        with pytest.raises(expected) as caught:
+            backup.run_backup(
+                client, make_config(tmp_path),
+                include_files=True, include_database=False, bid=TS,
+            )
+
+    if failure == "transfer":
+        assert caught.value is original_error
+    else:
+        assert "not valid UTF-8" in str(caught.value)
+        assert backup_dir / (checksum_name(files_archive_name(TS)) + ".part") in attempted
+    assert list(backup_dir.iterdir()) == [archive]
+    warning = capsys.readouterr().err
+    assert "WARNING:" in warning
+    assert str(archive) in warning
+    assert "cleanup denied" in warning
+    staging = staging_dir_for(SITE_ROOT, TS)
+    assert (staging in client.directories) == (failure == "checksum")
+
+
 def test_run_backup_remote_failure_removes_staging(
     tmp_path: Path, backup_dir: Path
 ) -> None:
@@ -795,3 +905,66 @@ def test_main_reports_sftp_failure_as_error(
     err = capsys.readouterr().err
     assert err.startswith("ERROR: ")
     assert "SFTP subsystem failed" in err
+
+
+@pytest.mark.parametrize(
+    ("failure_stage", "error_type"),
+    [
+        (None, None),
+        ("pruning", PermissionError),
+        ("pruning", FileNotFoundError),
+        ("stat", PermissionError),
+        ("stat", FileNotFoundError),
+    ],
+)
+def test_main_handles_local_post_processing(
+    tmp_path: Path,
+    backup_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+    failure_stage: str | None,
+    error_type: type[OSError] | None,
+) -> None:
+    client = FakeSSHClient(SITE_ROOT)
+    config = make_config(tmp_path)
+    archive = backup_dir / files_archive_name(TS)
+    original_prune = backup.prune_local_backups
+    original_stat = Path.stat
+
+    def failing_stat(path: Path, *args, **kwargs):
+        if path == archive and error_type is not None:
+            raise error_type("Backup directory unavailable")
+        return original_stat(path, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        def prune(directory: Path, retention_days: int) -> list[str]:
+            if failure_stage == "pruning" and error_type is not None:
+                raise error_type("Backup directory unavailable")
+            removed = original_prune(directory, retention_days)
+            if failure_stage == "stat":
+                patch.setattr(Path, "stat", failing_stat)
+            return removed
+
+        patch.setattr(backup, "load_config", lambda: config)
+        patch.setattr(backup, "connect", lambda cfg: client)
+        patch.setattr(backup, "backup_id", lambda: TS)
+        patch.setattr(backup, "prune_local_backups", prune)
+
+        exit_code = backup.main(["--files"])
+
+    output = capsys.readouterr()
+    assert archive.is_file()
+    assert (backup_dir / checksum_name(archive.name)).is_file()
+    assert staging_dir_for(SITE_ROOT, TS) not in client.directories
+    if failure_stage is None:
+        assert exit_code == 0
+        assert f"Backup complete: {TS}" in output.out
+        assert output.err == ""
+    else:
+        assert exit_code == 1
+        assert output.err.startswith(f"ERROR: Backup {TS} was downloaded")
+        assert "verified" in output.err
+        assert str(backup_dir) in output.err
+        assert "Backup directory unavailable" in output.err
+        assert "Backup complete:" not in output.out
+        assert "Traceback" not in output.err

@@ -378,7 +378,8 @@ def run_remote_cmd_checked(
 
 
 def sftp_download(
-    sftp: paramiko.SFTPClient, remote_path: str, local_path: str | Path
+    sftp: paramiko.SFTPClient, remote_path: str, local_path: str | Path,
+    *, created_paths: list[Path] | None = None,
 ) -> Path:
     """
     Download a file from the remote host via SFTP into local_path.
@@ -396,6 +397,8 @@ def sftp_download(
         sftp: An active SFTP client connected to the remote host.
         remote_path: The path to the file on the remote host.
         local_path: The local path where the file should be saved.
+        created_paths: If supplied, records the destination immediately after
+            exclusive creation, including when the subsequent transfer fails.
 
     Returns:
         The local path to the downloaded file as a Path object.
@@ -411,6 +414,8 @@ def sftp_download(
     # already exists at the path, then streams into a private file.
     fd = os.open(local, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
+        if created_paths is not None:
+            created_paths.append(local)
         stream = os.fdopen(fd, "wb", closefd=False)
         try:
             sftp.getfo(remote_path, stream)

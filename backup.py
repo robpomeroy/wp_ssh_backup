@@ -225,25 +225,16 @@ def _temp_download_name(name: str) -> str:
     return name + ".part"
 
 
-def _discard_temp_downloads(
-    backup_dir: Path, archive_names: list[str]
-) -> None:
-    """
-    Delete this run's temporary downloads, whatever stage they reached.
-
-    Temporary names carry this run's backup id, so a concurrent run's
-    downloads are never touched. Unverified files must never linger under
-    any name: find_backup_sets() groups files by backup id, so a corrupt
-    archive-plus-manifest pair left in BACKUP_DIR would be advertised as a
-    complete set and a default restore could select it instead of a valid
-    older backup.
-    """
-    for name in archive_names:
-        for temp in (
-            _temp_download_name(name),
-            _temp_download_name(checksum_name(name)),
-        ):
-            (backup_dir / temp).unlink(missing_ok=True)
+def _discard_temp_downloads(created_paths: list[Path]) -> None:
+    """Remove only owned temporary files without masking the original error."""
+    for path in created_paths:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as exc:
+            print(
+                f"WARNING: could not remove temporary download {path}: {exc}",
+                file=sys.stderr,
+            )
 
 
 def download_artifacts(
@@ -251,6 +242,8 @@ def download_artifacts(
     staging: str,
     archive_names: list[str],
     backup_dir: Path,
+    *,
+    created_paths: list[Path] | None = None,
 ) -> dict[str, Path]:
     """
     Download each archive and its .sha256 file into backup_dir.
@@ -266,6 +259,8 @@ def download_artifacts(
         staging: The remote staging directory containing the archives.
         archive_names: A list of archive filenames to download.
         backup_dir: The local directory where the files will be stored.
+        created_paths: If supplied, records files created by this run, even
+            if a transfer fails before this function returns.
 
     Returns:
         A dictionary mapping each archive's final name (and its checksum
@@ -277,11 +272,13 @@ def download_artifacts(
             sftp,
             posixpath.join(staging, name),
             backup_dir / _temp_download_name(name),
+            created_paths=created_paths,
         )
         local_paths[checksum_name(name)] = sftp_download(
             sftp,
             posixpath.join(staging, checksum_name(name)),
             backup_dir / _temp_download_name(checksum_name(name)),
+            created_paths=created_paths,
         )
     return local_paths
 
@@ -497,10 +494,12 @@ def run_backup(
         # default restore could then select the corrupt newest backup
         # instead of a valid older one.
         published = False
+        created_paths: list[Path] = []
         try:
             with client.open_sftp() as sftp:
                 temp_paths = download_artifacts(
-                    sftp, staging, archive_names, backup_dir
+                    sftp, staging, archive_names, backup_dir,
+                    created_paths=created_paths,
                 )
             verify_downloads(temp_paths, archive_names)
             local_paths = publish_downloads(
@@ -513,7 +512,7 @@ def run_backup(
                 # failure was a checksum mismatch or a dropped transfer.
                 # The remote staging decision is made by the handlers
                 # below (kept for a checksum retry, removed otherwise).
-                _discard_temp_downloads(backup_dir, archive_names)
+                _discard_temp_downloads(created_paths)
         print("Local checksum verification passed.")
     except ChecksumError:
         # Keep the remote staging dir so the transfer can be retried.
@@ -584,11 +583,19 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         client.close()
 
-    removed = prune_local_backups(config.backup_dir, config.retention_days)
-    if removed:
-        print(f"Pruned local backup sets: {', '.join(removed)}")
+    try:
+        removed = prune_local_backups(config.backup_dir, config.retention_days)
+        if removed:
+            print(f"Pruned local backup sets: {', '.join(removed)}")
 
-    total = sum(p.stat().st_size for p in local_paths.values())
+        total = sum(p.stat().st_size for p in local_paths.values())
+    except OSError as exc:
+        print(
+            f"ERROR: Backup {bid} was downloaded and verified in "
+            f"{config.backup_dir}, but local post-processing failed: {exc}",
+            file=sys.stderr,
+        )
+        return 1
     print(f"Backup complete: {bid} ({human_size(total)} downloaded).")
     return 0
 

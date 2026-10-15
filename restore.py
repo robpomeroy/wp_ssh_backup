@@ -11,6 +11,7 @@ import argparse
 import posixpath
 import shlex
 import sys
+import tarfile
 import time
 from pathlib import Path
 
@@ -346,6 +347,50 @@ def verify_remote_checksums(
         sftp.close()
 
 
+_ALLOWED_MEMBER_TYPES = frozenset({
+    tarfile.REGTYPE,
+    tarfile.AREGTYPE,
+    tarfile.DIRTYPE,
+    tarfile.SYMTYPE,
+    tarfile.LNKTYPE,
+})
+
+
+def _validate_local_member_types(archive: Path) -> None:
+    """
+    Reject a files archive containing any non-allowed member type.
+
+    The remote check relies on tar's verbose listing, whose type letters
+    vary between implementations and versions (e.g. a contiguous file may
+    be shown as a regular file). The local archive is byte-identical to
+    the uploaded one, which remote checksum verification confirms, so its
+    raw type flags are authoritative. Only regular files, directories,
+    symlinks and hard links are allowed; the links themselves are
+    validated by _validate_members() before extraction.
+
+    Raises:
+        WPSSHBackupError: If a member type is unsupported or the archive
+            cannot be read.
+    """
+    if not archive.is_file():
+        raise MissingArtifactError(f"Local file missing: {archive}")
+    try:
+        with tarfile.open(archive, mode="r:gz") as tar:
+            for member in tar:
+                if member.type not in _ALLOWED_MEMBER_TYPES:
+                    raise WPSSHBackupError(
+                        f"Refusing to restore {archive.name}: unsupported "
+                        f"member type {member.type!r} for {member.name!r}; "
+                        "only regular files, directories and links are "
+                        "allowed."
+                    )
+    except (tarfile.TarError, EOFError, OSError) as exc:
+        raise WPSSHBackupError(
+            f"Refusing to restore {archive.name}: cannot read archive "
+            f"members: {exc}"
+        ) from exc
+
+
 def _validate_members(
     archive: str,
     client: paramiko.SSHClient,
@@ -361,6 +406,8 @@ def _validate_members(
     (no absolute paths or '..' traversal), and every symlink target must
     resolve inside the site root when joined to the link's directory —
     including chains that would escape via another member.
+    Only regular files, directories, and validated links are permitted;
+    special and unknown member types are rejected before extraction.
 
     The listing is requested with --quoting-style=shell-always so every
     name and link target is exactly one shell token even when it contains
@@ -382,7 +429,8 @@ def _validate_members(
 
     Raises:
         WPSSHBackupError: If any member name or symlink target escapes
-            the restore tree, or if the listing cannot be decoded.
+            the restore tree, a member type is unsupported, or the listing
+            cannot be decoded.
     """
     # -v is required for link targets; --quoting-style=shell-always makes
     # every field unambiguous. Options must precede the archive operand
@@ -446,11 +494,26 @@ def _validate_members(
                 f"Refusing to extract {archive}: unexpected tar listing "
                 f"line {line!r}"
             )
-        if fields[-2] == "->":
+        kind = fields[0][:1]
+        if kind not in ("-", "d", "l", "h"):
+            raise WPSSHBackupError(
+                f"Refusing to extract {archive}: unsupported member type "
+                f"{kind!r} in tar listing line {line!r}"
+            )
+        if kind == "l" and len(fields) >= 8 and fields[-2] == "->":
             links[fields[-3]] = fields[-1]
-        elif fields[-3:-1] == ["link", "to"]:
+        elif (
+            kind == "h"
+            and len(fields) >= 9
+            and fields[-3:-1] == ["link", "to"]
+        ):
             hard_links.append((fields[-4], fields[-1]))
-        elif fields[0].startswith("-"):
+        elif kind in ("l", "h"):
+            raise WPSSHBackupError(
+                f"Refusing to extract {archive}: unexpected tar link "
+                f"listing line {line!r}"
+            )
+        elif kind == "-":
             # Only REGULAR members may serve as hard-link targets; a
             # directory (kind 'd') or anything exotic must not.
             regular_members.add(fields[-1].lstrip("/"))
@@ -787,6 +850,11 @@ def run_restore(
         print("Remote checksum verification passed.")
 
         if include_files:
+            # Checked after checksum verification so a corrupt archive is
+            # reported as a checksum failure, and before any extraction.
+            _validate_local_member_types(
+                set_files[files_archive_name(backup_bid)]
+            )
             started = _now()
             extract_files(client, config, staging, backup_bid)
             print(f"Files extracted ({_now() - started:.1f}s).")
@@ -858,7 +926,7 @@ def main(argv: list[str] | None = None) -> int:
             config.backup_dir,
         )
         client = connect(config)
-    except WPSSHBackupError as exc:
+    except (WPSSHBackupError, OSError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
 

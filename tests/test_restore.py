@@ -735,6 +735,92 @@ def test_extract_files_rejects_traversal_member(tmp_path: Path) -> None:
     assert posixpath.join(SITE_ROOT, "wp-config.php") not in client.remote_fs
 
 
+SPECIAL_MEMBER_TYPES = pytest.mark.parametrize(
+    "member_type",
+    [b"6", b"3", b"4", b"7", b"Z"],
+    ids=["fifo", "character-device", "block-device", "contiguous", "unknown"],
+)
+
+
+def _archive_with_special_member(member_type: bytes) -> bytes:
+    import io
+    import tarfile
+
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as tar:
+        regular = tarfile.TarInfo("wp-config.php")
+        regular.size = len(b"replacement")
+        tar.addfile(regular, io.BytesIO(b"replacement"))
+        special = tarfile.TarInfo("uploads/special")
+        special.type = member_type
+        if member_type == b"7":
+            # A contiguous member carries data and extracts as a file.
+            special.size = len(b"data")
+            tar.addfile(special, io.BytesIO(b"data"))
+        else:
+            tar.addfile(special)
+    return buffer.getvalue()
+
+
+@SPECIAL_MEMBER_TYPES
+@pytest.mark.parametrize("contiguous_listing_kind", ["C", "-"])
+def test_run_restore_rejects_special_members_before_extraction(
+    tmp_path: Path, member_type: bytes, contiguous_listing_kind: str
+) -> None:
+    """Special members are rejected from the archive's raw type flags.
+
+    The check must not depend on how the remote tar labels member types:
+    GNU tar 1.35 lists a contiguous file as 'C', but other implementations
+    may list it as a regular file ('-').
+    """
+    set_files = make_local_set(tmp_path / "backups", TS)
+    client = FakeSSHClient(SITE_ROOT, wp_cli="/usr/bin/wp")
+    client.contiguous_listing_kind = contiguous_listing_kind
+    config = make_config(tmp_path)
+    live_path = posixpath.join(SITE_ROOT, "wp-config.php")
+    client.remote_fs[live_path] = b"original site configuration"
+    archive_name = files_archive_name(TS)
+    data = _archive_with_special_member(member_type)
+    set_files[archive_name].write_bytes(data)
+    set_files[checksum_name(archive_name)].write_text(
+        f"{hashlib.sha256(data).hexdigest()}  {archive_name}\n"
+    )
+
+    with pytest.raises(WPSSHBackupError, match="unsupported member type"):
+        restore.run_restore(
+            client, config, set_files, True, False,
+            staging_bid="20261014T1000Z",
+        )
+
+    # Rejected before any extraction or listing; staging was cleaned up.
+    assert not any(command.startswith("tar ") for command in client.commands)
+    assert client.remote_fs == {live_path: b"original site configuration"}
+    staging = staging_dir_for(SITE_ROOT, "20261014T1000Z")
+    assert staging not in client.directories
+
+
+@SPECIAL_MEMBER_TYPES
+def test_extract_files_rejects_special_members_in_listing(
+    tmp_path: Path, member_type: bytes
+) -> None:
+    """The remote listing check independently blocks special members."""
+    client = FakeSSHClient(SITE_ROOT, wp_cli="/usr/bin/wp")
+    config = make_config(tmp_path)
+    staging = staging_dir_for(SITE_ROOT, "20261014T1000Z")
+    live_path = posixpath.join(SITE_ROOT, "wp-config.php")
+    client.remote_fs[live_path] = b"original site configuration"
+    client.remote_fs[posixpath.join(staging, files_archive_name(TS))] = (
+        _archive_with_special_member(member_type)
+    )
+
+    with pytest.raises(WPSSHBackupError, match="unsupported member type"):
+        restore.extract_files(client, config, staging, TS)
+
+    assert not any(command.startswith("tar xzf ") for command in client.commands)
+    assert client.remote_fs[live_path] == b"original site configuration"
+    assert posixpath.join(SITE_ROOT, "uploads/special") not in client.remote_fs
+
+
 def test_extract_files_allows_internal_symlink(tmp_path: Path) -> None:
     """A symlink resolving inside the site root must be allowed."""
     import io
@@ -1637,6 +1723,39 @@ def test_write_remote_file_restores_umask(tmp_path: Path) -> None:
         assert client.sftp.modes.get("/tmp/x.cnf") is not None
     finally:
         os.umask(before)
+
+
+@pytest.mark.parametrize("error_type", [PermissionError, OSError])
+def test_main_reports_backup_directory_listing_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+    error_type: type[OSError],
+) -> None:
+    config = make_config(tmp_path)
+    config.backup_dir.mkdir()
+    original_iterdir = Path.iterdir
+    error = error_type(f"Cannot list backup directory: {config.backup_dir}")
+
+    def iterdir(path: Path):
+        if path == config.backup_dir:
+            raise error
+        return original_iterdir(path)
+
+    def unexpected_connect(config: Config) -> None:
+        pytest.fail("Selection failure must not open an SSH connection")
+
+    monkeypatch.setattr(restore, "load_config", lambda: config)
+    monkeypatch.setattr(Path, "iterdir", iterdir)
+    monkeypatch.setattr(restore, "connect", unexpected_connect)
+
+    assert restore.main([]) == 2
+
+    output = capsys.readouterr()
+    assert output.err.startswith("ERROR: ")
+    assert str(error) in output.err
+    assert "Traceback" not in output.err
+    assert "Restore complete." not in output.out
 
 
 def test_main_reports_ssh_failure_as_error(

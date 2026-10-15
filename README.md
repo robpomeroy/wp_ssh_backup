@@ -114,6 +114,10 @@ To display the fingerprint without saving anything:
 python authorize_host.py --show
 ```
 
+`--show` and `--fingerprint` are mutually exclusive. Combining them is an
+argument error (exit status 2), rejected before configuration is loaded or a
+connection is made.
+
 If you have already connected to the server with the `ssh` command, its key is
 already in your `~/.ssh/known_hosts` and no authorisation step is needed.
 
@@ -159,8 +163,14 @@ often but you rarely upload new files.
 6. Checksums are re-verified locally. Only then are the files renamed to their
    final names. If verification fails, the partial downloads are deleted and
    the remote staging directory is **kept** so the transfer can be retried;
-   otherwise the staging directory is deleted.
+   otherwise the staging directory is deleted. Failed-run cleanup removes only
+   temporary files created by that run, preserving pre-existing `.part` paths.
+   Cleanup failures are reported as warnings without hiding the original error.
 7. Local backup sets older than `RETENTION_DAYS` are pruned.
+
+If local pruning or the final size calculation fails after a verified download,
+the CLI reports that the backup was downloaded and verified, includes the local
+filesystem error, and exits with status 1 rather than reporting full success.
 
 Backups are named `wp-db-<backup-id>.tar.gz` and `wp-files-<backup-id>.tar.gz`,
 where `<backup-id>` is a UTC timestamp plus a random run suffix, in the form
@@ -192,9 +202,19 @@ python restore.py [--timestamp <ts>] [--files] [--database] [--all]
 - An explicit `--timestamp` is strict: the set must exist and contain the
   requested artifacts; there is no fallback to older sets.
 
+If the local backup directory cannot be listed, restore reports an `ERROR:`
+message and exits with status 2 before opening an SSH connection.
+
 The restore process uploads the chosen tarballs to the server, verifies their
 checksums there, extracts the files into `WP_SITE_ROOT` and imports the database
 (via WP-CLI or `mysql`).
+
+Before extracting site files, restore permits only regular files, directories,
+and validated symbolic and hard links. Special members (including FIFOs,
+devices and contiguous files) and unknown member types are rejected before any
+site file is replaced. After checksum verification, the type flags are read
+directly from the local archive, so the check does not depend on how the
+server's `tar` labels member types; the server-side listing is checked as well.
 
 **Warning:** restoring overwrites the current site contents and database. Take a
 fresh backup immediately beforehand if you may need to roll back:

@@ -491,6 +491,33 @@ def test_authorize_host_fingerprint_pin_mismatch(
     assert "mismatch" in err.lower()
 
 
+@pytest.mark.parametrize("show_first", [True, False])
+def test_authorize_host_rejects_show_with_fingerprint(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+    show_first: bool,
+) -> None:
+    def unexpected_call(*args: object, **kwargs: object) -> None:
+        pytest.fail("Conflicting arguments must be rejected before any I/O")
+
+    monkeypatch.setattr(authorize_host, "load_config", unexpected_call)
+    monkeypatch.setattr(authorize_host, "fetch_host_key", unexpected_call)
+    monkeypatch.setattr(authorize_host, "confirm_interactive", unexpected_call)
+    monkeypatch.setattr(authorize_host, "append_to_known_hosts", unexpected_call)
+    args = ["--fingerprint", "SHA256:" + "A" * 43]
+    args = ["--show", *args] if show_first else [*args, "--show"]
+
+    with pytest.raises(SystemExit) as caught:
+        authorize_host.main(args)
+
+    assert caught.value.code == 2
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert "--show" in output.err
+    assert "--fingerprint" in output.err
+    assert "not allowed with argument" in output.err
+
+
 def test_authorize_host_show_does_not_save(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

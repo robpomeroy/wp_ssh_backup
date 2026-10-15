@@ -118,6 +118,9 @@ class FakeSSHClient:
         self.server_key: object | None = None
         self.trusted_fingerprints: set[str] = set()
         self.connect_calls: list[dict] = []
+        # Verbose-listing type letter for contiguous (CONTTYPE) members.
+        # GNU tar 1.35 prints 'C'; other tar implementations may print '-'.
+        self.contiguous_listing_kind = "C"
 
     # -- paramiko API -------------------------------------------------------
 
@@ -435,6 +438,9 @@ class FakeSSHClient:
                         elif member.islnk():
                             kind = "h"
                             perms = "rw-r--r--"
+                        elif member.type == tarfile.CONTTYPE:
+                            kind = self.contiguous_listing_kind
+                            perms = "rw-r--r--"
                         elif member.isfile():
                             kind = "-"
                             perms = "rw-r--r--"
@@ -451,7 +457,7 @@ class FakeSSHClient:
                             kind = "b"
                             perms = "rw-r--r--"
                         else:
-                            kind = "-"
+                            kind = "?"
                             perms = "rw-r--r--"
                         line = (
                             f"{kind}{perms} user/group 0 2026-01-01 "

@@ -184,14 +184,15 @@ def main(argv: list[str] | None = None) -> int:
             "fingerprint and records it in a known_hosts file."
         )
     )
-    parser.add_argument(
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
         "--fingerprint",
         help=(
             "Expected fingerprint (SHA256:...). When given, no interactive "
             "prompt is shown and the fetched key must match exactly."
         ),
     )
-    parser.add_argument(
+    group.add_argument(
         "--show",
         action="store_true",
         help="Display the fingerprint and exit without saving.",
