@@ -544,6 +544,46 @@ def test_load_config_trailing_slash_root_rejected(tmp_path: Path) -> None:
         load_config(write_env(tmp_path, WP_SITE_ROOT="//"))
 
 
+def test_load_config_normalises_dot_component(tmp_path: Path) -> None:
+    """'.' components must not place staging inside the real root."""
+    config = load_config(
+        write_env(tmp_path, WP_SITE_ROOT="/home/myuser/public_html/.")
+    )
+    assert config.wp_site_root == "/home/myuser/public_html"
+    # Staging must be a sibling of the EFFECTIVE site path.
+    staging = staging_dir_for(config.wp_site_root, "20261014T0930Z")
+    assert staging == (
+        "/home/myuser/wp-ssh-backup-staging-20261014T0930Z"
+    )
+
+
+def test_load_config_normalises_dotdot_component(tmp_path: Path) -> None:
+    """'..' components must collapse before the path is stored."""
+    config = load_config(
+        write_env(
+            tmp_path,
+            WP_SITE_ROOT="/home/myuser/subdir/../public_html",
+        )
+    )
+    assert config.wp_site_root == "/home/myuser/public_html"
+
+
+def test_load_config_dot_dot_resolving_to_root_rejected(
+    tmp_path: Path,
+) -> None:
+    """A path that normalises to '/' must be rejected."""
+    with pytest.raises(ConfigError, match="must not be '/'"):
+        load_config(write_env(tmp_path, WP_SITE_ROOT="/home/.."))
+
+
+def test_load_config_trailing_slash_normalised(tmp_path: Path) -> None:
+    """A trailing slash is stripped by normalisation, as before."""
+    config = load_config(
+        write_env(tmp_path, WP_SITE_ROOT="/home/myuser/public_html/")
+    )
+    assert config.wp_site_root == "/home/myuser/public_html"
+
+
 def test_load_config_bad_port(tmp_path: Path) -> None:
     with pytest.raises(ConfigError, match="SSH_PORT"):
         load_config(write_env(tmp_path, SSH_PORT="not-a-number"))

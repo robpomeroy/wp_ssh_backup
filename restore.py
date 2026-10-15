@@ -419,14 +419,21 @@ def _validate_members(
         f"tar --quoting-style=shell-always -tvzf {shquote(archive)}"
     )
     verbose = run_remote_cmd_checked(client, command, timeout=1800)
+    # Regular (non-link) member names, for the hard-link target check.
+    regular_members: set[str] = set()
     links: dict[str, str] = {}
+    hard_links: list[tuple[str, str]] = []
     for line in verbose.splitlines():
         if not line.strip():
             continue
         # With shell-always quoting every field is one token: permissions
-        # owner/group size date time name [-> target]. A symlink line has
-        # the arrow; anything else is a regular member (hard links print
-        # 'link to NAME' and stay inside the archive).
+        # owner/group size date time name [-> target | link to target].
+        # A symlink line ends with '-> TARGET'; HARD links end with
+        # 'link to TARGET' — tar uses that target during extraction, so
+        # it must be validated too: pointing at an existing symlink in
+        # the destination tree would create a second link to a file
+        # outside the site. A hard link is only safe when its target is
+        # a REGULAR member of the same archive.
         try:
             fields = shlex.split(line)
         except ValueError as exc:
@@ -439,9 +446,14 @@ def _validate_members(
                 f"Refusing to extract {archive}: unexpected tar listing "
                 f"line {line!r}"
             )
-        if fields[-2] != "->":
-            continue
-        links[fields[-3]] = fields[-1]
+        if fields[-2] == "->":
+            links[fields[-3]] = fields[-1]
+        elif fields[-3:-1] == ["link", "to"]:
+            hard_links.append((fields[-4], fields[-1]))
+        elif fields[0].startswith("-"):
+            # Only REGULAR members may serve as hard-link targets; a
+            # directory (kind 'd') or anything exotic must not.
+            regular_members.add(fields[-1].lstrip("/"))
 
     def _escape_path(link: str, target: str, seen: set[str]) -> str | None:
         """Return the escaping path if link -> target escapes, else None."""
@@ -466,6 +478,14 @@ def _validate_members(
             raise WPSSHBackupError(
                 f"Refusing to extract {archive}: symlink {link!r} -> "
                 f"{target!r} resolves outside the site root ({escape})."
+            )
+    for link, target in hard_links:
+        if target.lstrip("/") not in regular_members:
+            raise WPSSHBackupError(
+                f"Refusing to extract {archive}: hard link {link!r} "
+                f"targets {target!r}, which is not a regular member of "
+                "the archive; it could chain through an existing "
+                "symlink in the destination tree."
             )
     return member_dirs
 
@@ -593,23 +613,42 @@ def _validate_db_members(
                 f"Refusing to extract {archive}: unexpected tar listing "
                 f"line {line!r}"
             )
-        name = fields[-3] if fields[-2] == "->" else fields[-1]
-        target = fields[-1] if fields[-2] == "->" else None
-        members.append((name, fields[-2] == "->", target))
+        # The first token is the 10-character mode string; its first
+        # character is the member type: '-' regular, 'd' directory,
+        # 'l' symlink, 'p' FIFO, 'c' char device, 'b' block device.
+        kind = fields[0][0]
+        if fields[-2] == "->":
+            # Symlink member.
+            members.append((fields[-3], True, fields[-1], kind))
+        elif fields[-3:-1] == ["link", "to"]:
+            # Hard link member: rejected below.
+            members.append((fields[-4], True, fields[-1], kind))
+        else:
+            members.append((fields[-1], False, None, kind))
     if len(members) != 1:
         raise WPSSHBackupError(
             f"Refusing to extract {archive}: expected exactly one member "
             f"({expected!r}), found {len(members)}"
         )
-    name, is_link, target = members[0]
+    name, is_link, target, kind = members[0]
     normalised = posixpath.normpath(name.lstrip("/"))
     if (
         is_link
+        or kind != "-"
         or normalised != expected
         or normalised.startswith("../")
         or normalised == ".."
     ):
-        detail = f" (symlink to {target!r})" if is_link else ""
+        if is_link:
+            detail = f" (symlink to {target!r})"
+        else:
+            kind_detail = {
+                "d": "directory",
+                "p": "FIFO",
+                "c": "character device",
+                "b": "block device",
+            }.get(kind, f"type {kind!r}")
+            detail = "" if kind == "-" else f" ({kind_detail})"
         raise WPSSHBackupError(
             f"Refusing to extract {archive}: unexpected member "
             f"{name!r}{detail}; expected the regular file {expected!r}"

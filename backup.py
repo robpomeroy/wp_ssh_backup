@@ -298,6 +298,13 @@ def publish_downloads(
     file that reaches BACKUP_DIR under its final name is always a
     checksum-verified artifact.
 
+    Publication is transactional: every final path is checked for
+    existence before anything moves (pre-existing files are preserved,
+    never overwritten), and if a rename fails part-way, the paths this
+    run already published are moved back to their temporary names so the
+    caller's cleanup can discard them. A failed run therefore never
+    leaves a partial final-name set in BACKUP_DIR.
+
     Args:
         temp_paths: Mapping from final names to the temporary paths
             returned by download_artifacts().
@@ -307,14 +314,48 @@ def publish_downloads(
     Returns:
         A dictionary mapping each archive and its checksum filename to
         the final local Path object.
+
+    Raises:
+        FileExistsError: If any final path already exists.
     """
-    local_paths: dict[str, Path] = {}
+    finals: list[str] = []
     for name in archive_names:
-        for final in (name, checksum_name(name)):
+        finals.extend((name, checksum_name(name)))
+
+    # Pre-check: refuse to overwrite anything that already exists under
+    # a final name (e.g. a file from another run) BEFORE moving the
+    # first file, so pre-existing data is preserved and the publication
+    # never ends up half-done because of it.
+    for final in finals:
+        final_path = backup_dir / final
+        if final_path.exists():
+            raise FileExistsError(
+                f"Refusing to overwrite existing backup file: {final_path}"
+            )
+
+    moved: list[tuple[Path, Path]] = []
+    try:
+        for final in finals:
+            temp_path = temp_paths[final]
             final_path = backup_dir / final
-            temp_paths[final].replace(final_path)
-            local_paths[final] = final_path
-    return local_paths
+            temp_path.replace(final_path)
+            moved.append((temp_path, final_path))
+    except BaseException:
+        # Roll back the files this run already published: moving them
+        # back to their temporary names makes them eligible for the
+        # caller's _discard_temp_downloads() cleanup, which must never
+        # touch final paths it did not create.
+        for temp_path, final_path in reversed(moved):
+            try:
+                final_path.replace(temp_path)
+            except OSError as exc:
+                print(
+                    "WARNING: could not roll back published backup file "
+                    f"{final_path}: {exc}",
+                    file=sys.stderr,
+                )
+        raise
+    return {final: backup_dir / final for final in finals}
 
 
 def verify_downloads(

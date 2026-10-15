@@ -60,6 +60,12 @@ class FakeSFTPClient:
         with open(local_path, "wb") as handle:
             handle.write(self.remote_fs[remote_path])
 
+    def getfo(self, remote_path: str, local_file: object) -> None:
+        """Mirror paramiko's getfo: stream remote bytes into a file object."""
+        if remote_path not in self.remote_fs:
+            raise FileNotFoundError(remote_path)
+        local_file.write(self.remote_fs[remote_path])
+
     def put(self, local_path: str, remote_path: str) -> None:
         with open(local_path, "rb") as handle:
             self.remote_fs[remote_path] = handle.read()
@@ -428,6 +434,21 @@ class FakeSSHClient:
                             perms = "rwxrwxrwx"
                         elif member.islnk():
                             kind = "h"
+                            perms = "rw-r--r--"
+                        elif member.isfile():
+                            kind = "-"
+                            perms = "rw-r--r--"
+                        elif member.isdir():
+                            kind = "d"
+                            perms = "rwxr-xr-x"
+                        elif member.isfifo():
+                            kind = "p"
+                            perms = "rw-r--r--"
+                        elif member.ischr():
+                            kind = "c"
+                            perms = "rw-r--r--"
+                        elif member.isblk():
+                            kind = "b"
                             perms = "rw-r--r--"
                         else:
                             kind = "-"

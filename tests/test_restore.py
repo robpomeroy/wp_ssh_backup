@@ -575,6 +575,84 @@ def test_import_database_rejects_wrong_name(tmp_path: Path) -> None:
             True,
             staging_bid="20261014T1000Z",
         )
+
+
+def test_import_database_rejects_fifo_member(tmp_path: Path) -> None:
+    """A FIFO named like the dump must be rejected before extraction.
+
+    A checksum-matching archive whose single member is a FIFO passes a
+    name-only check; extraction would create the FIFO and the later
+    import can block reading it. Require a regular-file mode.
+    """
+    import io
+    import tarfile
+
+    backup_dir = tmp_path / "backups"
+    set_files = make_local_set(backup_dir, TS)
+    client = FakeSSHClient(SITE_ROOT, wp_cli="/usr/bin/wp")
+    config = make_config(tmp_path)
+
+    archive_name = db_archive_name(TS)
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as tar:
+        info = tarfile.TarInfo(f"wp-db-{TS}.sql")
+        info.type = tarfile.FIFOTYPE
+        tar.addfile(info)
+    archive_path = set_files[archive_name]
+    archive_path.write_bytes(buffer.getvalue())
+    checksum_path = set_files[checksum_name(archive_name)]
+    checksum_path.write_text(
+        f"{hashlib.sha256(buffer.getvalue()).hexdigest()}  {archive_name}\n"
+    )
+
+    with pytest.raises(WPSSHBackupError, match="FIFO"):
+        restore.run_restore(
+            client,
+            config,
+            set_files,
+            False,
+            True,
+            staging_bid="20261014T1000Z",
+        )
+
+    # Nothing was extracted into staging.
+    assert posixpath.join(staging_dir_for(SITE_ROOT, "20261014T1000Z"), (
+        f"wp-db-{TS}.sql"
+    )) not in client.remote_fs
+
+
+def test_import_database_rejects_directory_member(tmp_path: Path) -> None:
+    """A directory named like the dump must be rejected too."""
+    import io
+    import tarfile
+
+    backup_dir = tmp_path / "backups"
+    set_files = make_local_set(backup_dir, TS)
+    client = FakeSSHClient(SITE_ROOT, wp_cli="/usr/bin/wp")
+    config = make_config(tmp_path)
+
+    archive_name = db_archive_name(TS)
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as tar:
+        info = tarfile.TarInfo(f"wp-db-{TS}.sql")
+        info.type = tarfile.DIRTYPE
+        tar.addfile(info)
+    archive_path = set_files[archive_name]
+    archive_path.write_bytes(buffer.getvalue())
+    checksum_path = set_files[checksum_name(archive_name)]
+    checksum_path.write_text(
+        f"{hashlib.sha256(buffer.getvalue()).hexdigest()}  {archive_name}\n"
+    )
+
+    with pytest.raises(WPSSHBackupError, match="directory"):
+        restore.run_restore(
+            client,
+            config,
+            set_files,
+            False,
+            True,
+            staging_bid="20261014T1000Z",
+        )
     import io
     import tarfile
 
@@ -1167,20 +1245,165 @@ def test_extract_files_allows_hard_link(tmp_path: Path) -> None:
         client.remote_fs[posixpath.join(SITE_ROOT, "uploads/hard")]
         == b"-> wp-config.php"
     )
+
+
+def test_extract_files_rejects_hard_link_to_outside_member(
+    tmp_path: Path,
+) -> None:
+    """A hard link targeting a non-member must be rejected.
+
+    A crafted archive can name a target that is NOT an archive member
+    but IS an existing symlink in the destination tree pointing outside
+    the site: tar follows it during extraction and creates a second
+    link to the outside file. Reject any hard link whose target is not
+    a regular archive member.
+    """
+    import io
+    import tarfile
+
     backup_dir = tmp_path / "backups"
     set_files = make_local_set(backup_dir, TS)
     client = FakeSSHClient(SITE_ROOT, wp_cli="/usr/bin/wp")
     config = make_config(tmp_path)
-    staging = staging_dir_for(SITE_ROOT, "20261014T1000Z")
 
-    restore.run_restore(
-        client, config, set_files, False, True, staging_bid="20261014T1000Z"
+    # Pre-existing symlink 'untouched/escape' -> outside the site. The
+    # archive never writes into untouched/, so the destination audit
+    # correctly ignores it — the protection must come from the member
+    # check instead.
+    client.remote_fs[posixpath.join(SITE_ROOT, "untouched/escape")] = (
+        b"-> /home/user/private.txt"
     )
 
-    import_commands = [c for c in client.commands if "db import" in c]
-    assert len(import_commands) == 1
-    # The staging directory was restricted to the owner (0700).
-    assert client.directory_modes[staging] == 0o700
+    archive_name = files_archive_name(TS)
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as tar:
+        info = tarfile.TarInfo("wp-config.php")
+        data = b"<?php\n"
+        info.size = len(data)
+        tar.addfile(info, io.BytesIO(data))
+        hard = tarfile.TarInfo("uploads/copy")
+        hard.type = tarfile.LNKTYPE
+        hard.linkname = "untouched/escape"
+        tar.addfile(hard)
+    archive_path = set_files[archive_name]
+    archive_path.write_bytes(buffer.getvalue())
+    checksum_path = set_files[checksum_name(archive_name)]
+    checksum_path.write_text(
+        f"{hashlib.sha256(buffer.getvalue()).hexdigest()}  {archive_name}\n"
+    )
+
+    with pytest.raises(WPSSHBackupError, match="not a regular member"):
+        restore.run_restore(
+            client,
+            config,
+            set_files,
+            True,
+            False,
+            staging_bid="20261014T1000Z",
+        )
+
+    # Nothing was extracted into the site root.
+    assert posixpath.join(SITE_ROOT, "wp-config.php") not in client.remote_fs
+    # The pre-existing escape symlink was left untouched.
+    assert (
+        client.remote_fs[posixpath.join(SITE_ROOT, "untouched/escape")]
+        == b"-> /home/user/private.txt"
+    )
+
+
+def test_extract_files_rejects_hard_link_to_symlink_member(
+    tmp_path: Path,
+) -> None:
+    """A hard link targeting an archive SYMLINK must be rejected too."""
+    import io
+    import tarfile
+
+    backup_dir = tmp_path / "backups"
+    set_files = make_local_set(backup_dir, TS)
+    client = FakeSSHClient(SITE_ROOT, wp_cli="/usr/bin/wp")
+    config = make_config(tmp_path)
+
+    # The archive itself carries a symlink whose target is a member.
+    # Hard-linking to the symlink NAME would be resolved by tar through
+    # the existing tree at extraction time, so it is not the regular
+    # member the hard-link check requires.
+    archive_name = files_archive_name(TS)
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as tar:
+        info = tarfile.TarInfo("wp-config.php")
+        data = b"<?php\n"
+        info.size = len(data)
+        tar.addfile(info, io.BytesIO(data))
+        link = tarfile.TarInfo("uploads/alias")
+        link.type = tarfile.SYMTYPE
+        link.linkname = "../wp-config.php"
+        tar.addfile(link)
+        hard = tarfile.TarInfo("uploads/copy")
+        hard.type = tarfile.LNKTYPE
+        hard.linkname = "uploads/alias"
+        tar.addfile(hard)
+    archive_path = set_files[archive_name]
+    archive_path.write_bytes(buffer.getvalue())
+    checksum_path = set_files[checksum_name(archive_name)]
+    checksum_path.write_text(
+        f"{hashlib.sha256(buffer.getvalue()).hexdigest()}  {archive_name}\n"
+    )
+
+    with pytest.raises(WPSSHBackupError, match="not a regular member"):
+        restore.run_restore(
+            client,
+            config,
+            set_files,
+            True,
+            False,
+            staging_bid="20261014T1000Z",
+        )
+
+    assert posixpath.join(SITE_ROOT, "wp-config.php") not in client.remote_fs
+
+
+def test_extract_files_allows_hard_link_targeting_regular_member(
+    tmp_path: Path,
+) -> None:
+    """A hard link naming another REGULAR member must still be allowed."""
+    import io
+    import tarfile
+
+    backup_dir = tmp_path / "backups"
+    set_files = make_local_set(backup_dir, TS)
+    client = FakeSSHClient(SITE_ROOT, wp_cli="/usr/bin/wp")
+    config = make_config(tmp_path)
+
+    archive_name = files_archive_name(TS)
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as tar:
+        info = tarfile.TarInfo("wp-config.php")
+        data = b"<?php\n"
+        info.size = len(data)
+        tar.addfile(info, io.BytesIO(data))
+        other = tarfile.TarInfo("index.php")
+        data = b"<?php\n"
+        other.size = len(data)
+        tar.addfile(other, io.BytesIO(data))
+        hard = tarfile.TarInfo("uploads/hard")
+        hard.type = tarfile.LNKTYPE
+        hard.linkname = "index.php"
+        tar.addfile(hard)
+    archive_path = set_files[archive_name]
+    archive_path.write_bytes(buffer.getvalue())
+    checksum_path = set_files[checksum_name(archive_name)]
+    checksum_path.write_text(
+        f"{hashlib.sha256(buffer.getvalue()).hexdigest()}  {archive_name}\n"
+    )
+
+    restore.run_restore(
+        client, config, set_files, True, False, staging_bid="20261014T1000Z"
+    )
+
+    assert (
+        client.remote_fs[posixpath.join(SITE_ROOT, "uploads/hard")]
+        == b"-> index.php"
+    )
 
 
 def test_run_restore_mysqldump_fallback_uses_cnf(tmp_path: Path) -> None:

@@ -281,14 +281,15 @@ def test_run_backup_checksum_mismatch_keeps_staging(
 ) -> None:
     client = FakeSSHClient(SITE_ROOT, wp_cli="/usr/bin/wp")
     # Corrupt the tarball after checksum generation but before download.
-    original_get = client.sftp.get
+    original_getfo = client.sftp.getfo
 
-    def corrupting_get(remote_path: str, local_path: str) -> None:
-        original_get(remote_path, local_path)
+    def corrupting_getfo(remote_path: str, local_file: object) -> None:
+        original_getfo(remote_path, local_file)
         if remote_path.endswith(".tar.gz"):
-            Path(local_path).write_bytes(b"corrupted")
+            local_file.seek(0)
+            local_file.write(b"corrupted")
 
-    client.sftp.get = corrupting_get  # type: ignore[method-assign]
+    client.sftp.getfo = corrupting_getfo  # type: ignore[method-assign]
     config = make_config(tmp_path)
     staging = staging_dir_for(SITE_ROOT, TS)
 
@@ -306,14 +307,15 @@ def test_run_backup_checksum_mismatch_leaves_no_final_name_files(
 ) -> None:
     """A failed verification must not leave a corrupt set in BACKUP_DIR."""
     client = FakeSSHClient(SITE_ROOT, wp_cli="/usr/bin/wp")
-    original_get = client.sftp.get
+    original_getfo = client.sftp.getfo
 
-    def corrupting_get(remote_path: str, local_path: str) -> None:
-        original_get(remote_path, local_path)
+    def corrupting_getfo(remote_path: str, local_file: object) -> None:
+        original_getfo(remote_path, local_file)
         if remote_path.endswith(".tar.gz"):
-            Path(local_path).write_bytes(b"corrupted")
+            local_file.seek(0)
+            local_file.write(b"corrupted")
 
-    client.sftp.get = corrupting_get  # type: ignore[method-assign]
+    client.sftp.getfo = corrupting_getfo  # type: ignore[method-assign]
     config = make_config(tmp_path)
 
     with pytest.raises(ChecksumError):
@@ -407,19 +409,209 @@ def test_publish_downloads_renames_verified_files(
     assert not temp_checksum.exists()
 
 
+def test_publish_downloads_refuses_overwrite_of_existing(
+    tmp_path: Path, backup_dir: Path
+) -> None:
+    """Pre-existing final-name files must be preserved, not overwritten."""
+    archive = files_archive_name(TS)
+    existing = backup_dir / archive
+    existing.write_bytes(b"prior-content")
+    temp_archive = backup_dir / (archive + ".part")
+    temp_archive.write_bytes(b"payload")
+    temp_checksum = backup_dir / (checksum_name(archive) + ".part")
+    temp_checksum.write_text(f"{'a' * 64}  {archive}\n")
+
+    with pytest.raises(FileExistsError, match="Refusing to overwrite"):
+        backup.publish_downloads(
+            {
+                archive: temp_archive,
+                checksum_name(archive): temp_checksum,
+            },
+            [archive],
+            backup_dir,
+        )
+
+    # The pre-existing file is untouched; nothing was moved.
+    assert existing.read_bytes() == b"prior-content"
+    assert temp_archive.is_file()
+    assert temp_checksum.is_file()
+
+
+def test_publish_downloads_rolls_back_partial_publication(
+    tmp_path: Path, backup_dir: Path
+) -> None:
+    """A mid-publication failure must leave no final-name files behind.
+
+    A failing rename after the first file moved (e.g. permission error)
+    used to leave a lone final-name artifact that discovery could pair
+    with a stale checksum. Publication must be transactional: roll the
+    already-published paths back to their temporary names so the
+    caller's cleanup discards them.
+    """
+    # Two sets so at least one move happens before the failure. The
+    # temp paths are keyed by the FINAL filenames, matching the
+    # function's contract.
+    bid2 = "20261014T0931Z-b2c3d4"
+    archive1 = files_archive_name(TS)
+    archive2 = files_archive_name(bid2)
+    temp_paths = {}
+    for archive in (archive1, archive2):
+        temp_paths[archive] = backup_dir / (archive + ".part")
+        temp_paths[archive].write_bytes(b"payload")
+        temp_paths[checksum_name(archive)] = backup_dir / (
+            checksum_name(archive) + ".part"
+        )
+        temp_paths[checksum_name(archive)].write_text(
+            f"{'a' * 64}  {archive}\n"
+        )
+
+    original_replace = Path.replace
+
+    calls = {"n": 0}
+
+    def exploding_replace(self: Path, target: object) -> None:
+        calls["n"] += 1
+        if calls["n"] == 3:
+            # First two moves (archive1 + its checksum) succeeded; the
+            # third move fails, simulating a mid-publication error.
+            raise OSError("simulated mid-publication failure")
+        original_replace(self, target)  # type: ignore[arg-type]
+
+    import unittest.mock
+
+    with unittest.mock.patch.object(
+        Path, "replace", exploding_replace
+    ):
+        with pytest.raises(OSError, match="simulated mid-publication"):
+            backup.publish_downloads(
+                temp_paths,
+                [archive1, archive2],
+                backup_dir,
+            )
+
+    # No final-name file from this run remains: the first two published
+    # paths were rolled back, and none of the four finals exist.
+    for final in (
+        archive1,
+        checksum_name(archive1),
+        archive2,
+        checksum_name(archive2),
+    ):
+        assert not (backup_dir / final).exists()
+    # The rolled-back files are back under their temporary names, so
+    # the caller's _discard_temp_downloads() will remove them.
+    assert temp_paths[archive1].exists()
+    assert temp_paths[checksum_name(archive1)].exists()
+    assert temp_paths[archive2].exists()
+    assert temp_paths[checksum_name(archive2)].exists()
+
+
+def test_sftp_download_creates_private_file(tmp_path: Path) -> None:
+    """Downloaded files must be 0600 regardless of the process umask.
+
+    POSIX permission bits are not represented by Windows NTFS stat, so
+    this asserts on the POSIX platforms the tool targets (CI runs
+    ubuntu); on Windows the file is still created O_EXCL/0600-asking.
+    """
+    import os
+    import sys
+
+    from common import sftp_download
+
+    if sys.platform == "win32":
+        pytest.skip("POSIX mode bits are not reflected by Windows stat")
+
+    client = FakeSSHClient(SITE_ROOT)
+    client.remote_fs[posixpath.join(SITE_ROOT, "secret.tar.gz")] = (
+        b"payload"
+    )
+
+    old_umask = os.umask(0o022)
+    try:
+        with client.open_sftp() as sftp:
+            local = sftp_download(
+                sftp,
+                posixpath.join(SITE_ROOT, "secret.tar.gz"),
+                tmp_path / "secret.tar.gz",
+            )
+    finally:
+        os.umask(old_umask)
+
+    assert (os.stat(local).st_mode & 0o777) == 0o600
+
+
+def test_sftp_download_refuses_existing_symlink(tmp_path: Path) -> None:
+    """A planted symlink at the destination must not be followed.
+
+    Skipped on Windows: creating symlinks requires privileges there,
+    and the O_EXCL-no-follow behaviour is POSIX-specific anyway.
+    """
+    import os
+
+    from common import sftp_download
+
+    if os.name == "nt":
+        pytest.skip("symlink creation requires privileges on Windows")
+
+    client = FakeSSHClient(SITE_ROOT)
+    client.remote_fs[posixpath.join(SITE_ROOT, "archive.tar.gz")] = (
+        b"payload"
+    )
+
+    target = tmp_path / "victim.txt"
+    target.write_bytes(b"innocent")
+    link = tmp_path / "archive.tar.gz.part"
+    os.symlink(target, link)
+
+    with client.open_sftp() as sftp:
+        with pytest.raises(FileExistsError):
+            sftp_download(
+                sftp,
+                posixpath.join(SITE_ROOT, "archive.tar.gz"),
+                link,
+            )
+
+    # The planted target was NOT overwritten by the download.
+    assert target.read_bytes() == b"innocent"
+
+
+def test_sftp_download_refuses_existing_file(tmp_path: Path) -> None:
+    """A pre-existing file at the destination must not be truncated."""
+    from common import sftp_download
+
+    client = FakeSSHClient(SITE_ROOT)
+    client.remote_fs[posixpath.join(SITE_ROOT, "archive.tar.gz")] = (
+        b"payload"
+    )
+
+    existing = tmp_path / "archive.tar.gz.part"
+    existing.write_bytes(b"prior-content")
+
+    with client.open_sftp() as sftp:
+        with pytest.raises(FileExistsError):
+            sftp_download(
+                sftp,
+                posixpath.join(SITE_ROOT, "archive.tar.gz"),
+                existing,
+            )
+
+    assert existing.read_bytes() == b"prior-content"
+
+
 def test_run_backup_undecodable_manifest_keeps_staging(
     tmp_path: Path, backup_dir: Path
 ) -> None:
     """An undecodable manifest must keep staging for retry, like a mismatch."""
     client = FakeSSHClient(SITE_ROOT, wp_cli="/usr/bin/wp")
-    original_get = client.sftp.get
+    original_getfo = client.sftp.getfo
 
-    def corrupting_get(remote_path: str, local_path: str) -> None:
-        original_get(remote_path, local_path)
+    def corrupting_getfo(remote_path: str, local_file: object) -> None:
+        original_getfo(remote_path, local_file)
         if remote_path.endswith(".sha256"):
-            Path(local_path).write_bytes(b"\xff\xfe\x00invalid-utf8")
+            local_file.seek(0)
+            local_file.write(b"\xff\xfe\x00invalid-utf8")
 
-    client.sftp.get = corrupting_get  # type: ignore[method-assign]
+    client.sftp.getfo = corrupting_getfo  # type: ignore[method-assign]
     config = make_config(tmp_path)
     staging = staging_dir_for(SITE_ROOT, TS)
 
@@ -441,17 +633,17 @@ def test_run_backup_sftp_failure_discards_temp_downloads(
     import paramiko
 
     client = FakeSSHClient(SITE_ROOT, wp_cli="/usr/bin/wp")
-    original_get = client.sftp.get
+    original_getfo = client.sftp.getfo
 
-    def failing_get(remote_path: str, local_path: str) -> None:
+    def failing_getfo(remote_path: str, local_file: object) -> None:
         if remote_path.endswith(".tar.gz"):
             # The archive lands, then the connection drops before the
             # manifest is fetched.
-            original_get(remote_path, local_path)
+            original_getfo(remote_path, local_file)
             raise paramiko.SSHException("connection dropped")
-        original_get(remote_path, local_path)
+        original_getfo(remote_path, local_file)
 
-    client.sftp.get = failing_get  # type: ignore[method-assign]
+    client.sftp.getfo = failing_getfo  # type: ignore[method-assign]
     config = make_config(tmp_path)
     staging = staging_dir_for(SITE_ROOT, TS)
 

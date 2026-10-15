@@ -162,11 +162,18 @@ def load_config(env_file: str | os.PathLike | None = None) -> Config:
             "WP_SITE_ROOT must be an absolute remote path "
             f"(starting with '/'), got {site_root!r}"
         )
+    # Normalise "." and ".." components (e.g. /home/user/public_html/.
+    # or /home/user/../user/public_html) BEFORE the root check and before
+    # storing the value: staging_dir_for() places the staging directory
+    # next to the *string* passed here, so an unnormalised path such as
+    # '/x/.' yields /staging-dir — the PARENT of the real site root —
+    # or, for '/x/./.', staging inside the real root, where a files
+    # backup would archive its own growing tarball and the staged
+    # database dump.
+    site_root = posixpath.normpath(site_root)
+    # POSIX leaves exactly two leading slashes ('//') untouched; treat
+    # the result as root if nothing remains after stripping them.
     if site_root.rstrip("/") == "":
-        # The staging dir is a sibling of the site root; for '/' it would
-        # be '/wp-ssh-backup-staging-...' — INSIDE the '.' being archived,
-        # so the backup would capture its own staging directory (including
-        # the database dump and the growing files archive).
         raise ConfigError(
             "WP_SITE_ROOT must not be '/': the staging directory would "
             "sit inside the archived tree and the backup would capture "
@@ -181,7 +188,7 @@ def load_config(env_file: str | os.PathLike | None = None) -> Config:
         ssh_key_path=os.getenv("SSH_KEY_PATH", "").strip() or None,
         ssh_password=os.getenv("SSH_PASSWORD", "") or None,
         ssh_known_hosts=os.getenv("SSH_KNOWN_HOSTS", "").strip() or None,
-        wp_site_root=site_root.rstrip("/") or "/",
+        wp_site_root=site_root,
         wp_cli_path=os.getenv("WP_CLI_PATH", "").strip() or None,
         backup_dir=Path(os.getenv("BACKUP_DIR", "").strip()).expanduser(),
         retention_days=_get_int("RETENTION_DAYS", 30, minimum=0),
@@ -374,7 +381,16 @@ def sftp_download(
     sftp: paramiko.SFTPClient, remote_path: str, local_path: str | Path
 ) -> Path:
     """
-    Download a file from the remote host via SFTP.
+    Download a file from the remote host via SFTP into local_path.
+
+    The destination is created with O_EXCL semantics and mode 0600 before
+    the transfer starts: sftp.get() writes with the process's default
+    permissions, so under a permissive umask (e.g. 022) in a traversable
+    BACKUP_DIR other local users could read database archives and site
+    configuration while (and after) the file is downloaded. A pre-existing
+    file or symlink at the destination is never followed or truncated —
+    the call raises instead, so an attacker-planted link cannot redirect
+    the download.
 
     Args:
         sftp: An active SFTP client connected to the remote host.
@@ -383,10 +399,33 @@ def sftp_download(
 
     Returns:
         The local path to the downloaded file as a Path object.
+
+    Raises:
+        FileExistsError: If a file or symlink already exists at
+            local_path.
     """
     local = Path(local_path)
     local.parent.mkdir(parents=True, exist_ok=True)
-    sftp.get(remote_path, str(local))
+    # O_CREAT | O_EXCL | O_WRONLY, 0600: fails if anything (including a
+    # symlink, which os.open with O_EXCL never follows to its target)
+    # already exists at the path, then streams into a private file.
+    fd = os.open(local, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        stream = os.fdopen(fd, "wb", closefd=False)
+        try:
+            sftp.getfo(remote_path, stream)
+        finally:
+            # Flush and close the wrapper WITHOUT closing the raw fd;
+            # the fd is closed in the outer finally. Closing the wrapper
+            # alone leaves the fd dangling until GC, which pytest
+            # reports as an unraisable exception.
+            stream.flush()
+            os.close(fd)
+            fd = -1  # Marker: already closed.
+            stream.detach()
+    finally:
+        if fd >= 0:
+            os.close(fd)
     return local
 
 
