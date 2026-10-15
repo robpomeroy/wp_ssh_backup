@@ -40,7 +40,12 @@ class FakeSFTPClient:
     def open(self, path: str, mode: str = "rb"):
         if "w" in mode or "a" in mode:
             return _FakeWriteFile(self, path)
-        return _FakeReadFile(self.remote_fs.get(path))
+        if path not in self.remote_fs:
+            # Paramiko SFTP raises for a missing file; returning an empty
+            # stream would send callers down the wrong error branch (e.g.
+            # an empty manifest instead of a missing one).
+            raise FileNotFoundError(path)
+        return _FakeReadFile(self.remote_fs[path])
 
     def chmod(self, path: str, mode: int) -> None:
         self.modes[path] = mode
@@ -100,6 +105,7 @@ class FakeSSHClient:
         self.commands: list[str] = []
         self.fail_on: dict[str, int] = {}
         self.directories: set[str] = set()
+        self.directory_modes: dict[str, int] = {}
         # Host-key simulation: the key the "server" presents, and the set of
         # fingerprints the "client" already trusts.
         self.server_key: object | None = None
@@ -170,12 +176,29 @@ class FakeSSHClient:
             cwd = compound.group(1)
             command = compound.group(2)
 
+        # Split compound commands on top-level ' && ' (outside single
+        # quotes) and run each part, stopping at the first failure like
+        # a real shell would (mkdir X && chmod 700 X, trap ... EXIT && ...).
+        parts = _split_compound(command)
+        if len(parts) > 1:
+            for part in parts:
+                code = self._execute(part, stdout, stderr)
+                if code != 0:
+                    return code
+            return 0
+
         if command.startswith("mkdir ") and not command.startswith(
             "mkdir -p "
         ):
             return self._mkdir(command, stderr)
         if command.startswith("mkdir -p "):
             return self._mkdir_p(command)
+        if command.startswith("chmod "):
+            return self._chmod(command, stderr)
+        if command.startswith("trap "):
+            # Registering an EXIT handler is a no-op here; the cleanup the
+            # trap would perform is covered by the explicit rm -f calls.
+            return 0
         if command.startswith("rm -rf "):
             return self._rm_rf(command)
         if command.startswith("rm -f "):
@@ -195,6 +218,10 @@ class FakeSSHClient:
             return self._tar_create(command, stderr)
         if command.startswith("tar xzf "):
             return self._tar_extract(command, stderr)
+        if command.startswith("tar tvzf "):
+            return self._tar_list(command, stdout, stderr, verbose=True)
+        if command.startswith("tar tzf "):
+            return self._tar_list(command, stdout, stderr, verbose=False)
         if "mysqldump" in command:
             return self._mysqldump(command, stderr)
         if (
@@ -226,6 +253,20 @@ class FakeSSHClient:
                 )
                 return 1
             self.directories.add(path)
+        return 0
+
+    def _chmod(self, command: str, stderr: io.BytesIO) -> int:
+        """chmod NNN <path>: record the requested mode for the directory."""
+        match = re.search(r"chmod\s+([0-7]{3,4})\s+'([^']+)'", command)
+        if match:
+            path = match.group(2).rstrip("/")
+            if path not in self.directories:
+                stderr.write(
+                    f"chmod: cannot access {path!r}: No such file "
+                    "or directory\n".encode()
+                )
+                return 1
+            self.directory_modes[path] = int(match.group(1), 8)
         return 0
 
     def _mkdir_p(self, command: str) -> int:
@@ -334,11 +375,61 @@ class FakeSSHClient:
                 fileobj=io.BytesIO(self.remote_fs[archive_path]), mode="r:gz"
             ) as tar:
                 for member in tar.getmembers():
+                    if member.issym() or member.islnk():
+                        # Record the link like the real tar would: the
+                        # link name maps to its target.
+                        self.remote_fs[
+                            posixpath.join(cwd, member.name)
+                        ] = f"-> {member.linkname}".encode()
+                        continue
                     extracted = tar.extractfile(member)
                     if extracted is not None:
-                        self.remote_fs[posixpath.join(cwd, member.name)] = (
+                        # GNU tar strips leading slashes from member
+                        # names on extraction.
+                        name = member.name.lstrip("/")
+                        self.remote_fs[posixpath.join(cwd, name)] = (
                             extracted.read()
                         )
+        except (tarfile.TarError, EOFError, OSError) as exc:
+            stderr.write(f"tar: {exc}\n".encode())
+            return 2
+        return 0
+
+    def _tar_list(
+        self, command: str, stdout: io.BytesIO, stderr: io.BytesIO,
+        verbose: bool,
+    ) -> int:
+        quoted = self._quoted(command)
+        archive_path = quoted[0]
+        if archive_path not in self.remote_fs:
+            stderr.write(f"tar: {archive_path}: not found\n".encode())
+            return 1
+        try:
+            with tarfile.open(
+                fileobj=io.BytesIO(self.remote_fs[archive_path]), mode="r:gz"
+            ) as tar:
+                for member in tar.getmembers():
+                    if verbose:
+                        if member.issym():
+                            kind = "l"
+                            perms = "rwxrwxrwx"
+                        elif member.islnk():
+                            kind = "h"
+                            perms = "rw-r--r--"
+                        else:
+                            kind = "-"
+                            perms = "rw-r--r--"
+                        line = (
+                            f"{kind}{perms} user/group 0 2026-01-01 "
+                            f"09:30 {member.name}"
+                        )
+                        if kind == "l":
+                            line += f" -> {member.linkname}"
+                        elif kind == "h":
+                            line += f" link to {member.linkname}"
+                        stdout.write((line + "\n").encode())
+                    else:
+                        stdout.write(f"{member.name}\n".encode())
         except (tarfile.TarError, EOFError, OSError) as exc:
             stderr.write(f"tar: {exc}\n".encode())
             return 2
@@ -464,6 +555,42 @@ class _ChannelWriter:
 
     def flush(self) -> None:
         pass
+
+
+def _split_compound(command: str) -> list[str]:
+    """Split a command on top-level ' && ' (outside single quotes)."""
+    parts: list[str] = []
+    current: list[str] = []
+    in_quote = False
+    escaped = False
+    i = 0
+    while i < len(command):
+        ch = command[i]
+        if escaped:
+            # E.g. the '\'' quote-escape idiom: this char is literal.
+            escaped = False
+            current.append(ch)
+            i += 1
+            continue
+        if not in_quote and ch == "\\":
+            escaped = True
+            current.append(ch)
+            i += 1
+            continue
+        if ch == "'":
+            in_quote = not in_quote
+            current.append(ch)
+            i += 1
+            continue
+        if not in_quote and command[i: i + 4] == " && ":
+            parts.append("".join(current))
+            current = []
+            i += 4
+            continue
+        current.append(ch)
+        i += 1
+    parts.append("".join(current))
+    return parts
 
 
 class _Stream:

@@ -241,6 +241,9 @@ def test_run_backup_files_only_round_trip(
     # Staging dir removed after success.
     assert not any(path.startswith(staging) for path in client.remote_fs)
     assert local_paths[archive] == local_archive
+    # The staging directory was restricted to the owner (0700) so other
+    # host users cannot reach the archives or credentials inside it.
+    assert client.directory_modes[staging] == 0o700
 
 
 def test_run_backup_database_only_round_trip(

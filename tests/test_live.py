@@ -36,12 +36,19 @@ pytestmark = pytest.mark.live
 LIVE_ENABLED = os.getenv("WP_SSH_BACKUP_LIVE_TEST") == "1"
 
 
-def live_config():
-    return load_config()
+def acquire_live_config():
+    """
+    Load the live-test configuration, skipping when it is unusable.
 
+    Both the live_client fixture and the offline fixture test in
+    tests/test_live_fixture.py call this single helper, so the skip
+    decision lives in exactly one place and a change to the fixture's
+    error handling cannot silently diverge from the test.
 
-@pytest.fixture()
-def live_client():
+    Raises:
+        pytest.skip.Exception: If live testing is not enabled or the
+            configuration is missing or invalid.
+    """
     if not LIVE_ENABLED:
         pytest.skip("WP_SSH_BACKUP_LIVE_TEST not set to 1")
     # A missing or invalid .env is a skip, not an error: the live tests
@@ -49,9 +56,19 @@ def live_client():
     # without one there is nothing to test. Connection failures after a
     # valid configuration are real live-test failures and still raise.
     try:
-        config = live_config()
+        config = load_config()
     except WPSSHBackupError as exc:
         pytest.skip(f"no valid configuration for live tests: {exc}")
+    return config
+
+
+def live_config():
+    return acquire_live_config()
+
+
+@pytest.fixture()
+def live_client():
+    config = acquire_live_config()
     client = connect(config)
     yield client, config
     client.close()
@@ -61,52 +78,6 @@ def test_live_connection(live_client) -> None:
     client, _config = live_client
     out = run_remote_cmd_checked(client, "echo ok")
     assert out.strip() == "ok"
-
-
-def test_live_client_fixture_skips_on_config_error(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A configuration error in the fixture must skip, not error."""
-    import pytest as _pytest
-
-    calls: list[object] = []
-
-    class _FakeConfig:
-        pass
-
-    class _RaisingFixture:
-        """Mimic the live_client fixture body with a failing config load."""
-
-        def __init__(self) -> None:
-            self.skipped: str | None = None
-
-        def run(self, monkeypatch: pytest.MonkeyPatch) -> None:
-            def failing_load_config() -> object:
-                raise WPSSHBackupError("No .env file found.")
-
-            monkeypatch.setattr(
-                "tests.test_live.load_config", failing_load_config
-            )
-            monkeypatch.setattr(
-                "tests.test_live.LIVE_ENABLED", True
-            )
-            try:
-                config = live_config()
-            except WPSSHBackupError as exc:
-                self.skipped = str(exc)
-                _pytest.skip(
-                    f"no valid configuration for live tests: {exc}"
-                )
-            calls.append(config)
-
-    fixture = _RaisingFixture()
-    with pytest.raises(_pytest.skip.Exception):
-        fixture.run(monkeypatch)
-
-    assert fixture.skipped is not None
-    assert "No .env file found." in fixture.skipped
-    # connect() was never reached.
-    assert calls == []
 
 
 def test_live_backup_and_restore_round_trip(

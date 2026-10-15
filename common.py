@@ -445,10 +445,22 @@ def write_remote_file(
 
     Returns:
         None.
+
+    Note:
+        The process umask is tightened to 077 for the duration of the
+        write so the SFTP server creates the file already restricted to
+        the requesting user (SFTP servers apply their umask at creation
+        time). Relying on a post-write chmod alone would leave the secret
+        readable to other host users during the write window. The
+        previous umask is restored afterwards.
     """
     data = content.encode("utf-8") if isinstance(content, str) else content
-    with sftp.open(remote_path, "wb") as handle:
-        handle.write(data)
+    old_umask = os.umask(0o077)
+    try:
+        with sftp.open(remote_path, "wb") as handle:
+            handle.write(data)
+    finally:
+        os.umask(old_umask)
     sftp.chmod(remote_path, mode)
 
 

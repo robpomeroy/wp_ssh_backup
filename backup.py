@@ -318,8 +318,10 @@ def create_staging_dir(
         WPSSHBackupError: If the staging directory already exists.
     """
     staging = staging_dir_for(config.wp_site_root, bid)
+    # Mode 0700 keeps other host users out of the directory that will
+    # hold the database credentials file and the archives.
     code, _, err = run_remote_cmd(
-        client, f"mkdir {shquote(staging)}"
+        client, f"mkdir {shquote(staging)} && chmod 700 {shquote(staging)}"
     )
     if code != 0:
         raise WPSSHBackupError(

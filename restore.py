@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import posixpath
+import re
 import sys
 import time
 from pathlib import Path
@@ -345,6 +346,91 @@ def verify_remote_checksums(
         sftp.close()
 
 
+def _validate_members(
+    archive: str,
+    client: paramiko.SSHClient,
+    site_root: str,
+) -> None:
+    """
+    Validate a files archive's members before extracting into site_root.
+
+    A checksum-matching archive can still carry malicious members: a
+    symlink such as 'uploads/link -> ../../private.txt' would be created
+    verbatim by tar and, on hosts that serve symlinks, expose files
+    outside the site root. Every member name must stay inside the tree
+    (no absolute paths or '..' traversal), and every symlink target must
+    resolve inside the site root when joined to the link's directory —
+    including chains that would escape via another member.
+
+    Args:
+        archive: The remote path of the files archive.
+        client: An active SSH client connected to the remote host.
+        site_root: The directory the archive will be extracted into.
+
+    Raises:
+        WPSSHBackupError: If any member name or symlink target escapes
+            the restore tree.
+    """
+    command = f"tar tzf {shquote(archive)}"
+    out = run_remote_cmd_checked(client, command, timeout=1800)
+    for member in out.splitlines():
+        name = member.strip()
+        if not name:
+            continue
+        # Normalise the member path relative to the site root. GNU tar
+        # strips leading slashes on extraction, so lstrip("/") mirrors
+        # what would land on disk.
+        normalised = posixpath.normpath(name.lstrip("/"))
+        if normalised.startswith("../") or normalised == "..":
+            raise WPSSHBackupError(
+                f"Refusing to extract {archive}: member {name!r} escapes "
+                "the site root."
+            )
+    # Symlink targets are only visible via tar -tvzf; use the verbose
+    # listing to check where links point, following chains through other
+    # links in the archive.
+    command = f"tar tvzf {shquote(archive)}"
+    verbose = run_remote_cmd_checked(client, command, timeout=1800)
+    links: dict[str, str] = {}
+    for line in verbose.splitlines():
+        # GNU tar -tv prints symlinks as
+        # 'lrwxrwxrwx owner/group size date time link -> target'
+        # (hard links start with 'h' and stay inside the archive).
+        match = re.match(
+            r"^l\S+\s+\S+\s+\S+\s+\S+\s+\S+\s+(?P<link>\S+)\s+->\s+"
+            r"(?P<target>.+)$",
+            line,
+        )
+        if not match:
+            continue
+        links[match.group("link")] = match.group("target").strip()
+
+    def _escape_path(link: str, target: str, seen: set[str]) -> str | None:
+        """Return the escaping path if link -> target escapes, else None."""
+        link_dir = posixpath.dirname(posixpath.normpath(link.lstrip("/")))
+        resolved = posixpath.normpath(posixpath.join(link_dir, target))
+        if (
+            posixpath.isabs(resolved)
+            or resolved.startswith("../")
+            or resolved == ".."
+        ):
+            return resolved
+        # A chain: the resolved path may itself be a link in the archive
+        # whose target escapes (a -> b, b -> ../../outside).
+        if resolved in links and resolved not in seen:
+            seen.add(resolved)
+            return _escape_path(resolved, links[resolved], seen)
+        return None
+
+    for link, target in links.items():
+        escape = _escape_path(link, target, {link})
+        if escape is not None:
+            raise WPSSHBackupError(
+                f"Refusing to extract {archive}: symlink {link!r} -> "
+                f"{target!r} resolves outside the site root ({escape})."
+            )
+
+
 def extract_files(
     client: paramiko.SSHClient,
     config: Config,
@@ -352,6 +438,7 @@ def extract_files(
     ts: str,
 ) -> None:
     archive = posixpath.join(staging, files_archive_name(ts))
+    _validate_members(archive, client, config.wp_site_root)
     command = f"tar xzf {shquote(archive)} -C {shquote(config.wp_site_root)}"
     run_remote_cmd_checked(client, command, timeout=3600)
 
@@ -456,7 +543,12 @@ def run_restore(
 
     # Bare mkdir (no -p): the staging dir is exclusive to this run, and a
     # collision aborts instead of sharing artifacts with another run.
-    code, _, err = run_remote_cmd(client, f"mkdir {shquote(staging)}")
+    # Mode 0700 keeps other host users out of the directory that will
+    # hold the database credentials file.
+    code, _, err = run_remote_cmd(
+        client,
+        f"mkdir {shquote(staging)} && chmod 700 {shquote(staging)}",
+    )
     if code != 0:
         raise WPSSHBackupError(
             f"Could not create staging directory {staging}: "
