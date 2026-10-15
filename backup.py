@@ -220,6 +220,32 @@ def generate_remote_checksums(
 # ---------------------------------------------------------------------------
 
 
+def _temp_download_name(name: str) -> str:
+    """Temporary name used until a download has been verified."""
+    return name + ".part"
+
+
+def _discard_temp_downloads(
+    backup_dir: Path, archive_names: list[str]
+) -> None:
+    """
+    Delete this run's temporary downloads, whatever stage they reached.
+
+    Temporary names carry this run's backup id, so a concurrent run's
+    downloads are never touched. Unverified files must never linger under
+    any name: find_backup_sets() groups files by backup id, so a corrupt
+    archive-plus-manifest pair left in BACKUP_DIR would be advertised as a
+    complete set and a default restore could select it instead of a valid
+    older backup.
+    """
+    for name in archive_names:
+        for temp in (
+            _temp_download_name(name),
+            _temp_download_name(checksum_name(name)),
+        ):
+            (backup_dir / temp).unlink(missing_ok=True)
+
+
 def download_artifacts(
     sftp: paramiko.SFTPClient,
     staging: str,
@@ -229,27 +255,65 @@ def download_artifacts(
     """
     Download each archive and its .sha256 file into backup_dir.
 
+    Files land under temporary names (the final name plus a ".part"
+    suffix) so a failed or interrupted transfer can never be mistaken for
+    a backup set: the suffix does not match the backup filename pattern,
+    and publish_downloads() renames the files only after checksum
+    verification has passed.
+
     Args:
         sftp: An active SFTP client connected to the remote host.
         staging: The remote staging directory containing the archives.
         archive_names: A list of archive filenames to download.
-        backup_dir: The local directory where the downloaded files will be
-            stored.
+        backup_dir: The local directory where the files will be stored.
 
     Returns:
-        A dictionary mapping each archive and its checksum filename to the
-        corresponding local Path object.
+        A dictionary mapping each archive's final name (and its checksum
+        filename) to the temporary local Path it was downloaded to.
     """
     local_paths: dict[str, Path] = {}
     for name in archive_names:
         local_paths[name] = sftp_download(
-            sftp, posixpath.join(staging, name), backup_dir / name
+            sftp,
+            posixpath.join(staging, name),
+            backup_dir / _temp_download_name(name),
         )
         local_paths[checksum_name(name)] = sftp_download(
             sftp,
             posixpath.join(staging, checksum_name(name)),
-            backup_dir / checksum_name(name),
+            backup_dir / _temp_download_name(checksum_name(name)),
         )
+    return local_paths
+
+
+def publish_downloads(
+    temp_paths: dict[str, Path],
+    archive_names: list[str],
+    backup_dir: Path,
+) -> dict[str, Path]:
+    """
+    Rename verified temporary downloads to their final names.
+
+    Only called after verify_downloads() has accepted every file, so a
+    file that reaches BACKUP_DIR under its final name is always a
+    checksum-verified artifact.
+
+    Args:
+        temp_paths: Mapping from final names to the temporary paths
+            returned by download_artifacts().
+        archive_names: The archive filenames that were downloaded.
+        backup_dir: The local directory that receives the final names.
+
+    Returns:
+        A dictionary mapping each archive and its checksum filename to
+        the final local Path object.
+    """
+    local_paths: dict[str, Path] = {}
+    for name in archive_names:
+        for final in (name, checksum_name(name)):
+            final_path = backup_dir / final
+            temp_paths[final].replace(final_path)
+            local_paths[final] = final_path
     return local_paths
 
 
@@ -306,6 +370,11 @@ def create_staging_dir(
     and therefore different directories, and a collision (astronomically
     unlikely) aborts instead of sharing artifacts.
 
+    The 0700 chmod is issued separately by the caller (inside its cleanup
+    scope): mkdir and chmod chained with && would leave an orphaned
+    directory on the host if mkdir succeeded but chmod failed, before
+    run_backup's cleanup block was entered.
+
     Args:
         client: An active SSH client connected to the remote host.
         config: The backup configuration.
@@ -318,10 +387,8 @@ def create_staging_dir(
         WPSSHBackupError: If the staging directory already exists.
     """
     staging = staging_dir_for(config.wp_site_root, bid)
-    # Mode 0700 keeps other host users out of the directory that will
-    # hold the database credentials file and the archives.
     code, _, err = run_remote_cmd(
-        client, f"mkdir {shquote(staging)} && chmod 700 {shquote(staging)}"
+        client, f"mkdir {shquote(staging)}"
     )
     if code != 0:
         raise WPSSHBackupError(
@@ -359,6 +426,14 @@ def run_backup(
 
     archive_names: list[str] = []
     try:
+        # Mode 0700 keeps other host users out of the directory that will
+        # hold the database credentials file and the archives. It runs
+        # INSIDE the cleanup block: if it fails, the directory this run
+        # just created is removed instead of being orphaned on the host.
+        run_remote_cmd_checked(
+            client, f"chmod 700 {shquote(staging)}"
+        )
+
         if include_database:
             started = time.monotonic()
             db_archive = create_db_dump(client, config, staging, bid)
@@ -375,11 +450,29 @@ def run_backup(
 
         generate_remote_checksums(client, staging, archive_names)
 
-        with client.open_sftp() as sftp:
-            local_paths = download_artifacts(
-                sftp, staging, archive_names, backup_dir
+        # Download under temporary names and publish only verified files:
+        # a bad pair left in BACKUP_DIR under its final name would be
+        # advertised by find_backup_sets() as a complete set, and a
+        # default restore could then select the corrupt newest backup
+        # instead of a valid older one.
+        published = False
+        try:
+            with client.open_sftp() as sftp:
+                temp_paths = download_artifacts(
+                    sftp, staging, archive_names, backup_dir
+                )
+            verify_downloads(temp_paths, archive_names)
+            local_paths = publish_downloads(
+                temp_paths, archive_names, backup_dir
             )
-        verify_downloads(local_paths, archive_names)
+            published = True
+        finally:
+            if not published:
+                # Remove every file this run downloaded, whether the
+                # failure was a checksum mismatch or a dropped transfer.
+                # The remote staging decision is made by the handlers
+                # below (kept for a checksum retry, removed otherwise).
+                _discard_temp_downloads(backup_dir, archive_names)
         print("Local checksum verification passed.")
     except ChecksumError:
         # Keep the remote staging dir so the transfer can be retried.

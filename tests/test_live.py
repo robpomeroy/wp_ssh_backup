@@ -87,20 +87,29 @@ def test_live_backup_and_restore_round_trip(
     client, config = live_client
     bid = backup_id()
 
-    # Exclusive remote directories: the allocator returns the only paths we
-    # may delete, so a pre-existing or foreign directory is never touched.
-    # The cleanup guard starts immediately after the FIRST allocation and
-    # tracks only successfully allocated paths, so a failure allocating a
-    # later directory cannot leak the earlier ones.
+    # Exclusive remote directories: the allocator returns the only paths we may
+    # delete, so a pre-existing or foreign directory is never touched. The
+    # cleanup guard starts immediately after the FIRST allocation and tracks
+    # only successfully allocated paths, so a failure allocating a later
+    # directory (or chmod-ing an earlier one) cannot leak the earlier ones.
+    # Each directory is locked to 0700 right after creation: with a typical
+    # 0755 umask other host users could otherwise read the archived and
+    # extracted wp-config.php during this test.
     scratch = allocate_remote_dir(
         client, config.wp_site_root, "restore-scratch-"
     )
     allocated: list[str] = [scratch]
     try:
+        run_remote_cmd_checked(
+            client, f"chmod 700 {shquote(scratch)}"
+        )
         staging = allocate_remote_dir(
             client, config.wp_site_root, "wp-ssh-backup-staging-"
         )
         allocated.append(staging)
+        run_remote_cmd_checked(
+            client, f"chmod 700 {shquote(staging)}"
+        )
         # --- Backup -------------------------------------------------------
         archive = files_archive_name(bid)
         run_remote_cmd_checked(

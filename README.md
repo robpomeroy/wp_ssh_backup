@@ -153,10 +153,13 @@ often but you rarely upload new files.
 3. The site root is packed into a gzip tarball, excluding the staging directory
    and `wp-content/cache`.
 4. SHA-256 checksums are generated on the server.
-5. The tarballs and checksum files are downloaded over SFTP into `BACKUP_DIR`.
-6. Checksums are re-verified locally. If verification fails, the remote staging
-   directory is **kept** so the transfer can be retried; otherwise it is
-   deleted.
+5. The tarballs and checksum files are downloaded over SFTP into `BACKUP_DIR`
+   under temporary names (a `.part` suffix), so a failed transfer can never be
+   mistaken for a backup set.
+6. Checksums are re-verified locally. Only then are the files renamed to their
+   final names. If verification fails, the partial downloads are deleted and
+   the remote staging directory is **kept** so the transfer can be retried;
+   otherwise the staging directory is deleted.
 7. Local backup sets older than `RETENTION_DAYS` are pruned.
 
 Backups are named `wp-db-<backup-id>.tar.gz` and `wp-files-<backup-id>.tar.gz`,

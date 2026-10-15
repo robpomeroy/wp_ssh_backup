@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import argparse
 import posixpath
-import re
+import shlex
 import sys
 import time
 from pathlib import Path
@@ -362,21 +362,46 @@ def _validate_members(
     resolve inside the site root when joined to the link's directory —
     including chains that would escape via another member.
 
+    The listing is requested with --quoting-style=shell-always so every
+    name and link target is exactly one shell token even when it contains
+    spaces or a literal ' -> ' sequence; the tokens are decoded with
+    shlex. GNU tar's default -tv format is not machine-readable (a name
+    with spaces would be split, and a name containing ' -> ' could be
+    mistaken for part of a link target), so any line that cannot be
+    decoded unambiguously fails the restore rather than being skipped.
+
     Args:
         archive: The remote path of the files archive.
         client: An active SSH client connected to the remote host.
         site_root: The directory the archive will be extracted into.
 
+    Returns:
+        The set of directories inside the site root that the archive
+        writes into ("" for the root itself), used by the destination
+        tree audit to decide which pre-existing symlinks matter.
+
     Raises:
         WPSSHBackupError: If any member name or symlink target escapes
-            the restore tree.
+            the restore tree, or if the listing cannot be decoded.
     """
-    command = f"tar tzf {shquote(archive)}"
+    # -v is required for link targets; --quoting-style=shell-always makes
+    # every field unambiguous. Options must precede the archive operand
+    # (GNU tar treats trailing options as positional and ignores them).
+    command = (
+        f"tar --quoting-style=shell-always -tzf {shquote(archive)}"
+    )
     out = run_remote_cmd_checked(client, command, timeout=1800)
-    for member in out.splitlines():
-        name = member.strip()
-        if not name:
+    member_dirs: set[str] = {""}
+    for line in out.splitlines():
+        if not line.strip():
             continue
+        try:
+            name = shlex.split(line)[0]
+        except (ValueError, IndexError) as exc:
+            raise WPSSHBackupError(
+                f"Refusing to extract {archive}: cannot decode member "
+                f"name from tar listing line {line!r}: {exc}"
+            ) from exc
         # Normalise the member path relative to the site root. GNU tar
         # strips leading slashes on extraction, so lstrip("/") mirrors
         # what would land on disk.
@@ -386,24 +411,37 @@ def _validate_members(
                 f"Refusing to extract {archive}: member {name!r} escapes "
                 "the site root."
             )
-    # Symlink targets are only visible via tar -tvzf; use the verbose
-    # listing to check where links point, following chains through other
-    # links in the archive.
-    command = f"tar tvzf {shquote(archive)}"
+        member_dirs.add(posixpath.dirname(normalised))
+    # Symlink targets are only visible in the verbose listing; use the
+    # quoted verbose listing to check where links point, following chains
+    # through other links in the archive.
+    command = (
+        f"tar --quoting-style=shell-always -tvzf {shquote(archive)}"
+    )
     verbose = run_remote_cmd_checked(client, command, timeout=1800)
     links: dict[str, str] = {}
     for line in verbose.splitlines():
-        # GNU tar -tv prints symlinks as
-        # 'lrwxrwxrwx owner/group size date time link -> target'
-        # (hard links start with 'h' and stay inside the archive).
-        match = re.match(
-            r"^l\S+\s+\S+\s+\S+\s+\S+\s+\S+\s+(?P<link>\S+)\s+->\s+"
-            r"(?P<target>.+)$",
-            line,
-        )
-        if not match:
+        if not line.strip():
             continue
-        links[match.group("link")] = match.group("target").strip()
+        # With shell-always quoting every field is one token: permissions
+        # owner/group size date time name [-> target]. A symlink line has
+        # the arrow; anything else is a regular member (hard links print
+        # 'link to NAME' and stay inside the archive).
+        try:
+            fields = shlex.split(line)
+        except ValueError as exc:
+            raise WPSSHBackupError(
+                f"Refusing to extract {archive}: cannot decode tar "
+                f"listing line {line!r}: {exc}"
+            ) from exc
+        if len(fields) < 6:
+            raise WPSSHBackupError(
+                f"Refusing to extract {archive}: unexpected tar listing "
+                f"line {line!r}"
+            )
+        if fields[-2] != "->":
+            continue
+        links[fields[-3]] = fields[-1]
 
     def _escape_path(link: str, target: str, seen: set[str]) -> str | None:
         """Return the escaping path if link -> target escapes, else None."""
@@ -429,6 +467,66 @@ def _validate_members(
                 f"Refusing to extract {archive}: symlink {link!r} -> "
                 f"{target!r} resolves outside the site root ({escape})."
             )
+    return member_dirs
+
+
+def _audit_destination_tree(
+    client: paramiko.SSHClient,
+    site_root: str,
+    member_dirs: set[str],
+) -> None:
+    """
+    Reject pre-existing symlinks in the site tree that extraction would
+    traverse or overwrite.
+
+    _validate_members only sees the archive's contents, but tar extracts into
+    the EXISTING site tree: if 'uploads' is already a symlink to a directory
+    outside the site root, an archive member 'uploads/file' writes there; if an
+    archive link points at an existing link under 'uploads', the chain resolves
+    outside the site without appearing in the archive's link map. `find <root>
+    -type l` lists every symlink already on disk WITHOUT following links (find
+    does not traverse symlinked directories by default), so the audit sees the
+    real tree.
+
+    Only directories that the archive actually writes into are audited: an
+    untouched pre-existing symlink elsewhere in the site is not this restore's
+    business.
+
+    Args:
+        client: An active SSH client connected to the remote host.
+        site_root: The directory the archive will be extracted into.
+        member_dirs: Archive directories (including "") that will be written
+            during extraction.
+
+    Raises:
+        WPSSHBackupError: If a pre-existing symlink sits in an audited
+            directory or is itself an audited write target.
+    """
+    if not member_dirs:
+        return
+    # -print0 / NUL-separated output keeps spaced names intact; the decoder
+    # splits on NUL and every name is used verbatim (no shell parsing), so
+    # nothing can be smuggled past this check.
+    command = (
+        f"find {shquote(site_root)} -type l -print0"
+    )
+    out = run_remote_cmd_checked(client, command, timeout=600)
+    for raw in out.split("\0"):
+        if not raw:
+            continue
+        link = raw.rstrip("/")
+        parent = posixpath.dirname(link)
+        rel_parent = posixpath.relpath(parent, site_root)
+        if rel_parent == ".":
+            rel_parent = ""
+        if rel_parent in member_dirs or link == posixpath.join(
+            site_root, ""
+        ).rstrip("/"):
+            raise WPSSHBackupError(
+                f"Refusing to extract: {link!r} already exists as a "
+                "symlink in the site tree; extraction would follow or "
+                "replace it. Remove it and re-run."
+            )
 
 
 def extract_files(
@@ -438,9 +536,84 @@ def extract_files(
     ts: str,
 ) -> None:
     archive = posixpath.join(staging, files_archive_name(ts))
-    _validate_members(archive, client, config.wp_site_root)
+    member_dirs = _validate_members(archive, client, config.wp_site_root)
+    _audit_destination_tree(client, config.wp_site_root, member_dirs)
     command = f"tar xzf {shquote(archive)} -C {shquote(config.wp_site_root)}"
     run_remote_cmd_checked(client, command, timeout=3600)
+
+
+def _validate_db_members(
+    archive: str,
+    client: paramiko.SSHClient,
+    ts: str,
+) -> None:
+    """
+    Require the DB tarball to hold exactly the expected SQL dump member.
+
+    The tarball is checksum-verified, but a checksum only proves the
+    bytes match the manifest — a modified archive with a matching local
+    manifest could carry a '../' traversal member or a symlink (e.g.
+    'my-<id>.cnf' pointing outside staging). Extraction would write
+    outside staging, and the later credentials-file write could follow
+    such a link and overwrite its target. The backup tool only ever
+    packs one regular file (wp-db-<id>.sql), so anything else — links,
+    extra names, traversal — is rejected before tar runs.
+
+    The listing is requested with --quoting-style=shell-always and
+    decoded with shlex, as for the files archive, so spaced or hostile
+    names cannot defeat the check; an undecodable line fails closed.
+
+    Args:
+        archive: The remote path of the DB archive.
+        client: An active SSH client connected to the remote host.
+        ts: The backup identifier the expected dump name is derived from.
+
+    Raises:
+        WPSSHBackupError: If the archive does not contain exactly one
+            regular member named wp-db-<ts>.sql.
+    """
+    expected = f"wp-db-{ts}.sql"
+    command = (
+        f"tar --quoting-style=shell-always -tvzf {shquote(archive)}"
+    )
+    verbose = run_remote_cmd_checked(client, command, timeout=1800)
+    members: list[tuple[str, bool, str | None]] = []
+    for line in verbose.splitlines():
+        if not line.strip():
+            continue
+        try:
+            fields = shlex.split(line)
+        except ValueError as exc:
+            raise WPSSHBackupError(
+                f"Refusing to extract {archive}: cannot decode tar "
+                f"listing line {line!r}: {exc}"
+            ) from exc
+        if len(fields) < 6:
+            raise WPSSHBackupError(
+                f"Refusing to extract {archive}: unexpected tar listing "
+                f"line {line!r}"
+            )
+        name = fields[-3] if fields[-2] == "->" else fields[-1]
+        target = fields[-1] if fields[-2] == "->" else None
+        members.append((name, fields[-2] == "->", target))
+    if len(members) != 1:
+        raise WPSSHBackupError(
+            f"Refusing to extract {archive}: expected exactly one member "
+            f"({expected!r}), found {len(members)}"
+        )
+    name, is_link, target = members[0]
+    normalised = posixpath.normpath(name.lstrip("/"))
+    if (
+        is_link
+        or normalised != expected
+        or normalised.startswith("../")
+        or normalised == ".."
+    ):
+        detail = f" (symlink to {target!r})" if is_link else ""
+        raise WPSSHBackupError(
+            f"Refusing to extract {archive}: unexpected member "
+            f"{name!r}{detail}; expected the regular file {expected!r}"
+        )
 
 
 def import_database(
@@ -455,7 +628,11 @@ def import_database(
     dump_path = posixpath.join(staging, dump_name)
     wp_cli = detect_wp_cli(client, config)
 
-    # Extract the SQL dump from the tarball first.
+    # The tarball is checksum-verified but its members are not trusted:
+    # require exactly the expected regular SQL dump before tar runs.
+    _validate_db_members(archive, client, ts)
+
+    # Extract the SQL dump from the tarball.
     run_remote_cmd_checked(
         client,
         f"tar xzf {shquote(archive)} -C {shquote(staging)}",
@@ -543,11 +720,12 @@ def run_restore(
 
     # Bare mkdir (no -p): the staging dir is exclusive to this run, and a
     # collision aborts instead of sharing artifacts with another run.
-    # Mode 0700 keeps other host users out of the directory that will
-    # hold the database credentials file.
+    # The 0700 chmod is issued separately INSIDE the try block below:
+    # chained 'mkdir && chmod' would orphan the directory if mkdir
+    # succeeded but chmod failed, before the cleanup block was entered.
     code, _, err = run_remote_cmd(
         client,
-        f"mkdir {shquote(staging)} && chmod 700 {shquote(staging)}",
+        f"mkdir {shquote(staging)}",
     )
     if code != 0:
         raise WPSSHBackupError(
@@ -557,6 +735,13 @@ def run_restore(
     print(f"Remote staging directory: {staging}")
 
     try:
+        # Mode 0700 keeps other host users out of the directory that will
+        # hold the database credentials file. If the chmod fails, the
+        # handler below removes the directory this run just created.
+        run_remote_cmd_checked(
+            client, f"chmod 700 {shquote(staging)}"
+        )
+
         with client.open_sftp() as sftp:
             upload_artifacts(sftp, set_files, archive_names, staging)
         verify_remote_checksums(client, staging, archive_names)

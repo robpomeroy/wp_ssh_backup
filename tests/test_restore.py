@@ -416,8 +416,165 @@ def test_run_restore_files_round_trip(tmp_path: Path) -> None:
     assert client.directory_modes[staging] == 0o700
 
 
-def test_extract_files_rejects_escaping_symlink(tmp_path: Path) -> None:
-    """A symlink pointing outside the site root must block extraction."""
+def test_import_database_rejects_traversal_member(tmp_path: Path) -> None:
+    """A ../ member in the DB tarball must block extraction."""
+    import io
+    import tarfile
+
+    backup_dir = tmp_path / "backups"
+    set_files = make_local_set(backup_dir, TS)
+    client = FakeSSHClient(SITE_ROOT, wp_cli="/usr/bin/wp")
+    config = make_config(tmp_path)
+    staging = staging_dir_for(SITE_ROOT, "20261014T1000Z")
+
+    # Rebuild the DB tarball with a traversal member and refresh the
+    # checksum so the archive still verifies.
+    archive_name = db_archive_name(TS)
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as tar:
+        info = tarfile.TarInfo("../evil.sql")
+        data = b"-- escaped"
+        info.size = len(data)
+        tar.addfile(info, io.BytesIO(data))
+    archive_path = set_files[archive_name]
+    archive_path.write_bytes(buffer.getvalue())
+    checksum_path = set_files[checksum_name(archive_name)]
+    checksum_path.write_text(
+        f"{hashlib.sha256(buffer.getvalue()).hexdigest()}  {archive_name}\n"
+    )
+
+    with pytest.raises(WPSSHBackupError, match="unexpected member"):
+        restore.run_restore(
+            client,
+            config,
+            set_files,
+            False,
+            True,
+            staging_bid="20261014T1000Z",
+        )
+
+    # Nothing was extracted out of staging.
+    assert posixpath.join(posixpath.dirname(staging), "evil.sql") not in (
+        client.remote_fs
+    )
+    # Staging was cleaned up (restore always cleans on failure).
+    assert not any(path.startswith(staging) for path in client.remote_fs)
+
+
+def test_import_database_rejects_symlink_member(tmp_path: Path) -> None:
+    """A symlink member named like the cnf must block extraction."""
+    import io
+    import tarfile
+
+    backup_dir = tmp_path / "backups"
+    set_files = make_local_set(backup_dir, TS)
+    client = FakeSSHClient(SITE_ROOT, wp_cli=None)
+    config = make_config(tmp_path)
+    staging = staging_dir_for(SITE_ROOT, "20261014T1000Z")
+
+    # A symlink member named my-<ts>.cnf pointing outside staging: the
+    # later credentials write would follow it and overwrite the target.
+    archive_name = db_archive_name(TS)
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as tar:
+        info = tarfile.TarInfo(f"my-{TS}.cnf")
+        info.type = tarfile.SYMTYPE
+        info.linkname = "../../../home/user/.bashrc"
+        tar.addfile(info)
+    archive_path = set_files[archive_name]
+    archive_path.write_bytes(buffer.getvalue())
+    checksum_path = set_files[checksum_name(archive_name)]
+    checksum_path.write_text(
+        f"{hashlib.sha256(buffer.getvalue()).hexdigest()}  {archive_name}\n"
+    )
+
+    with pytest.raises(WPSSHBackupError, match="unexpected member"):
+        restore.run_restore(
+            client,
+            config,
+            set_files,
+            False,
+            True,
+            staging_bid="20261014T1000Z",
+        )
+
+    # The credentials file was never written through the link.
+    assert posixpath.join(staging, f"my-{TS}.cnf") not in client.remote_fs
+    assert not any(path.startswith(staging) for path in client.remote_fs)
+
+
+def test_import_database_rejects_extra_members(tmp_path: Path) -> None:
+    """A second member in the DB tarball must block extraction."""
+    import io
+    import tarfile
+
+    backup_dir = tmp_path / "backups"
+    set_files = make_local_set(backup_dir, TS)
+    client = FakeSSHClient(SITE_ROOT, wp_cli="/usr/bin/wp")
+    config = make_config(tmp_path)
+
+    archive_name = db_archive_name(TS)
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as tar:
+        info = tarfile.TarInfo(f"wp-db-{TS}.sql")
+        data = b"-- SQL dump\n"
+        info.size = len(data)
+        tar.addfile(info, io.BytesIO(data))
+        extra = tarfile.TarInfo("extra.txt")
+        data = b"extra"
+        extra.size = len(data)
+        tar.addfile(extra, io.BytesIO(data))
+    archive_path = set_files[archive_name]
+    archive_path.write_bytes(buffer.getvalue())
+    checksum_path = set_files[checksum_name(archive_name)]
+    checksum_path.write_text(
+        f"{hashlib.sha256(buffer.getvalue()).hexdigest()}  {archive_name}\n"
+    )
+
+    with pytest.raises(WPSSHBackupError, match="exactly one member"):
+        restore.run_restore(
+            client,
+            config,
+            set_files,
+            False,
+            True,
+            staging_bid="20261014T1000Z",
+        )
+
+
+def test_import_database_rejects_wrong_name(tmp_path: Path) -> None:
+    """A single member with the wrong name must block extraction."""
+    import io
+    import tarfile
+
+    backup_dir = tmp_path / "backups"
+    set_files = make_local_set(backup_dir, TS)
+    client = FakeSSHClient(SITE_ROOT, wp_cli="/usr/bin/wp")
+    config = make_config(tmp_path)
+
+    archive_name = db_archive_name(TS)
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as tar:
+        info = tarfile.TarInfo("dump.sql")
+        data = b"-- SQL dump\n"
+        info.size = len(data)
+        tar.addfile(info, io.BytesIO(data))
+    archive_path = set_files[archive_name]
+    archive_path.write_bytes(buffer.getvalue())
+    checksum_path = set_files[checksum_name(archive_name)]
+    checksum_path.write_text(
+        f"{hashlib.sha256(buffer.getvalue()).hexdigest()}  {archive_name}\n"
+    )
+
+    with pytest.raises(WPSSHBackupError, match="unexpected member"):
+        restore.run_restore(
+            client,
+            config,
+            set_files,
+            False,
+            True,
+            staging_bid="20261014T1000Z",
+        )
     import io
     import tarfile
 
@@ -536,6 +693,315 @@ def test_extract_files_allows_internal_symlink(tmp_path: Path) -> None:
     assert (
         client.remote_fs[posixpath.join(SITE_ROOT, "uploads/link")]
         == b"-> ../index.php"
+    )
+
+
+def test_extract_files_rejects_symlink_name_with_spaces(
+    tmp_path: Path,
+) -> None:
+    """A spaced link name must still be validated (quoted listing)."""
+    import io
+    import tarfile
+
+    backup_dir = tmp_path / "backups"
+    set_files = make_local_set(backup_dir, TS)
+    client = FakeSSHClient(SITE_ROOT, wp_cli="/usr/bin/wp")
+    config = make_config(tmp_path)
+
+    archive_name = files_archive_name(TS)
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as tar:
+        info = tarfile.TarInfo("wp-config.php")
+        data = b"<?php\n"
+        info.size = len(data)
+        tar.addfile(info, io.BytesIO(data))
+        link = tarfile.TarInfo("uploads/link with space")
+        link.type = tarfile.SYMTYPE
+        link.linkname = "../../private.txt"
+        tar.addfile(link)
+    archive_path = set_files[archive_name]
+    archive_path.write_bytes(buffer.getvalue())
+    checksum_path = set_files[checksum_name(archive_name)]
+    checksum_path.write_text(
+        f"{hashlib.sha256(buffer.getvalue()).hexdigest()}  {archive_name}\n"
+    )
+
+    with pytest.raises(WPSSHBackupError, match="resolves outside"):
+        restore.run_restore(
+            client,
+            config,
+            set_files,
+            True,
+            False,
+            staging_bid="20261014T1000Z",
+        )
+
+    assert posixpath.join(SITE_ROOT, "wp-config.php") not in client.remote_fs
+
+
+def test_extract_files_rejects_symlink_name_with_arrow(
+    tmp_path: Path,
+) -> None:
+    """A link name containing ' -> ' must not be mistaken for a target."""
+    import io
+    import tarfile
+
+    backup_dir = tmp_path / "backups"
+    set_files = make_local_set(backup_dir, TS)
+    client = FakeSSHClient(SITE_ROOT, wp_cli="/usr/bin/wp")
+    config = make_config(tmp_path)
+
+    archive_name = files_archive_name(TS)
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as tar:
+        info = tarfile.TarInfo("wp-config.php")
+        data = b"<?php\n"
+        info.size = len(data)
+        tar.addfile(info, io.BytesIO(data))
+        # The NAME contains ' -> '; the target escapes. A naive parser
+        # would read the name's arrow as the separator and validate the
+        # wrong string.
+        link = tarfile.TarInfo("uploads/a -> b")
+        link.type = tarfile.SYMTYPE
+        link.linkname = "../../private.txt"
+        tar.addfile(link)
+    archive_path = set_files[archive_name]
+    archive_path.write_bytes(buffer.getvalue())
+    checksum_path = set_files[checksum_name(archive_name)]
+    checksum_path.write_text(
+        f"{hashlib.sha256(buffer.getvalue()).hexdigest()}  {archive_name}\n"
+    )
+
+    with pytest.raises(WPSSHBackupError, match="resolves outside"):
+        restore.run_restore(
+            client,
+            config,
+            set_files,
+            True,
+            False,
+            staging_bid="20261014T1000Z",
+        )
+
+    assert posixpath.join(SITE_ROOT, "wp-config.php") not in client.remote_fs
+
+
+def test_extract_files_allows_internal_symlink_with_spaces(
+    tmp_path: Path,
+) -> None:
+    """A benign spaced link must survive the quoted-listing decode."""
+    import io
+    import tarfile
+
+    backup_dir = tmp_path / "backups"
+    set_files = make_local_set(backup_dir, TS)
+    client = FakeSSHClient(SITE_ROOT, wp_cli="/usr/bin/wp")
+    config = make_config(tmp_path)
+
+    archive_name = files_archive_name(TS)
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as tar:
+        info = tarfile.TarInfo("wp-config.php")
+        data = b"<?php\n"
+        info.size = len(data)
+        tar.addfile(info, io.BytesIO(data))
+        link = tarfile.TarInfo("uploads/my link")
+        link.type = tarfile.SYMTYPE
+        link.linkname = "../index.php"
+        tar.addfile(link)
+    archive_path = set_files[archive_name]
+    archive_path.write_bytes(buffer.getvalue())
+    checksum_path = set_files[checksum_name(archive_name)]
+    checksum_path.write_text(
+        f"{hashlib.sha256(buffer.getvalue()).hexdigest()}  {archive_name}\n"
+    )
+
+    restore.run_restore(
+        client, config, set_files, True, False, staging_bid="20261014T1000Z"
+    )
+
+    assert (
+        client.remote_fs[posixpath.join(SITE_ROOT, "uploads/my link")]
+        == b"-> ../index.php"
+    )
+
+
+def test_validate_members_fails_closed_on_undecodable_line(
+    tmp_path: Path,
+) -> None:
+    """A listing line that cannot be decoded must abort the restore."""
+    client = FakeSSHClient(SITE_ROOT, wp_cli="/usr/bin/wp")
+    archive = posixpath.join(
+        staging_dir_for(SITE_ROOT, "20261014T1000Z"),
+        files_archive_name(TS),
+    )
+    # A malformed quoted token: shlex cannot decode an unterminated quote.
+    listing = "lrwxrwxrwx user/group 0 2026-01-01 09:30 'uploads/broken\n"
+    original_execute = client._execute
+
+    def fake_execute(command: str, stdout, stderr):
+        if "-tvzf" in command:
+            stdout.write(listing.encode())
+            return 0
+        return original_execute(command, stdout, stderr)
+
+    client._execute = fake_execute  # type: ignore[method-assign]
+    # The archive must be a real gzip tarball so the listing command
+    # itself succeeds; the fake's -tvzf output is replaced wholesale.
+    import io as _io
+    import tarfile as _tarfile
+
+    buffer = _io.BytesIO()
+    with _tarfile.open(fileobj=buffer, mode="w:gz") as tar:
+        info = _tarfile.TarInfo("wp-config.php")
+        info.size = 0
+        tar.addfile(info)
+    client.remote_fs[archive] = buffer.getvalue()
+
+    with pytest.raises(WPSSHBackupError, match="cannot decode"):
+        restore._validate_members(archive, client, SITE_ROOT)
+
+
+def test_extract_files_rejects_preexisting_symlinked_dir(
+    tmp_path: Path,
+) -> None:
+    """A pre-existing symlinked 'uploads' must block extraction into it."""
+    import io
+    import tarfile
+
+    backup_dir = tmp_path / "backups"
+    set_files = make_local_set(backup_dir, TS)
+    client = FakeSSHClient(SITE_ROOT, wp_cli="/usr/bin/wp")
+    config = make_config(tmp_path)
+
+    # The site tree already contains uploads -> /home/user/private.
+    client.remote_fs[posixpath.join(SITE_ROOT, "uploads")] = (
+        b"-> /home/user/private"
+    )
+
+    archive_name = files_archive_name(TS)
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as tar:
+        info = tarfile.TarInfo("wp-config.php")
+        data = b"<?php\n"
+        info.size = len(data)
+        tar.addfile(info, io.BytesIO(data))
+        member = tarfile.TarInfo("uploads/file.txt")
+        data = b"payload"
+        member.size = len(data)
+        tar.addfile(member, io.BytesIO(data))
+    archive_path = set_files[archive_name]
+    archive_path.write_bytes(buffer.getvalue())
+    checksum_path = set_files[checksum_name(archive_name)]
+    checksum_path.write_text(
+        f"{hashlib.sha256(buffer.getvalue()).hexdigest()}  {archive_name}\n"
+    )
+
+    with pytest.raises(WPSSHBackupError, match="already exists as a symlink"):
+        restore.run_restore(
+            client,
+            config,
+            set_files,
+            True,
+            False,
+            staging_bid="20261014T1000Z",
+        )
+
+    # Nothing was extracted into the site root.
+    assert posixpath.join(SITE_ROOT, "wp-config.php") not in client.remote_fs
+
+
+def test_extract_files_rejects_preexisting_link_in_member_dir(
+    tmp_path: Path,
+) -> None:
+    """A pre-existing link inside an archive directory must block too."""
+    import io
+    import tarfile
+
+    backup_dir = tmp_path / "backups"
+    set_files = make_local_set(backup_dir, TS)
+    client = FakeSSHClient(SITE_ROOT, wp_cli="/usr/bin/wp")
+    config = make_config(tmp_path)
+
+    # uploads is a real directory, but it already contains a symlink.
+    client.remote_fs[posixpath.join(SITE_ROOT, "uploads/escape")] = (
+        b"-> ../../../private"
+    )
+
+    archive_name = files_archive_name(TS)
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as tar:
+        info = tarfile.TarInfo("wp-config.php")
+        data = b"<?php\n"
+        info.size = len(data)
+        tar.addfile(info, io.BytesIO(data))
+        member = tarfile.TarInfo("uploads/file.txt")
+        data = b"payload"
+        member.size = len(data)
+        tar.addfile(member, io.BytesIO(data))
+    archive_path = set_files[archive_name]
+    archive_path.write_bytes(buffer.getvalue())
+    checksum_path = set_files[checksum_name(archive_name)]
+    checksum_path.write_text(
+        f"{hashlib.sha256(buffer.getvalue()).hexdigest()}  {archive_name}\n"
+    )
+
+    with pytest.raises(WPSSHBackupError, match="already exists as a symlink"):
+        restore.run_restore(
+            client,
+            config,
+            set_files,
+            True,
+            False,
+            staging_bid="20261014T1000Z",
+        )
+
+    assert posixpath.join(SITE_ROOT, "wp-config.php") not in client.remote_fs
+
+
+def test_extract_files_ignores_symlink_outside_member_dirs(
+    tmp_path: Path,
+) -> None:
+    """A pre-existing symlink in an untouched directory must not block."""
+    import io
+    import tarfile
+
+    backup_dir = tmp_path / "backups"
+    set_files = make_local_set(backup_dir, TS)
+    client = FakeSSHClient(SITE_ROOT, wp_cli="/usr/bin/wp")
+    config = make_config(tmp_path)
+
+    # other-dir is NOT written by the archive, so its symlink is not this
+    # restore's business.
+    client.remote_fs[posixpath.join(SITE_ROOT, "other-dir/link")] = (
+        b"-> /somewhere"
+    )
+
+    archive_name = files_archive_name(TS)
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as tar:
+        info = tarfile.TarInfo("wp-config.php")
+        data = b"<?php\n"
+        info.size = len(data)
+        tar.addfile(info, io.BytesIO(data))
+    archive_path = set_files[archive_name]
+    archive_path.write_bytes(buffer.getvalue())
+    checksum_path = set_files[checksum_name(archive_name)]
+    checksum_path.write_text(
+        f"{hashlib.sha256(buffer.getvalue()).hexdigest()}  {archive_name}\n"
+    )
+
+    restore.run_restore(
+        client, config, set_files, True, False, staging_bid="20261014T1000Z"
+    )
+
+    assert (
+        client.remote_fs[posixpath.join(SITE_ROOT, "wp-config.php")]
+        == b"<?php\n"
+    )
+    # The untouched symlink is still there.
+    assert (
+        client.remote_fs[posixpath.join(SITE_ROOT, "other-dir/link")]
+        == b"-> /somewhere"
     )
 
 
@@ -764,6 +1230,30 @@ def test_run_restore_checksum_failure_removes_staging(tmp_path: Path) -> None:
         )
 
     staging = staging_dir_for(SITE_ROOT, "20261014T1000Z")
+    assert not any(path.startswith(staging) for path in client.remote_fs)
+
+
+def test_run_restore_chmod_failure_removes_staging(tmp_path: Path) -> None:
+    """A failed 0700 chmod must not orphan the staging directory."""
+    backup_dir = tmp_path / "backups"
+    set_files = make_local_set(backup_dir, TS)
+    client = FakeSSHClient(SITE_ROOT, wp_cli="/usr/bin/wp")
+    client.fail_on["chmod"] = 1
+    config = make_config(tmp_path)
+
+    with pytest.raises(Exception):
+        restore.run_restore(
+            client,
+            config,
+            set_files,
+            True,
+            False,
+            staging_bid="20261014T1000Z",
+        )
+
+    staging = staging_dir_for(SITE_ROOT, "20261014T1000Z")
+    # The directory this run created was removed by the cleanup handler.
+    assert staging not in client.directories
     assert not any(path.startswith(staging) for path in client.remote_fs)
 
 

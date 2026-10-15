@@ -13,6 +13,7 @@ import hashlib
 import io
 import posixpath
 import re
+import shlex
 import tarfile
 
 
@@ -218,10 +219,12 @@ class FakeSSHClient:
             return self._tar_create(command, stderr)
         if command.startswith("tar xzf "):
             return self._tar_extract(command, stderr)
-        if command.startswith("tar tvzf "):
+        if re.search(r"^tar\s+.*\s-tvzf\s", command):
             return self._tar_list(command, stdout, stderr, verbose=True)
-        if command.startswith("tar tzf "):
+        if re.search(r"^tar\s+.*\s-tzf\s", command):
             return self._tar_list(command, stdout, stderr, verbose=False)
+        if re.search(r"^find\s+", command) and "-type l" in command:
+            return self._find_type_l(command, stdout, stderr)
         if "mysqldump" in command:
             return self._mysqldump(command, stderr)
         if (
@@ -404,6 +407,16 @@ class FakeSSHClient:
         if archive_path not in self.remote_fs:
             stderr.write(f"tar: {archive_path}: not found\n".encode())
             return 1
+        # GNU tar's default -tv format is not machine-readable: names with
+        # spaces are split and a name containing ' -> ' can be mistaken
+        # for part of a link target. The tool therefore requests
+        # --quoting-style=shell-always, which makes every name and target
+        # exactly one shell token; reproduce that here.
+        shell_quoted = "--quoting-style=shell-always" in command
+
+        def q(text: str) -> str:
+            return shlex.quote(text) if shell_quoted else text
+
         try:
             with tarfile.open(
                 fileobj=io.BytesIO(self.remote_fs[archive_path]), mode="r:gz"
@@ -421,18 +434,43 @@ class FakeSSHClient:
                             perms = "rw-r--r--"
                         line = (
                             f"{kind}{perms} user/group 0 2026-01-01 "
-                            f"09:30 {member.name}"
+                            f"09:30 {q(member.name)}"
                         )
                         if kind == "l":
-                            line += f" -> {member.linkname}"
+                            line += f" -> {q(member.linkname)}"
                         elif kind == "h":
-                            line += f" link to {member.linkname}"
+                            line += f" link to {q(member.linkname)}"
                         stdout.write((line + "\n").encode())
                     else:
-                        stdout.write(f"{member.name}\n".encode())
+                        stdout.write(f"{q(member.name)}\n".encode())
         except (tarfile.TarError, EOFError, OSError) as exc:
             stderr.write(f"tar: {exc}\n".encode())
             return 2
+        return 0
+
+    def _find_type_l(
+        self, command: str, stdout: io.BytesIO, stderr: io.BytesIO
+    ) -> int:
+        """find <root> -type l -print0: list symlinks under root.
+
+        The fake records symlinks as remote_fs entries whose content is
+        b"-> <target>" (see _tar_extract), so a symlink is any entry
+        whose data starts with b"-> ". Like real find, links are listed
+        WITHOUT following them, and the root itself is never listed.
+        """
+        match = re.search(r"^find\s+'([^']+)'\s+-type l\s+-print0$", command)
+        if not match:
+            stderr.write(f"find: unsupported syntax: {command}\n".encode())
+            return 1
+        root = match.group(1).rstrip("/")
+        prefix = root + "/"
+        links = [
+            path
+            for path, data in self.remote_fs.items()
+            if path.startswith(prefix) and data.startswith(b"-> ")
+        ]
+        for path in sorted(links):
+            stdout.write(path.encode() + b"\0")
         return 0
 
     def _resolve(self, name: str, cwd: str | None) -> str:

@@ -301,14 +301,43 @@ def test_run_backup_checksum_mismatch_keeps_staging(
     assert any(path.startswith(staging) for path in client.remote_fs)
 
 
+def test_run_backup_checksum_mismatch_leaves_no_final_name_files(
+    tmp_path: Path, backup_dir: Path
+) -> None:
+    """A failed verification must not leave a corrupt set in BACKUP_DIR."""
+    client = FakeSSHClient(SITE_ROOT, wp_cli="/usr/bin/wp")
+    original_get = client.sftp.get
+
+    def corrupting_get(remote_path: str, local_path: str) -> None:
+        original_get(remote_path, local_path)
+        if remote_path.endswith(".tar.gz"):
+            Path(local_path).write_bytes(b"corrupted")
+
+    client.sftp.get = corrupting_get  # type: ignore[method-assign]
+    config = make_config(tmp_path)
+
+    with pytest.raises(ChecksumError):
+        backup.run_backup(
+            client, config, include_files=True, include_database=False, bid=TS
+        )
+
+    # No file from this run may remain under its final name: a corrupt
+    # archive-plus-manifest pair would be advertised by find_backup_sets()
+    # as a complete set and a default restore could select it.
+    assert list(backup_dir.iterdir()) == []
+    from common import find_backup_sets
+
+    assert find_backup_sets(backup_dir) == {}
+
+
 def test_verify_downloads_undecodable_manifest_raises_checksum_error(
     tmp_path: Path,
 ) -> None:
     """An invalid-UTF-8 manifest must raise ChecksumError, not crash."""
     archive = files_archive_name(TS)
-    archive_path = tmp_path / archive
+    archive_path = tmp_path / (archive + ".part")
     archive_path.write_bytes(b"payload")
-    checksum_path = tmp_path / checksum_name(archive)
+    checksum_path = tmp_path / (checksum_name(archive) + ".part")
     checksum_path.write_bytes(b"\xff\xfe\x00invalid-utf8")
 
     with pytest.raises(ChecksumError, match="not valid UTF-8"):
@@ -319,6 +348,63 @@ def test_verify_downloads_undecodable_manifest_raises_checksum_error(
             },
             [archive],
         )
+
+
+def test_download_artifacts_uses_temp_names(
+    tmp_path: Path, backup_dir: Path
+) -> None:
+    """Downloads must land under .part names, invisible to set discovery."""
+    from common import find_backup_sets, sftp_download
+
+    client = FakeSSHClient(SITE_ROOT)
+    staging = staging_dir_for(SITE_ROOT, TS)
+    archive = files_archive_name(TS)
+    client.remote_fs[posixpath.join(staging, archive)] = b"payload"
+    client.remote_fs[posixpath.join(staging, checksum_name(archive))] = (
+        f"{'a' * 64}  {archive}\n".encode()
+    )
+
+    with client.open_sftp() as sftp:
+        temp_paths = backup.download_artifacts(
+            sftp, staging, [archive], backup_dir
+        )
+
+    # The temp files exist under .part names...
+    assert (backup_dir / (archive + ".part")).is_file()
+    assert (
+        backup_dir / (checksum_name(archive) + ".part")
+    ).is_file()
+    # ...and are invisible to find_backup_sets (no complete set yet).
+    assert find_backup_sets(backup_dir) == {}
+    # The returned mapping is keyed by final names.
+    assert temp_paths[archive] == backup_dir / (archive + ".part")
+    del sftp_download
+
+
+def test_publish_downloads_renames_verified_files(
+    tmp_path: Path, backup_dir: Path
+) -> None:
+    """publish_downloads renames .part files to their final names."""
+    archive = files_archive_name(TS)
+    temp_archive = backup_dir / (archive + ".part")
+    temp_checksum = backup_dir / (checksum_name(archive) + ".part")
+    temp_archive.write_bytes(b"payload")
+    temp_checksum.write_text(f"{'a' * 64}  {archive}\n")
+
+    local_paths = backup.publish_downloads(
+        {
+            archive: temp_archive,
+            checksum_name(archive): temp_checksum,
+        },
+        [archive],
+        backup_dir,
+    )
+
+    assert local_paths[archive] == backup_dir / archive
+    assert (backup_dir / archive).is_file()
+    assert (backup_dir / checksum_name(archive)).is_file()
+    assert not temp_archive.exists()
+    assert not temp_checksum.exists()
 
 
 def test_run_backup_undecodable_manifest_keeps_staging(
@@ -344,6 +430,39 @@ def test_run_backup_undecodable_manifest_keeps_staging(
 
     # Remote staging must be kept for retry.
     assert any(path.startswith(staging) for path in client.remote_fs)
+    # And no partial downloads may linger in BACKUP_DIR.
+    assert list(backup_dir.iterdir()) == []
+
+
+def test_run_backup_sftp_failure_discards_temp_downloads(
+    tmp_path: Path, backup_dir: Path
+) -> None:
+    """A dropped transfer must leave no partial files in BACKUP_DIR."""
+    import paramiko
+
+    client = FakeSSHClient(SITE_ROOT, wp_cli="/usr/bin/wp")
+    original_get = client.sftp.get
+
+    def failing_get(remote_path: str, local_path: str) -> None:
+        if remote_path.endswith(".tar.gz"):
+            # The archive lands, then the connection drops before the
+            # manifest is fetched.
+            original_get(remote_path, local_path)
+            raise paramiko.SSHException("connection dropped")
+        original_get(remote_path, local_path)
+
+    client.sftp.get = failing_get  # type: ignore[method-assign]
+    config = make_config(tmp_path)
+    staging = staging_dir_for(SITE_ROOT, TS)
+
+    with pytest.raises(paramiko.SSHException):
+        backup.run_backup(
+            client, config, include_files=True, include_database=False, bid=TS
+        )
+
+    assert list(backup_dir.iterdir()) == []
+    # The remote staging dir is removed on non-checksum failures.
+    assert not any(path.startswith(staging) for path in client.remote_fs)
 
 
 def test_run_backup_remote_failure_removes_staging(
@@ -404,6 +523,56 @@ def test_run_backup_staging_dir_is_exclusive(
 
     with pytest.raises(Exception, match="Could not create staging"):
         backup.run_backup(client, config, True, False, TS)
+
+
+def test_run_backup_chmod_failure_removes_staging(
+    tmp_path: Path, backup_dir: Path
+) -> None:
+    """A failed 0700 chmod must not orphan the staging directory."""
+    client = FakeSSHClient(SITE_ROOT)
+    client.fail_on["chmod"] = 1
+    config = make_config(tmp_path)
+    staging = staging_dir_for(SITE_ROOT, TS)
+
+    with pytest.raises(Exception):
+        backup.run_backup(
+            client, config, include_files=True, include_database=False, bid=TS
+        )
+
+    # The directory this run created was removed by the cleanup handler.
+    assert staging not in client.directories
+    assert not any(path.startswith(staging) for path in client.remote_fs)
+
+
+def test_run_backup_chmod_runs_before_any_artifacts(
+    tmp_path: Path, backup_dir: Path
+) -> None:
+    """The 0700 chmod must be a separate command issued before the dump."""
+    client = FakeSSHClient(SITE_ROOT, wp_cli="/usr/bin/wp")
+    config = make_config(tmp_path)
+    staging = staging_dir_for(SITE_ROOT, TS)
+
+    backup.run_backup(
+        client, config, include_files=False, include_database=True, bid=TS
+    )
+
+    # mkdir and chmod are separate commands; chmod comes before any
+    # artifact-producing command (mysqldump / wp db export / tar czf).
+    mkdir_commands = [c for c in client.commands if c.startswith("mkdir ")]
+    chmod_commands = [c for c in client.commands if c.startswith("chmod ")]
+    artifact_commands = [
+        c for c in client.commands
+        if "mysqldump" in c or "db export" in c or "tar czf" in c
+    ]
+    assert len(mkdir_commands) == 1
+    assert len(chmod_commands) == 1
+    assert "&&" not in mkdir_commands[0]
+    assert chmod_commands[0].startswith(f"chmod 700 '{staging}'")
+    assert client.commands.index(chmod_commands[0]) < client.commands.index(
+        artifact_commands[0]
+    )
+    # The staging directory was restricted to the owner (0700).
+    assert client.directory_modes[staging] == 0o700
 
 
 def test_main_reports_sftp_failure_as_error(
