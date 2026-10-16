@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
+import os
 import posixpath
 from pathlib import Path
+from typing import BinaryIO
 
 import pytest
 
@@ -48,6 +51,28 @@ def backup_dir(tmp_path: Path) -> Path:
     path = tmp_path / "backups"
     path.mkdir()
     return path
+
+
+def make_temp_set(backup_dir: Path, *archives: str) -> dict[str, Path]:
+    """Write .part downloads for each archive, keyed by final name."""
+    temp_paths: dict[str, Path] = {}
+    for archive in archives:
+        archive_path = backup_dir / (archive + ".part")
+        archive_path.write_bytes(b"payload")
+        manifest = f"{hashlib.sha256(b'payload').hexdigest()}  {archive}\n"
+        checksum_path = backup_dir / (checksum_name(archive) + ".part")
+        checksum_path.write_bytes(manifest.encode())
+        temp_paths[archive] = archive_path
+        temp_paths[checksum_name(archive)] = checksum_path
+    return temp_paths
+
+
+def digests_for(temp_paths: dict[str, Path]) -> dict[str, str]:
+    """Digests of the current .part bytes, keyed by final name."""
+    return {
+        final: hashlib.sha256(path.read_bytes()).hexdigest()
+        for final, path in temp_paths.items()
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -352,6 +377,35 @@ def test_verify_downloads_undecodable_manifest_raises_checksum_error(
         )
 
 
+def test_verify_downloads_returns_publication_digests(
+    tmp_path: Path,
+) -> None:
+    """verify_downloads must bind each final name to a digest.
+
+    publish_downloads() re-verifies every published file against the
+    digest verify_downloads() captured, so the returned mapping must
+    cover the archives (bound to their manifest digest) and the
+    checksum files (bound to their own digest at verification time).
+    """
+    archive = files_archive_name(TS)
+    payload = b"payload"
+    manifest = f"{hashlib.sha256(payload).hexdigest()}  {archive}\n"
+    archive_path = tmp_path / (archive + ".part")
+    archive_path.write_bytes(payload)
+    checksum_path = tmp_path / (checksum_name(archive) + ".part")
+    checksum_path.write_bytes(manifest.encode())
+
+    digests = backup.verify_downloads(
+        {archive: archive_path, checksum_name(archive): checksum_path},
+        [archive],
+    )
+
+    assert digests[archive] == hashlib.sha256(payload).hexdigest()
+    assert digests[checksum_name(archive)] == hashlib.sha256(
+        manifest.encode()
+    ).hexdigest()
+
+
 def test_download_artifacts_uses_temp_names(
     tmp_path: Path, backup_dir: Path
 ) -> None:
@@ -383,58 +437,48 @@ def test_download_artifacts_uses_temp_names(
     del sftp_download
 
 
-def test_publish_downloads_renames_verified_files(
-    tmp_path: Path, backup_dir: Path
+def test_publish_downloads_publishes_verified_files(
+    backup_dir: Path,
 ) -> None:
-    """publish_downloads renames .part files to their final names."""
+    """publish_downloads publishes .part files under their final names."""
     archive = files_archive_name(TS)
-    temp_archive = backup_dir / (archive + ".part")
-    temp_checksum = backup_dir / (checksum_name(archive) + ".part")
-    temp_archive.write_bytes(b"payload")
-    temp_checksum.write_text(f"{'a' * 64}  {archive}\n")
+    temp_paths = make_temp_set(backup_dir, archive)
 
     local_paths = backup.publish_downloads(
-        {
-            archive: temp_archive,
-            checksum_name(archive): temp_checksum,
-        },
+        temp_paths,
         [archive],
         backup_dir,
+        digests_for(temp_paths),
     )
 
     assert local_paths[archive] == backup_dir / archive
     assert (backup_dir / archive).is_file()
     assert (backup_dir / checksum_name(archive)).is_file()
-    assert not temp_archive.exists()
-    assert not temp_checksum.exists()
+    assert not temp_paths[archive].exists()
+    assert not temp_paths[checksum_name(archive)].exists()
 
 
 def test_publish_downloads_refuses_overwrite_of_existing(
-    tmp_path: Path, backup_dir: Path
+    backup_dir: Path,
 ) -> None:
     """Pre-existing final-name files must be preserved, not overwritten."""
     archive = files_archive_name(TS)
     existing = backup_dir / archive
     existing.write_bytes(b"prior-content")
-    temp_archive = backup_dir / (archive + ".part")
-    temp_archive.write_bytes(b"payload")
-    temp_checksum = backup_dir / (checksum_name(archive) + ".part")
-    temp_checksum.write_text(f"{'a' * 64}  {archive}\n")
+    temp_paths = make_temp_set(backup_dir, archive)
 
     with pytest.raises(FileExistsError, match="Refusing to overwrite"):
         backup.publish_downloads(
-            {
-                archive: temp_archive,
-                checksum_name(archive): temp_checksum,
-            },
+            temp_paths,
             [archive],
             backup_dir,
+            digests_for(temp_paths),
         )
 
     # The pre-existing file is untouched; nothing was moved.
     assert existing.read_bytes() == b"prior-content"
-    assert temp_archive.is_file()
-    assert temp_checksum.is_file()
+    assert temp_paths[archive].is_file()
+    assert temp_paths[checksum_name(archive)].is_file()
 
 
 @pytest.mark.parametrize("kind", ["file", "dangling-symlink", "live-symlink"])
@@ -461,24 +505,19 @@ def test_publish_downloads_refuses_existing_symlink(
         final_path.symlink_to(target)
     else:
         final_path.write_bytes(b"prior-content")
-    temp_archive = backup_dir / (archive + ".part")
-    temp_archive.write_bytes(b"payload")
-    temp_checksum = backup_dir / (checksum_name(archive) + ".part")
-    temp_checksum.write_text(f"{'a' * 64}  {archive}\n")
+    temp_paths = make_temp_set(backup_dir, archive)
 
     with pytest.raises(FileExistsError, match="Refusing to overwrite"):
         backup.publish_downloads(
-            {
-                archive: temp_archive,
-                checksum_name(archive): temp_checksum,
-            },
+            temp_paths,
             [archive],
             backup_dir,
+            digests_for(temp_paths),
         )
 
     # The pre-existing path is untouched; nothing was moved.
-    assert temp_archive.is_file()
-    assert temp_checksum.is_file()
+    assert temp_paths[archive].is_file()
+    assert temp_paths[checksum_name(archive)].is_file()
     if kind == "dangling-symlink":
         assert final_path.is_symlink()
         assert not final_path.exists()
@@ -490,7 +529,7 @@ def test_publish_downloads_refuses_existing_symlink(
 
 
 def test_publish_downloads_rolls_back_partial_publication(
-    tmp_path: Path, backup_dir: Path
+    backup_dir: Path,
 ) -> None:
     """A mid-publication failure must leave no final-name files behind.
 
@@ -501,21 +540,10 @@ def test_publish_downloads_rolls_back_partial_publication(
     caller's cleanup discards the still intact temporary downloads.
     """
     # Two sets so at least one publication happens before the failure.
-    # The temp paths are keyed by the FINAL filenames, matching the
-    # function's contract.
     bid2 = "20261014T0931Z-b2c3d4"
     archive1 = files_archive_name(TS)
     archive2 = files_archive_name(bid2)
-    temp_paths = {}
-    for archive in (archive1, archive2):
-        temp_paths[archive] = backup_dir / (archive + ".part")
-        temp_paths[archive].write_bytes(b"payload")
-        temp_paths[checksum_name(archive)] = backup_dir / (
-            checksum_name(archive) + ".part"
-        )
-        temp_paths[checksum_name(archive)].write_text(
-            f"{'a' * 64}  {archive}\n"
-        )
+    temp_paths = make_temp_set(backup_dir, archive1, archive2)
 
     import unittest.mock
 
@@ -523,14 +551,16 @@ def test_publish_downloads_rolls_back_partial_publication(
 
     calls = {"n": 0}
 
-    def exploding_publish(temp_path: Path, final_path: Path) -> None:
+    def exploding_publish(
+        handle: BinaryIO, temp_path: Path, final_path: Path
+    ) -> BinaryIO:
         calls["n"] += 1
         if calls["n"] == 3:
             # First two publications (archive1 + its checksum)
             # succeeded; the third fails, simulating a
             # mid-publication error.
             raise OSError("simulated mid-publication failure")
-        original_publish(temp_path, final_path)
+        return original_publish(handle, temp_path, final_path)
 
     with unittest.mock.patch.object(
         backup, "_publish_no_replace", exploding_publish
@@ -540,6 +570,7 @@ def test_publish_downloads_rolls_back_partial_publication(
                 temp_paths,
                 [archive1, archive2],
                 backup_dir,
+                digests_for(temp_paths),
             )
 
     # No final-name file from this run remains: the first two published
@@ -560,7 +591,7 @@ def test_publish_downloads_rolls_back_partial_publication(
 
 
 def test_publish_downloads_no_replace_survives_post_check_race(
-    tmp_path: Path, backup_dir: Path
+    backup_dir: Path,
 ) -> None:
     """A final path created after the pre-check must not be overwritten.
 
@@ -575,25 +606,18 @@ def test_publish_downloads_no_replace_survives_post_check_race(
     bid2 = "20261014T0931Z-b2c3d4"
     archive1 = files_archive_name(TS)
     archive2 = files_archive_name(bid2)
-    temp_paths = {}
-    for archive in (archive1, archive2):
-        temp_paths[archive] = backup_dir / (archive + ".part")
-        temp_paths[archive].write_bytes(b"payload")
-        temp_paths[checksum_name(archive)] = backup_dir / (
-            checksum_name(archive) + ".part"
-        )
-        temp_paths[checksum_name(archive)].write_text(
-            f"{'a' * 64}  {archive}\n"
-        )
+    temp_paths = make_temp_set(backup_dir, archive1, archive2)
 
     original_publish = backup._publish_no_replace
 
-    def racing_publish(temp_path: Path, final_path: Path) -> None:
+    def racing_publish(
+        handle: BinaryIO, temp_path: Path, final_path: Path
+    ) -> BinaryIO:
         if final_path.name == checksum_name(archive2):
             # Simulate another process creating the final path after
             # the pre-check, just before this run publishes it.
             final_path.write_bytes(b"created-by-other-process")
-        original_publish(temp_path, final_path)
+        return original_publish(handle, temp_path, final_path)
 
     with unittest.mock.patch.object(
         backup, "_publish_no_replace", racing_publish
@@ -603,6 +627,7 @@ def test_publish_downloads_no_replace_survives_post_check_race(
                 temp_paths,
                 [archive1, archive2],
                 backup_dir,
+                digests_for(temp_paths),
             )
 
     # The other process's file is preserved, not overwritten.
@@ -615,6 +640,197 @@ def test_publish_downloads_no_replace_survives_post_check_race(
     # The temporary downloads remain for the caller's cleanup.
     for temp_path in temp_paths.values():
         assert temp_path.exists()
+
+
+def test_publish_downloads_rejects_symlinked_temp(
+    backup_dir: Path,
+) -> None:
+    """A .part path swapped for a symlink must not be published.
+
+    os.link() follows a symlink at the source path, so publication from
+    the pathname would link the target's unverified inode. The .part
+    files are opened through no-follow descriptors before publication;
+    this test simulates the swap by making os.open() reject the leaf
+    with ELOOP, the same failure O_NOFOLLOW produces on POSIX.
+    """
+    import errno
+    import os
+    import unittest.mock
+
+    archive = files_archive_name(TS)
+    temp_paths = make_temp_set(backup_dir, archive)
+
+    def open_rejects_symlink(path, *args, **kwargs):
+        if str(path).endswith(".part"):
+            raise OSError(errno.ELOOP, "Too many levels of symbolic links")
+        return real_open(path, *args, **kwargs)
+
+    real_open = os.open
+    with unittest.mock.patch.object(
+        backup.os, "open", open_rejects_symlink
+    ):
+        with pytest.raises(
+            WPSSHBackupError, match="Refusing to publish through symlink"
+        ):
+            backup.publish_downloads(
+                temp_paths,
+                [archive],
+                backup_dir,
+                digests_for(temp_paths),
+            )
+
+    # Nothing was published and the temps were not touched.
+    assert not (backup_dir / archive).exists()
+    assert not (backup_dir / checksum_name(archive)).exists()
+    assert temp_paths[archive].is_file()
+    assert temp_paths[checksum_name(archive)].is_file()
+
+
+def test_publish_downloads_rejects_temp_replaced_before_publication(
+    backup_dir: Path,
+) -> None:
+    """A .part replaced after verification must not be published.
+
+    A writer who can write BACKUP_DIR can replace a verified .part
+    pathname with different bytes before publication opens it. The
+    digest is re-verified through the held descriptor after linking, so
+    the replacement is detected and the publication is rolled back
+    instead of publishing unverified bytes.
+    """
+    archive = files_archive_name(TS)
+    temp_paths = make_temp_set(backup_dir, archive)
+    digests = digests_for(temp_paths)
+
+    # Simulate a writer replacing the verified .part pathname with
+    # different bytes after verification, before publication opens it.
+    temp_paths[archive].unlink()
+    temp_paths[archive].write_bytes(b"attacker-bytes")
+
+    with pytest.raises(ChecksumError, match="changed after verification"):
+        backup.publish_downloads(
+            temp_paths,
+            [archive],
+            backup_dir,
+            digests,
+        )
+
+    # The rejected publication was rolled back; the replacement's bytes
+    # never appeared under a final name.
+    assert not (backup_dir / archive).exists()
+    assert not (backup_dir / checksum_name(archive)).exists()
+    # The temporary downloads remain for the caller's cleanup.
+    assert temp_paths[archive].is_file()
+    assert temp_paths[checksum_name(archive)].is_file()
+
+
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="Windows refuses to unlink a file this process holds open",
+)
+def test_publish_downloads_rejects_temp_replaced_after_open(
+    backup_dir: Path,
+) -> None:
+    """A .part swapped after publication opened it must not be published.
+
+    os.link() links the source pathname's current target, so a writer
+    who replaces a verified .part pathname after publication opened it
+    would publish the replacement's unverified inode. The created link
+    must reference the held descriptor's inode; the identity check
+    rejects the swap and the publication is rolled back.
+
+    Skipped on Windows: the held descriptor itself prevents the
+    replacement there (the file cannot be unlinked while open), so the
+    scenario is POSIX-specific.
+    """
+    import unittest.mock
+
+    archive = files_archive_name(TS)
+    temp_paths = make_temp_set(backup_dir, archive)
+    digests = digests_for(temp_paths)
+
+    original_publish = backup._publish_no_replace
+
+    def replacing_publish(
+        handle: BinaryIO, temp_path: Path, final_path: Path
+    ) -> BinaryIO:
+        if temp_path.name == archive + ".part":
+            # Simulate a writer replacing the verified .part pathname
+            # after publication opened it: the path now points at
+            # different bytes, while the held descriptor still
+            # references the verified inode.
+            temp_path.unlink()
+            temp_path.write_bytes(b"attacker-bytes")
+        return original_publish(handle, temp_path, final_path)
+
+    with unittest.mock.patch.object(
+        backup, "_publish_no_replace", replacing_publish
+    ):
+        with pytest.raises(
+            WPSSHBackupError, match="was replaced after verification"
+        ):
+            backup.publish_downloads(
+                temp_paths,
+                [archive],
+                backup_dir,
+                digests,
+            )
+
+    # The rejected publication was rolled back; the replacement's bytes
+    # never appeared under a final name.
+    assert not (backup_dir / archive).exists()
+    assert not (backup_dir / checksum_name(archive)).exists()
+    # The temporary downloads remain for the caller's cleanup.
+    assert temp_paths[archive].is_file()
+    assert temp_paths[checksum_name(archive)].is_file()
+
+
+def test_publish_downloads_rejects_mutated_temp(
+    backup_dir: Path,
+) -> None:
+    """A .part mutated in place after verification must not be published.
+
+    A hard link shares the temporary file's inode, so bytes appended to
+    the .part path between verification and publication would also
+    change the published backup. The digest is re-verified through the
+    held descriptor after linking, so the mutation is detected and the
+    publication is rolled back.
+    """
+    import unittest.mock
+
+    archive = files_archive_name(TS)
+    temp_paths = make_temp_set(backup_dir, archive)
+    digests = digests_for(temp_paths)
+
+    original_publish = backup._publish_no_replace
+
+    def mutating_publish(
+        handle: BinaryIO, temp_path: Path, final_path: Path
+    ) -> BinaryIO:
+        if temp_path.name == archive + ".part":
+            # Simulate a writer appending to the verified .part in
+            # place after verification, before the digest re-check.
+            with open(temp_path, "ab") as mutating:
+                mutating.write(b"tampered")
+        return original_publish(handle, temp_path, final_path)
+
+    with unittest.mock.patch.object(
+        backup, "_publish_no_replace", mutating_publish
+    ):
+        with pytest.raises(ChecksumError, match="changed after verification"):
+            backup.publish_downloads(
+                temp_paths,
+                [archive],
+                backup_dir,
+                digests,
+            )
+
+    # The mutated publication was rolled back; no final-name file
+    # contains the tampered bytes.
+    assert not (backup_dir / archive).exists()
+    assert not (backup_dir / checksum_name(archive)).exists()
+    # The temporary downloads remain for the caller's cleanup.
+    assert temp_paths[archive].is_file()
+    assert temp_paths[checksum_name(archive)].is_file()
 
 
 def test_sftp_download_creates_private_file(tmp_path: Path) -> None:

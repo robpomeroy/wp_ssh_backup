@@ -658,6 +658,10 @@ def test_import_database_rejects_directory_member(tmp_path: Path) -> None:
             True,
             staging_bid="20261014T1000Z",
         )
+
+
+def test_extract_files_rejects_symlink_member(tmp_path: Path) -> None:
+    """A symlink member escaping the site root must block extraction."""
     import io
     import tarfile
 
@@ -875,7 +879,8 @@ def test_extract_files_rejects_special_members_in_listing(
     with pytest.raises(WPSSHBackupError, match="unsupported member type"):
         restore.extract_files(client, config, staging, TS)
 
-    assert not any(command.startswith("tar xzf ") for command in client.commands)
+    assert not any(
+        command.startswith("tar xzf ") for command in client.commands)
     assert client.remote_fs[live_path] == b"original site configuration"
     assert posixpath.join(SITE_ROOT, "uploads/special") not in client.remote_fs
 

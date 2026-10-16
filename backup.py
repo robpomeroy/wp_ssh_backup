@@ -8,9 +8,14 @@ remote staging directory and prunes old local backups.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 from pathlib import Path
+from typing import BinaryIO, Iterator
+import errno
+import hashlib
 import os
 import posixpath
+import stat
 import sys
 import time
 
@@ -37,6 +42,7 @@ from common import (
     remove_remote_staging,
     run_remote_cmd,
     run_remote_cmd_checked,
+    sha256_file,
     shquote,
     sftp_download,
     split_db_host,
@@ -252,8 +258,8 @@ def download_artifacts(
     Files land under temporary names (the final name plus a ".part"
     suffix) so a failed or interrupted transfer can never be mistaken for
     a backup set: the suffix does not match the backup filename pattern,
-    and publish_downloads() renames the files only after checksum
-    verification has passed.
+    and publish_downloads() links the files under their final names only
+    after checksum verification has passed.
 
     Args:
         sftp: An active SFTP client connected to the remote host.
@@ -284,15 +290,145 @@ def download_artifacts(
     return local_paths
 
 
-def _publish_no_replace(temp_path: Path, final_path: Path) -> None:
-    """Publish temp_path at final_path atomically, never replacing.
+def _open_nofollow_regular(path: Path) -> int:
+    """
+    Open a local file through a descriptor that cannot follow a symlink
+    at the final path component.
+
+    On POSIX, O_NOFOLLOW makes the open fail with ELOOP when the leaf is
+    a symlink. Windows has no O_NOFOLLOW, so the descriptor is opened
+    and then compared against lstat(): a symlink leaf resolves to a
+    different device/inode pair than the link itself, and the mismatch
+    is rejected the same way. The descriptor is also required to be a
+    regular file, so a directory or any other non-regular object is
+    rejected.
+
+    Raises:
+        MissingArtifactError: If the path does not exist.
+        WPSSHBackupError: If the leaf is a symlink or not a regular
+            file.
+    """
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_BINARY", 0)
+        # A no-op for regular files, but stops a planted FIFO from
+        # blocking the open forever on POSIX; the S_ISREG check below
+        # rejects it.
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    try:
+        return os.open(path, flags | nofollow)
+    except OSError as exc:
+        # ELOOP from open() always means a symlink problem: either
+        # O_NOFOLLOW rejected a symlinked leaf, or the path itself
+        # contains a symlink loop. Translate it either way.
+        if exc.errno in (errno.ELOOP, errno.EMLINK):
+            raise WPSSHBackupError(
+                f"Refusing to publish through symlink: {path}"
+            ) from exc
+        if exc.errno == errno.ENOENT:
+            raise MissingArtifactError(
+                f"Downloaded file missing: {path}"
+            ) from exc
+        raise WPSSHBackupError(
+            f"Refusing to publish {path.name}: cannot open local file: "
+            f"{exc}"
+        ) from exc
+
+
+def _assert_nofollow_regular(fd: int, path: Path) -> None:
+    """Reject a descriptor whose leaf was (or is) a symlink or non-file.
+
+    On platforms without O_NOFOLLOW the open itself cannot detect a
+    symlinked leaf, so the descriptor's identity is compared against the
+    leaf's lstat(): a symlink resolves to the target's device/inode,
+    which differs from the link's own. The caller owns the descriptor
+    and closes it when this check rejects.
+    """
+    fd_stat = os.fstat(fd)
+    if not stat.S_ISREG(fd_stat.st_mode):
+        raise WPSSHBackupError(
+            f"Refusing to publish {path.name}: not a regular file"
+        )
+    if not getattr(os, "O_NOFOLLOW", 0):
+        leaf_stat = os.lstat(path)
+        if (leaf_stat.st_dev, leaf_stat.st_ino) != (
+            fd_stat.st_dev,
+            fd_stat.st_ino,
+        ):
+            raise WPSSHBackupError(
+                f"Refusing to publish through symlink: {path}"
+            )
+
+
+@contextmanager
+def _held_temp_downloads(
+    temp_paths: dict[str, Path],
+    finals: list[str],
+) -> Iterator[dict[str, BinaryIO]]:
+    """
+    Open each temporary download once through a no-follow descriptor and
+    hold it open for the whole context.
+
+    Publication must read from the same opened file it links: a writer
+    that swaps a .part pathname for a symlink (or replaces the file)
+    after verification cannot make publication link different bytes
+    than the ones that were verified.
+    """
+    handles: dict[str, BinaryIO] = {}
+    try:
+        for final in finals:
+            path = temp_paths[final]
+            fd = _open_nofollow_regular(path)
+            try:
+                _assert_nofollow_regular(fd, path)
+                handles[final] = os.fdopen(fd, "rb")
+            except BaseException:
+                # fdopen took ownership only on success; after a failed
+                # assertion the descriptor is still ours to close.
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                raise
+        yield handles
+    finally:
+        for handle in handles.values():
+            handle.close()
+
+
+def _publish_no_replace(
+    handle: BinaryIO,
+    temp_path: Path,
+    final_path: Path,
+) -> BinaryIO:
+    """
+    Publish the already-opened temp file at final_path, never replacing.
+
+    The link is created from the held descriptor's inode, not from the
+    pathname: a writer that swapped temp_path for a symlink after
+    verification would otherwise have os.link() follow it and publish
+    the target's unverified inode. The caller confirms that the created
+    link references the held inode and re-verifies its digest.
 
     Uses os.link() so the publication either happens or fails with
     FileExistsError: there is no window in which another process can
     create final_path and have it silently overwritten. On filesystems
     without hard-link support (some Windows volumes), falls back to
     os.rename(), which on Windows also refuses to replace an existing
-    destination.
+    destination; the descriptor is closed first because Windows refuses
+    to rename an open file, and the renamed file is re-opened no-follow
+    and re-identified so the fallback publishes the same inode that was
+    verified.
+
+    Returns:
+        The descriptor-holding file object the published inode must be
+        verified through: the held handle, or — on the rename fallback —
+        a fresh handle for the renamed file.
+
+    Raises:
+        FileExistsError: If final_path already exists.
     """
     try:
         os.link(temp_path, final_path)
@@ -303,20 +439,109 @@ def _publish_no_replace(temp_path: Path, final_path: Path) -> None:
     except OSError:
         if os.name != "nt":
             raise
-        # Windows fallback: rename is atomic and refuses to replace an
-        # existing destination (it fails instead of overwriting).
+        return _publish_by_rename(handle, temp_path, final_path)
+    return handle
+
+
+def _publish_by_rename(
+    handle: BinaryIO,
+    temp_path: Path,
+    final_path: Path,
+) -> BinaryIO:
+    """Rename fallback publishing an already-verified inode.
+
+    Windows refuses to rename a file it holds open, so the held
+    descriptor is closed first and the renamed file is re-opened
+    no-follow and re-identified; the caller verifies the published
+    inode through the returned handle. If the renamed file cannot be
+    re-opened and identified, it is removed so no unverified file is
+    left under a final name.
+    """
+    handle.close()
+    try:
+        os.rename(temp_path, final_path)
+    except FileExistsError as exc:
+        raise FileExistsError(
+            f"Refusing to overwrite existing backup file: {final_path}"
+        ) from exc
+    try:
+        fd = _open_nofollow_regular(final_path)
+    except BaseException:
         try:
-            os.rename(temp_path, final_path)
-        except FileExistsError as exc:
-            raise FileExistsError(
-                f"Refusing to overwrite existing backup file: {final_path}"
-            ) from exc
+            final_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+    try:
+        _assert_nofollow_regular(fd, final_path)
+        new_handle = os.fdopen(fd, "rb")
+    except BaseException:
+        # fdopen took ownership only on success; after a failed
+        # assertion the descriptor is still ours to close.
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        try:
+            final_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+    return new_handle
+
+
+def _assert_published_inode(handle: BinaryIO, final_path: Path) -> None:
+    """
+    Reject a publication whose final path is not the verified inode.
+
+    os.link() follows a symlink at the source path on some platforms,
+    so the link is confirmed by comparing the final path's own directory
+    entry (lstat) against the held descriptor's inode. The final path is
+    already recorded for rollback, so a rejection removes the link after
+    the held descriptors are closed.
+    """
+    final_stat = os.lstat(final_path)
+    fd_stat = os.fstat(handle.fileno())
+    if (final_stat.st_dev, final_stat.st_ino) != (
+        fd_stat.st_dev,
+        fd_stat.st_ino,
+    ):
+        raise WPSSHBackupError(
+            f"Refusing to publish {final_path}: the temporary download "
+            "was replaced after verification"
+        )
+
+
+def _verify_published_inode(
+    handle: BinaryIO,
+    final_path: Path,
+    expected_sha256: str,
+) -> None:
+    """
+    Re-verify the published file's digest through the held descriptor.
+
+    A hard link shares the temporary file's inode, so bytes written to
+    the .part path after verification would also change the published
+    backup. Re-reading the digest from the descriptor at publication
+    time binds the verified checksum to the inode that was linked.
+    """
+    handle.seek(0)
+    digest = hashlib.sha256()
+    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+        digest.update(chunk)
+    actual = digest.hexdigest()
+    if actual.lower() != expected_sha256.lower():
+        raise ChecksumError(
+            f"Published backup {final_path} changed after verification: "
+            f"expected {expected_sha256}, got {actual}"
+        )
 
 
 def publish_downloads(
     temp_paths: dict[str, Path],
     archive_names: list[str],
     backup_dir: Path,
+    digests: dict[str, str],
 ) -> dict[str, Path]:
     """
     Publish verified temporary downloads under their final names.
@@ -325,21 +550,34 @@ def publish_downloads(
     file that reaches BACKUP_DIR under its final name is always a
     checksum-verified artifact.
 
+    Every temporary download is opened once through a no-follow
+    descriptor and held open across publication, so the bytes published
+    are the bytes that were verified: a writer that swaps a .part path
+    for a symlink (or replaces the file) after verification cannot make
+    publication link different bytes than the ones that were verified.
+
     Publication is transactional and atomic: each final path is created
-    with a no-replace operation (hard link, or a no-replace rename on
-    filesystems without hard-link support), so a file that appears at a
-    final name after the pre-check — from another backup process or a
-    local attacker who can write BACKUP_DIR — can never be silently
-    overwritten. If publication fails part-way, the final paths this run
-    created are removed so the caller's cleanup can discard the still
-    intact temporary downloads. A failed run therefore never leaves a
-    partial final-name set in BACKUP_DIR.
+    with a no-replace operation from the held descriptor's inode (hard
+    link, or a no-replace rename on filesystems without hard-link
+    support), so a file that appears at a final name after the pre-check
+    — from another backup process or a local attacker who can write
+    BACKUP_DIR — can never be silently overwritten. The created link
+    must reference the verified inode, and because a hard link shares
+    that inode, the digest is re-verified through the held descriptor
+    after linking: bytes written to a .part path between verification
+    and publication would otherwise change the published backup too. If
+    publication fails part-way, the final paths this run created are
+    removed so the caller's cleanup can discard the still intact
+    temporary downloads. A failed run therefore never leaves a partial
+    final-name set in BACKUP_DIR.
 
     Args:
         temp_paths: Mapping from final names to the temporary paths
             returned by download_artifacts().
         archive_names: The archive filenames that were downloaded.
         backup_dir: The local directory that receives the final names.
+        digests: The digest each final name's bytes must still have at
+            publication time, as returned by verify_downloads().
 
     Returns:
         A dictionary mapping each archive and its checksum filename to
@@ -348,6 +586,10 @@ def publish_downloads(
     Raises:
         FileExistsError: If any final path already exists, including one
             created between the pre-check and publication.
+        WPSSHBackupError: If a temporary download is a symlink or the
+            created link does not reference the verified inode.
+        ChecksumError: If a published file's digest no longer matches
+            the digest verify_downloads() captured.
     """
     finals: list[str] = []
     for name in archive_names:
@@ -371,10 +613,18 @@ def publish_downloads(
 
     published: list[Path] = []
     try:
-        for final in finals:
-            final_path = backup_dir / final
-            _publish_no_replace(temp_paths[final], final_path)
-            published.append(final_path)
+        with _held_temp_downloads(temp_paths, finals) as handles:
+            for final in finals:
+                final_path = backup_dir / final
+                published_handle = _publish_no_replace(
+                    handles[final], temp_paths[final], final_path
+                )
+                handles[final] = published_handle
+                published.append(final_path)
+                _assert_published_inode(published_handle, final_path)
+                _verify_published_inode(
+                    published_handle, final_path, digests[final]
+                )
     except BaseException:
         # Roll back the final paths this run created. They were made by
         # this run's no-replace publications, so unlinking them can
@@ -411,7 +661,7 @@ def publish_downloads(
 def verify_downloads(
     local_paths: dict[str, Path],
     archive_names: list[str],
-) -> None:
+) -> dict[str, str]:
     """
     Recompute SHA-256 locally using the downloaded .sha256 files.
 
@@ -419,7 +669,16 @@ def verify_downloads(
         local_paths: A dictionary mapping each archive and its checksum
             filename to the corresponding local Path object.
         archive_names: A list of archive filenames to verify.
+
+    Returns:
+        A dictionary mapping each final name to the digest its bytes
+        must still have at publication time: each archive is bound to
+        the digest its manifest records, and each checksum file to its
+        own digest at verification time, so publish_downloads() can
+        re-verify every published file against the bytes that were
+        verified here.
     """
+    digests: dict[str, str] = {}
     for name in archive_names:
         local_path = local_paths[name]
         if not local_path.is_file():
@@ -437,12 +696,15 @@ def verify_downloads(
                 f"{checksum_file} is not valid UTF-8 and cannot be parsed "
                 f"as a checksum manifest: {exc}"
             ) from exc
-        digests = parse_sha256sum_output(text)
-        if name not in digests:
+        parsed = parse_sha256sum_output(text)
+        if name not in parsed:
             raise ChecksumError(
                 f"{checksum_file} contains no digest for {name}"
             )
-        verify_local_checksum(local_path, digests[name])
+        verify_local_checksum(local_path, parsed[name])
+        digests[name] = parsed[name]
+        digests[checksum_name(name)] = sha256_file(checksum_file)
+    return digests
 
 
 # ---------------------------------------------------------------------------
@@ -558,9 +820,9 @@ def run_backup(
                     sftp, staging, archive_names, backup_dir,
                     created_paths=created_paths,
                 )
-            verify_downloads(temp_paths, archive_names)
+            digests = verify_downloads(temp_paths, archive_names)
             local_paths = publish_downloads(
-                temp_paths, archive_names, backup_dir
+                temp_paths, archive_names, backup_dir, digests
             )
             published = True
         finally:
