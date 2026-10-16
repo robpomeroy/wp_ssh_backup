@@ -494,14 +494,14 @@ def test_publish_downloads_rolls_back_partial_publication(
 ) -> None:
     """A mid-publication failure must leave no final-name files behind.
 
-    A failing rename after the first file moved (e.g. permission error)
-    used to leave a lone final-name artifact that discovery could pair
-    with a stale checksum. Publication must be transactional: roll the
-    already-published paths back to their temporary names so the
-    caller's cleanup discards them.
+    A failing publication after the first files were published (e.g.
+    permission error) used to leave a lone final-name artifact that
+    discovery could pair with a stale checksum. Publication must be
+    transactional: the final paths this run created are removed so the
+    caller's cleanup discards the still intact temporary downloads.
     """
-    # Two sets so at least one move happens before the failure. The
-    # temp paths are keyed by the FINAL filenames, matching the
+    # Two sets so at least one publication happens before the failure.
+    # The temp paths are keyed by the FINAL filenames, matching the
     # function's contract.
     bid2 = "20261014T0931Z-b2c3d4"
     archive1 = files_archive_name(TS)
@@ -517,22 +517,23 @@ def test_publish_downloads_rolls_back_partial_publication(
             f"{'a' * 64}  {archive}\n"
         )
 
-    original_replace = Path.replace
+    import unittest.mock
+
+    original_publish = backup._publish_no_replace
 
     calls = {"n": 0}
 
-    def exploding_replace(self: Path, target: object) -> None:
+    def exploding_publish(temp_path: Path, final_path: Path) -> None:
         calls["n"] += 1
         if calls["n"] == 3:
-            # First two moves (archive1 + its checksum) succeeded; the
-            # third move fails, simulating a mid-publication error.
+            # First two publications (archive1 + its checksum)
+            # succeeded; the third fails, simulating a
+            # mid-publication error.
             raise OSError("simulated mid-publication failure")
-        original_replace(self, target)  # type: ignore[arg-type]
-
-    import unittest.mock
+        original_publish(temp_path, final_path)
 
     with unittest.mock.patch.object(
-        Path, "replace", exploding_replace
+        backup, "_publish_no_replace", exploding_publish
     ):
         with pytest.raises(OSError, match="simulated mid-publication"):
             backup.publish_downloads(
@@ -550,12 +551,70 @@ def test_publish_downloads_rolls_back_partial_publication(
         checksum_name(archive2),
     ):
         assert not (backup_dir / final).exists()
-    # The rolled-back files are back under their temporary names, so
-    # the caller's _discard_temp_downloads() will remove them.
+    # The temporary downloads were never unlinked, so the caller's
+    # _discard_temp_downloads() will remove them.
     assert temp_paths[archive1].exists()
     assert temp_paths[checksum_name(archive1)].exists()
     assert temp_paths[archive2].exists()
     assert temp_paths[checksum_name(archive2)].exists()
+
+
+def test_publish_downloads_no_replace_survives_post_check_race(
+    tmp_path: Path, backup_dir: Path
+) -> None:
+    """A final path created after the pre-check must not be overwritten.
+
+    The existence pre-check and publication are not one atomic step: a
+    concurrent backup process (or a local attacker who can write
+    BACKUP_DIR) can create a final path in between. Publication must use
+    a no-replace operation so the newcomer is preserved and the run
+    fails instead of silently replacing it.
+    """
+    import unittest.mock
+
+    bid2 = "20261014T0931Z-b2c3d4"
+    archive1 = files_archive_name(TS)
+    archive2 = files_archive_name(bid2)
+    temp_paths = {}
+    for archive in (archive1, archive2):
+        temp_paths[archive] = backup_dir / (archive + ".part")
+        temp_paths[archive].write_bytes(b"payload")
+        temp_paths[checksum_name(archive)] = backup_dir / (
+            checksum_name(archive) + ".part"
+        )
+        temp_paths[checksum_name(archive)].write_text(
+            f"{'a' * 64}  {archive}\n"
+        )
+
+    original_publish = backup._publish_no_replace
+
+    def racing_publish(temp_path: Path, final_path: Path) -> None:
+        if final_path.name == checksum_name(archive2):
+            # Simulate another process creating the final path after
+            # the pre-check, just before this run publishes it.
+            final_path.write_bytes(b"created-by-other-process")
+        original_publish(temp_path, final_path)
+
+    with unittest.mock.patch.object(
+        backup, "_publish_no_replace", racing_publish
+    ):
+        with pytest.raises(FileExistsError, match="Refusing to overwrite"):
+            backup.publish_downloads(
+                temp_paths,
+                [archive1, archive2],
+                backup_dir,
+            )
+
+    # The other process's file is preserved, not overwritten.
+    checksum2 = backup_dir / checksum_name(archive2)
+    assert checksum2.read_bytes() == b"created-by-other-process"
+    # This run's earlier publications were rolled back.
+    assert not (backup_dir / archive1).exists()
+    assert not (backup_dir / checksum_name(archive1)).exists()
+    assert not (backup_dir / archive2).exists()
+    # The temporary downloads remain for the caller's cleanup.
+    for temp_path in temp_paths.values():
+        assert temp_path.exists()
 
 
 def test_sftp_download_creates_private_file(tmp_path: Path) -> None:

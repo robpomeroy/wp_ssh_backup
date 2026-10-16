@@ -163,12 +163,20 @@ often but you rarely upload new files.
 5. The tarballs and checksum files are downloaded over SFTP into `BACKUP_DIR`
    under temporary names (a `.part` suffix), so a failed transfer can never be
    mistaken for a backup set.
-6. Checksums are re-verified locally. Only then are the files renamed to their
-   final names. If verification fails, the partial downloads are deleted and
-   the remote staging directory is **kept** so the transfer can be retried;
-   otherwise the staging directory is deleted. Failed-run cleanup removes only
-   temporary files created by that run, preserving pre-existing `.part` paths.
-   Cleanup failures are reported as warnings without hiding the original error.
+6. Checksums are re-verified locally. Only then are the files published
+   under their final names, using an atomic no-replace operation (a hard
+   link, or a no-replace rename on filesystems without hard-link
+   support). A file that appears at a final name after the pre-check —
+   from another backup process or a local attacker who can write
+   `BACKUP_DIR` — can never be silently overwritten. If publication
+   fails part-way, the final files this run created are removed and the
+   temporary downloads are cleaned up. If verification fails, the
+   partial downloads are deleted and the remote staging directory is
+   **kept** so the transfer can be retried; otherwise the staging
+   directory is deleted. Failed-run cleanup removes only temporary
+   files created by that run, preserving pre-existing `.part` paths.
+   Cleanup failures are reported as warnings without hiding the original
+   error.
 7. Local backup sets older than `RETENTION_DAYS` are pruned.
 
 If local pruning or the final size calculation fails after a verified download,

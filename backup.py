@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+import os
 import posixpath
 import sys
 import time
@@ -283,24 +284,56 @@ def download_artifacts(
     return local_paths
 
 
+def _publish_no_replace(temp_path: Path, final_path: Path) -> None:
+    """Publish temp_path at final_path atomically, never replacing.
+
+    Uses os.link() so the publication either happens or fails with
+    FileExistsError: there is no window in which another process can
+    create final_path and have it silently overwritten. On filesystems
+    without hard-link support (some Windows volumes), falls back to
+    os.rename(), which on Windows also refuses to replace an existing
+    destination.
+    """
+    try:
+        os.link(temp_path, final_path)
+    except FileExistsError as exc:
+        raise FileExistsError(
+            f"Refusing to overwrite existing backup file: {final_path}"
+        ) from exc
+    except OSError:
+        if os.name != "nt":
+            raise
+        # Windows fallback: rename is atomic and refuses to replace an
+        # existing destination (it fails instead of overwriting).
+        try:
+            os.rename(temp_path, final_path)
+        except FileExistsError as exc:
+            raise FileExistsError(
+                f"Refusing to overwrite existing backup file: {final_path}"
+            ) from exc
+
+
 def publish_downloads(
     temp_paths: dict[str, Path],
     archive_names: list[str],
     backup_dir: Path,
 ) -> dict[str, Path]:
     """
-    Rename verified temporary downloads to their final names.
+    Publish verified temporary downloads under their final names.
 
     Only called after verify_downloads() has accepted every file, so a
     file that reaches BACKUP_DIR under its final name is always a
     checksum-verified artifact.
 
-    Publication is transactional: every final path is checked for
-    existence before anything moves (pre-existing files are preserved,
-    never overwritten), and if a rename fails part-way, the paths this
-    run already published are moved back to their temporary names so the
-    caller's cleanup can discard them. A failed run therefore never
-    leaves a partial final-name set in BACKUP_DIR.
+    Publication is transactional and atomic: each final path is created
+    with a no-replace operation (hard link, or a no-replace rename on
+    filesystems without hard-link support), so a file that appears at a
+    final name after the pre-check — from another backup process or a
+    local attacker who can write BACKUP_DIR — can never be silently
+    overwritten. If publication fails part-way, the final paths this run
+    created are removed so the caller's cleanup can discard the still
+    intact temporary downloads. A failed run therefore never leaves a
+    partial final-name set in BACKUP_DIR.
 
     Args:
         temp_paths: Mapping from final names to the temporary paths
@@ -313,19 +346,22 @@ def publish_downloads(
         the final local Path object.
 
     Raises:
-        FileExistsError: If any final path already exists.
+        FileExistsError: If any final path already exists, including one
+            created between the pre-check and publication.
     """
     finals: list[str] = []
     for name in archive_names:
         finals.extend((name, checksum_name(name)))
 
     # Pre-check: refuse to overwrite anything that already exists under
-    # a final name (e.g. a file from another run) BEFORE moving the
-    # first file, so pre-existing data is preserved and the publication
-    # never ends up half-done because of it. Symlinks are rejected too,
-    # including dangling ones: Path.exists() is False for a broken link,
-    # but Path.replace() would silently replace it, breaking the
-    # preservation promise.
+    # a final name (e.g. a file from another run) BEFORE publishing the
+    # first file, so the common conflict case fails fast with a friendly
+    # error and no half-done publication. This check alone is not the
+    # guarantee — the no-replace publication below is: it fails if a
+    # path appears here between the check and the publication. Symlinks
+    # are rejected too, including dangling ones: Path.exists() is False
+    # for a broken link, but publication would silently replace it,
+    # breaking the preservation promise.
     for final in finals:
         final_path = backup_dir / final
         if final_path.exists() or final_path.is_symlink():
@@ -333,21 +369,22 @@ def publish_downloads(
                 f"Refusing to overwrite existing backup file: {final_path}"
             )
 
-    moved: list[tuple[Path, Path]] = []
+    published: list[Path] = []
     try:
         for final in finals:
-            temp_path = temp_paths[final]
             final_path = backup_dir / final
-            temp_path.replace(final_path)
-            moved.append((temp_path, final_path))
+            _publish_no_replace(temp_paths[final], final_path)
+            published.append(final_path)
     except BaseException:
-        # Roll back the files this run already published: moving them
-        # back to their temporary names makes them eligible for the
-        # caller's _discard_temp_downloads() cleanup, which must never
-        # touch final paths it did not create.
-        for temp_path, final_path in reversed(moved):
+        # Roll back the final paths this run created. They were made by
+        # this run's no-replace publications, so unlinking them can
+        # never remove a pre-existing file. The temporary downloads were
+        # not unlinked, so the caller's _discard_temp_downloads()
+        # cleanup — which must never touch final paths it did not
+        # create — discards them.
+        for final_path in reversed(published):
             try:
-                final_path.replace(temp_path)
+                final_path.unlink(missing_ok=True)
             except OSError as exc:
                 print(
                     "WARNING: could not roll back published backup file "
@@ -355,6 +392,19 @@ def publish_downloads(
                     file=sys.stderr,
                 )
         raise
+    # Publication succeeded: remove the temporary downloads. A leftover
+    # temp is only a warning — the finals are complete and verified, so
+    # publication is not undone over a cleanup failure.
+    for final in finals:
+        temp_path = temp_paths[final]
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError as exc:
+            print(
+                f"WARNING: could not remove temporary download {temp_path}: "
+                f"{exc}",
+                file=sys.stderr,
+            )
     return {final: backup_dir / final for final in finals}
 
 

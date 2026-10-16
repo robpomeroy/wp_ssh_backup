@@ -13,6 +13,7 @@ import shlex
 import sys
 import tarfile
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import paramiko
@@ -413,13 +414,29 @@ def _validate_local_member_types(archive: Path) -> None:
         ) from exc
 
 
+@dataclass(frozen=True)
+class _ArchiveWrites:
+    """The paths inside the site root that extracting an archive touches.
+
+    member_paths holds every member path the archive writes, relative to
+    the site root (POSIX-normalised, leading slashes stripped).
+    link_targets holds the paths the archive's symlink members resolve to
+    inside the site root: a pre-existing symlink at one of those paths
+    would complete an escape chain during extraction.
+    """
+
+
+    member_paths: frozenset[str]
+    link_targets: frozenset[str]
+
+
 def _validate_members(
     archive: str,
     client: paramiko.SSHClient,
-    site_root: str,
-) -> None:
+) -> _ArchiveWrites:
     """
-    Validate a files archive's members before extracting into site_root.
+    Validate a files archive's members before extracting into the site
+    root.
 
     A checksum-matching archive can still carry malicious members: a
     symlink such as 'uploads/link -> ../../private.txt' would be created
@@ -442,12 +459,12 @@ def _validate_members(
     Args:
         archive: The remote path of the files archive.
         client: An active SSH client connected to the remote host.
-        site_root: The directory the archive will be extracted into.
 
     Returns:
-        The set of directories inside the site root that the archive
-        writes into ("" for the root itself), used by the destination
-        tree audit to decide which pre-existing symlinks matter.
+        An _ArchiveWrites describing the paths inside the site root the
+        archive writes and resolves links to, used by the destination
+        tree audit to decide which pre-existing symlinks extraction
+        would traverse or replace.
 
     Raises:
         WPSSHBackupError: If any member name or symlink target escapes
@@ -461,7 +478,7 @@ def _validate_members(
         f"tar --quoting-style=shell-always -tzf {shquote(archive)}"
     )
     out = run_remote_cmd_checked(client, command, timeout=1800)
-    member_dirs: set[str] = {""}
+    member_paths: set[str] = set()
     for line in out.splitlines():
         if not line.strip():
             continue
@@ -481,7 +498,7 @@ def _validate_members(
                 f"Refusing to extract {archive}: member {name!r} escapes "
                 "the site root."
             )
-        member_dirs.add(posixpath.dirname(normalised))
+        member_paths.add(normalised)
     # Symlink targets are only visible in the verbose listing; use the
     # quoted verbose listing to check where links point, following chains
     # through other links in the archive.
@@ -540,30 +557,33 @@ def _validate_members(
             # directory (kind 'd') or anything exotic must not.
             regular_members.add(fields[-1].lstrip("/"))
 
-    def _escape_path(link: str, target: str, seen: set[str]) -> str | None:
-        """Return the escaping path if link -> target escapes, else None."""
+    def _resolve_link(link: str, target: str, seen: set[str]) -> str:
+        """Resolve link -> target through the archive's own links."""
         link_dir = posixpath.dirname(posixpath.normpath(link.lstrip("/")))
         resolved = posixpath.normpath(posixpath.join(link_dir, target))
+        # A chain: the resolved path may itself be a link in the archive
+        # (a -> b, b -> ../../outside).
+        if resolved in links and resolved not in seen:
+            seen.add(resolved)
+            return _resolve_link(resolved, links[resolved], seen)
+        return resolved
+
+    link_targets: set[str] = set()
+    for link, target in links.items():
+        resolved = _resolve_link(link, target, {link})
         if (
             posixpath.isabs(resolved)
             or resolved.startswith("../")
             or resolved == ".."
         ):
-            return resolved
-        # A chain: the resolved path may itself be a link in the archive
-        # whose target escapes (a -> b, b -> ../../outside).
-        if resolved in links and resolved not in seen:
-            seen.add(resolved)
-            return _escape_path(resolved, links[resolved], seen)
-        return None
-
-    for link, target in links.items():
-        escape = _escape_path(link, target, {link})
-        if escape is not None:
             raise WPSSHBackupError(
                 f"Refusing to extract {archive}: symlink {link!r} -> "
-                f"{target!r} resolves outside the site root ({escape})."
+                f"{target!r} resolves outside the site root ({resolved})."
             )
+        # A pre-existing symlink sitting at the resolved path would
+        # complete the chain to wherever IT points; the destination tree
+        # audit rejects such links.
+        link_targets.add(resolved)
     for link, target in hard_links:
         if target.lstrip("/") not in regular_members:
             raise WPSSHBackupError(
@@ -572,43 +592,56 @@ def _validate_members(
                 "the archive; it could chain through an existing "
                 "symlink in the destination tree."
             )
-    return member_dirs
+    return _ArchiveWrites(frozenset(member_paths), frozenset(link_targets))
 
 
 def _audit_destination_tree(
     client: paramiko.SSHClient,
     site_root: str,
-    member_dirs: set[str],
+    writes: _ArchiveWrites,
 ) -> None:
     """
     Reject pre-existing symlinks in the site tree that extraction would
-    traverse or overwrite.
+    traverse or replace.
 
     _validate_members only sees the archive's contents, but tar extracts into
     the EXISTING site tree: if 'uploads' is already a symlink to a directory
-    outside the site root, an archive member 'uploads/file' writes there; if an
-    archive link points at an existing link under 'uploads', the chain resolves
-    outside the site without appearing in the archive's link map. `find <root>
+    outside the site root, an archive member 'uploads/file' writes there; if
+    an archive link resolves to a path where a pre-existing symlink already
+    sits, the chain resolves to wherever that link points. `find <root>
     -type l` lists every symlink already on disk WITHOUT following links (find
     does not traverse symlinked directories by default), so the audit sees the
     real tree.
 
-    Only directories that the archive actually writes into are audited: an
-    untouched pre-existing symlink elsewhere in the site is not this restore's
-    business.
+    Only symlinks that extraction would actually traverse or replace are
+    rejected: a symlink is a problem when it sits at the site root itself,
+    at a directory the archive writes into (an ancestor of a member path),
+    at a member path itself (extraction would replace it), or at a path an
+    archive symlink resolves to (it would complete the escape chain). An
+    untouched pre-existing symlink elsewhere in the site is not this
+    restore's business.
 
     Args:
         client: An active SSH client connected to the remote host.
         site_root: The directory the archive will be extracted into.
-        member_dirs: Archive directories (including "") that will be written
-            during extraction.
+        writes: The member paths and resolved link targets inside the site
+            root that extraction touches.
 
     Raises:
-        WPSSHBackupError: If a pre-existing symlink sits in an audited
-            directory or is itself an audited write target.
+        WPSSHBackupError: If a pre-existing symlink sits at the site root,
+            at a member path, in a directory the archive writes into, or
+            at a path an archive symlink resolves to.
     """
-    if not member_dirs:
+    if not writes.member_paths and not writes.link_targets:
         return
+    # Directories extraction writes through: every ancestor directory of
+    # every member path. tar follows a pre-existing symlink sitting at one
+    # of these paths when creating the members beneath it.
+    ancestors: set[str] = set()
+    for member in writes.member_paths:
+        parts = member.split("/")
+        for i in range(1, len(parts)):
+            ancestors.add("/".join(parts[:i]))
     # -print0 / NUL-separated output keeps spaced names intact; the decoder
     # splits on NUL and every name is used verbatim (no shell parsing), so
     # nothing can be smuggled past this check.
@@ -620,17 +653,28 @@ def _audit_destination_tree(
         if not raw:
             continue
         link = raw.rstrip("/")
-        parent = posixpath.dirname(link)
-        rel_parent = posixpath.relpath(parent, site_root)
-        if rel_parent == ".":
-            rel_parent = ""
-        if rel_parent in member_dirs or link == posixpath.join(
-            site_root, ""
-        ).rstrip("/"):
+        rel_link = posixpath.relpath(link, site_root)
+        if (
+            rel_link == "."
+            or rel_link in writes.member_paths
+            or rel_link in ancestors
+        ):
+            # The site root itself is a symlink (every write goes through
+            # it), extraction would replace the link with a member, or
+            # extraction would follow the link to write a member beneath
+            # it.
             raise WPSSHBackupError(
                 f"Refusing to extract: {link!r} already exists as a "
                 "symlink in the site tree; extraction would follow or "
                 "replace it. Remove it and re-run."
+            )
+        if rel_link in writes.link_targets:
+            # An archive symlink resolves to this path; the pre-existing
+            # link would complete the chain to wherever it points.
+            raise WPSSHBackupError(
+                f"Refusing to extract: {link!r} already exists as a "
+                "symlink in the site tree; an archive symlink resolves "
+                "to it and would follow it. Remove it and re-run."
             )
 
 
@@ -641,8 +685,8 @@ def extract_files(
     ts: str,
 ) -> None:
     archive = posixpath.join(staging, files_archive_name(ts))
-    member_dirs = _validate_members(archive, client, config.wp_site_root)
-    _audit_destination_tree(client, config.wp_site_root, member_dirs)
+    writes = _validate_members(archive, client)
+    _audit_destination_tree(client, config.wp_site_root, writes)
     command = f"tar xzf {shquote(archive)} -C {shquote(config.wp_site_root)}"
     run_remote_cmd_checked(client, command, timeout=3600)
 

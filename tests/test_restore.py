@@ -846,8 +846,10 @@ def test_run_restore_rejects_special_members_before_extraction(
         )
 
     # Rejected before any extraction or listing; staging was cleaned up.
+    # The GNU tar preflight (`tar --version`) is neither an extraction
+    # nor a listing, so it is allowed here.
     assert not any(
-        command.startswith("tar x") or command.startswith("tar -")
+        command.startswith("tar x") or command.startswith("tar t")
         for command in client.commands
     )
     assert client.remote_fs == {live_path: b"original site configuration"}
@@ -1078,7 +1080,7 @@ def test_validate_members_fails_closed_on_undecodable_line(
     client.remote_fs[archive] = buffer.getvalue()
 
     with pytest.raises(WPSSHBackupError, match="cannot decode"):
-        restore._validate_members(archive, client, SITE_ROOT)
+        restore._validate_members(archive, client)
 
 
 def test_extract_files_rejects_preexisting_symlinked_dir(
@@ -1142,7 +1144,9 @@ def test_extract_files_rejects_preexisting_link_in_member_dir(
     client = FakeSSHClient(SITE_ROOT, wp_cli="/usr/bin/wp")
     config = make_config(tmp_path)
 
-    # uploads is a real directory, but it already contains a symlink.
+    # uploads is a real directory, but it already contains a symlink; the
+    # archive writes a member beneath it, so extraction would follow the
+    # link.
     client.remote_fs[posixpath.join(SITE_ROOT, "uploads/escape")] = (
         b"-> ../../../private"
     )
@@ -1154,7 +1158,7 @@ def test_extract_files_rejects_preexisting_link_in_member_dir(
         data = b"<?php\n"
         info.size = len(data)
         tar.addfile(info, io.BytesIO(data))
-        member = tarfile.TarInfo("uploads/file.txt")
+        member = tarfile.TarInfo("uploads/escape/file.txt")
         data = b"payload"
         member.size = len(data)
         tar.addfile(member, io.BytesIO(data))
@@ -1178,7 +1182,7 @@ def test_extract_files_rejects_preexisting_link_in_member_dir(
     assert posixpath.join(SITE_ROOT, "wp-config.php") not in client.remote_fs
 
 
-def test_extract_files_ignores_symlink_outside_member_dirs(
+def test_extract_files_ignores_unrelated_symlink(
     tmp_path: Path,
 ) -> None:
     """A pre-existing symlink in an untouched directory must not block."""
@@ -1223,6 +1227,153 @@ def test_extract_files_ignores_symlink_outside_member_dirs(
         client.remote_fs[posixpath.join(SITE_ROOT, "other-dir/link")]
         == b"-> /somewhere"
     )
+
+
+def test_extract_files_ignores_root_level_symlink_outside_writes(
+    tmp_path: Path,
+) -> None:
+    """A root-level symlink the archive never touches must not block."""
+    import io
+    import tarfile
+
+    backup_dir = tmp_path / "backups"
+    set_files = make_local_set(backup_dir, TS)
+    client = FakeSSHClient(SITE_ROOT, wp_cli="/usr/bin/wp")
+    config = make_config(tmp_path)
+
+    # The archive writes only a root-level member; a sibling symlink at the
+    # site root is not on any write path, so it must be left alone.
+    client.remote_fs[posixpath.join(SITE_ROOT, "other-link")] = (
+        b"-> /somewhere"
+    )
+
+    archive_name = files_archive_name(TS)
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as tar:
+        info = tarfile.TarInfo("wp-config.php")
+        data = b"<?php\n"
+        info.size = len(data)
+        tar.addfile(info, io.BytesIO(data))
+    archive_path = set_files[archive_name]
+    archive_path.write_bytes(buffer.getvalue())
+    checksum_path = set_files[checksum_name(archive_name)]
+    checksum_path.write_text(
+        f"{hashlib.sha256(buffer.getvalue()).hexdigest()}  {archive_name}\n"
+    )
+
+    restore.run_restore(
+        client, config, set_files, True, False, staging_bid="20261014T1000Z"
+    )
+
+    assert (
+        client.remote_fs[posixpath.join(SITE_ROOT, "wp-config.php")]
+        == b"<?php\n"
+    )
+    # The untouched symlink is still there.
+    assert (
+        client.remote_fs[posixpath.join(SITE_ROOT, "other-link")]
+        == b"-> /somewhere"
+    )
+
+
+def test_extract_files_rejects_preexisting_link_at_member_path(
+    tmp_path: Path,
+) -> None:
+    """A pre-existing link at a member path would be replaced: reject it."""
+    import io
+    import tarfile
+
+    backup_dir = tmp_path / "backups"
+    set_files = make_local_set(backup_dir, TS)
+    client = FakeSSHClient(SITE_ROOT, wp_cli="/usr/bin/wp")
+    config = make_config(tmp_path)
+
+    # The archive writes wp-config.php, which already exists as a symlink;
+    # extraction would replace it.
+    client.remote_fs[posixpath.join(SITE_ROOT, "wp-config.php")] = (
+        b"-> /home/user/private/wp-config.php"
+    )
+
+    archive_name = files_archive_name(TS)
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as tar:
+        info = tarfile.TarInfo("wp-config.php")
+        data = b"<?php\n"
+        info.size = len(data)
+        tar.addfile(info, io.BytesIO(data))
+    archive_path = set_files[archive_name]
+    archive_path.write_bytes(buffer.getvalue())
+    checksum_path = set_files[checksum_name(archive_name)]
+    checksum_path.write_text(
+        f"{hashlib.sha256(buffer.getvalue()).hexdigest()}  {archive_name}\n"
+    )
+
+    with pytest.raises(WPSSHBackupError, match="already exists as a symlink"):
+        restore.run_restore(
+            client,
+            config,
+            set_files,
+            True,
+            False,
+            staging_bid="20261014T1000Z",
+        )
+
+    # The symlink was not replaced.
+    assert (
+        client.remote_fs[posixpath.join(SITE_ROOT, "wp-config.php")]
+        == b"-> /home/user/private/wp-config.php"
+    )
+
+
+def test_extract_files_rejects_link_completing_archive_chain(
+    tmp_path: Path,
+) -> None:
+    """A pre-existing link an archive symlink resolves to must block."""
+    import io
+    import tarfile
+
+    backup_dir = tmp_path / "backups"
+    set_files = make_local_set(backup_dir, TS)
+    client = FakeSSHClient(SITE_ROOT, wp_cli="/usr/bin/wp")
+    config = make_config(tmp_path)
+
+    # The archive's symlink resolves inside the site root, but a
+    # pre-existing link already sits at that path; creating the archive
+    # link would chain through it to wherever it points.
+    client.remote_fs[posixpath.join(SITE_ROOT, "existing-link")] = (
+        b"-> /home/user/private"
+    )
+
+    archive_name = files_archive_name(TS)
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as tar:
+        info = tarfile.TarInfo("wp-config.php")
+        data = b"<?php\n"
+        info.size = len(data)
+        tar.addfile(info, io.BytesIO(data))
+        link = tarfile.TarInfo("uploads/link")
+        link.type = tarfile.SYMTYPE
+        link.linkname = "../existing-link"
+        tar.addfile(link)
+    archive_path = set_files[archive_name]
+    archive_path.write_bytes(buffer.getvalue())
+    checksum_path = set_files[checksum_name(archive_name)]
+    checksum_path.write_text(
+        f"{hashlib.sha256(buffer.getvalue()).hexdigest()}  {archive_name}\n"
+    )
+
+    with pytest.raises(WPSSHBackupError, match="already exists as a symlink"):
+        restore.run_restore(
+            client,
+            config,
+            set_files,
+            True,
+            False,
+            staging_bid="20261014T1000Z",
+        )
+
+    # Nothing was extracted into the site root.
+    assert posixpath.join(SITE_ROOT, "wp-config.php") not in client.remote_fs
 
 
 def test_extract_files_rejects_chained_symlink_escape(
