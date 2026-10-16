@@ -10,7 +10,7 @@ from __future__ import annotations
 import argparse
 from contextlib import contextmanager
 from pathlib import Path
-from typing import BinaryIO, Iterator
+from typing import BinaryIO, Generator
 import errno
 import hashlib
 import os
@@ -366,7 +366,7 @@ def _assert_nofollow_regular(fd: int, path: Path) -> None:
 def _held_temp_downloads(
     temp_paths: dict[str, Path],
     finals: list[str],
-) -> Iterator[dict[str, BinaryIO]]:
+) -> Generator[dict[str, BinaryIO]]:
     """
     Open each temporary download once through a no-follow descriptor and
     hold it open for the whole context.
@@ -496,11 +496,20 @@ def _assert_published_inode(handle: BinaryIO, final_path: Path) -> None:
 
     os.link() follows a symlink at the source path on some platforms,
     so the link is confirmed by comparing the final path's own directory
-    entry (lstat) against the held descriptor's inode. The final path is
-    already recorded for rollback, so a rejection removes the link after
-    the held descriptors are closed.
+    entry (lstat) against the held descriptor's inode. A missing entry
+    is rejected the same way: the published file is gone. The final path
+    is already recorded for rollback, so a rejection removes the link
+    after the held descriptors are closed — unless the entry was
+    replaced, in which case it no longer references this run's inode and
+    the replacement is left in place.
     """
-    final_stat = os.lstat(final_path)
+    try:
+        final_stat = os.lstat(final_path)
+    except FileNotFoundError as exc:
+        raise WPSSHBackupError(
+            f"Refusing to publish {final_path}: the published file was "
+            "replaced after verification"
+        ) from exc
     fd_stat = os.fstat(handle.fileno())
     if (final_stat.st_dev, final_stat.st_ino) != (
         fd_stat.st_dev,
@@ -518,12 +527,20 @@ def _verify_published_inode(
     expected_sha256: str,
 ) -> None:
     """
-    Re-verify the published file's digest through the held descriptor.
+    Re-verify the published file through the held descriptor.
 
     A hard link shares the temporary file's inode, so bytes written to
     the .part path after verification would also change the published
     backup. Re-reading the digest from the descriptor at publication
     time binds the verified checksum to the inode that was linked.
+
+    The digest alone cannot prove what the final name contains: the
+    final directory entry can be unlinked and replaced while the digest
+    is being re-read, leaving an attacker-controlled file at the
+    published name while the verified inode's digest still passes. The
+    entry is therefore re-checked against the held inode after hashing,
+    so a replacement is rejected and the window left to a replacement
+    ends at this check.
     """
     handle.seek(0)
     digest = hashlib.sha256()
@@ -535,6 +552,7 @@ def _verify_published_inode(
             f"Published backup {final_path} changed after verification: "
             f"expected {expected_sha256}, got {actual}"
         )
+    _assert_published_inode(handle, final_path)
 
 
 def publish_downloads(
@@ -565,11 +583,16 @@ def publish_downloads(
     must reference the verified inode, and because a hard link shares
     that inode, the digest is re-verified through the held descriptor
     after linking: bytes written to a .part path between verification
-    and publication would otherwise change the published backup too. If
-    publication fails part-way, the final paths this run created are
-    removed so the caller's cleanup can discard the still intact
-    temporary downloads. A failed run therefore never leaves a partial
-    final-name set in BACKUP_DIR.
+    and publication would otherwise change the published backup too.
+    The final directory entry can still be unlinked and replaced while
+    the digest is re-read, so it is checked against the held inode once
+    more after hashing; a replacement is rejected instead of being
+    reported as a successful publication. If publication fails
+    part-way, the final paths this run created are removed so the
+    caller's cleanup can discard the still intact temporary downloads
+    (a path that was replaced after publication no longer references
+    this run's inode and is left in place with a warning). A failed run
+    therefore never leaves a partial final-name set in BACKUP_DIR.
 
     Args:
         temp_paths: Mapping from final names to the temporary paths
@@ -586,8 +609,9 @@ def publish_downloads(
     Raises:
         FileExistsError: If any final path already exists, including one
             created between the pre-check and publication.
-        WPSSHBackupError: If a temporary download is a symlink or the
-            created link does not reference the verified inode.
+        WPSSHBackupError: If a temporary download is a symlink, the
+            created link does not reference the verified inode, or the
+            final path is replaced during publication.
         ChecksumError: If a published file's digest no longer matches
             the digest verify_downloads() captured.
     """
@@ -611,16 +635,22 @@ def publish_downloads(
                 f"Refusing to overwrite existing backup file: {final_path}"
             )
 
-    published: list[Path] = []
+    published: list[tuple[Path, tuple[int, int]]] = []
     try:
         with _held_temp_downloads(temp_paths, finals) as handles:
             for final in finals:
                 final_path = backup_dir / final
+                # Record the held inode before publication: it is the
+                # inode this run verified and intends to publish, and
+                # rollback must recognize it even when publication
+                # linked a replacement instead.
+                fd_stat = os.fstat(handles[final].fileno())
+                identity = (fd_stat.st_dev, fd_stat.st_ino)
                 published_handle = _publish_no_replace(
                     handles[final], temp_paths[final], final_path
                 )
                 handles[final] = published_handle
-                published.append(final_path)
+                published.append((final_path, identity))
                 _assert_published_inode(published_handle, final_path)
                 _verify_published_inode(
                     published_handle, final_path, digests[final]
@@ -628,11 +658,33 @@ def publish_downloads(
     except BaseException:
         # Roll back the final paths this run created. They were made by
         # this run's no-replace publications, so unlinking them can
-        # never remove a pre-existing file. The temporary downloads were
-        # not unlinked, so the caller's _discard_temp_downloads()
-        # cleanup — which must never touch final paths it did not
-        # create — discards them.
-        for final_path in reversed(published):
+        # never remove a pre-existing file. A path that was unlinked and
+        # replaced after publication no longer references this run's
+        # inode; the replacement is left in place with a warning rather
+        # than unlinking a file this run did not create. The temporary
+        # downloads were not unlinked, so the caller's
+        # _discard_temp_downloads() cleanup — which must never touch
+        # final paths it did not create — discards them.
+        for final_path, identity in reversed(published):
+            try:
+                final_stat = os.lstat(final_path)
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                print(
+                    "WARNING: could not roll back published backup file "
+                    f"{final_path}: {exc}",
+                    file=sys.stderr,
+                )
+                continue
+            if (final_stat.st_dev, final_stat.st_ino) != identity:
+                print(
+                    "WARNING: published backup file "
+                    f"{final_path} was replaced during publication; "
+                    "leaving the replacement in place",
+                    file=sys.stderr,
+                )
+                continue
             try:
                 final_path.unlink(missing_ok=True)
             except OSError as exc:

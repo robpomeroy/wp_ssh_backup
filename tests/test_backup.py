@@ -775,9 +775,62 @@ def test_publish_downloads_rejects_temp_replaced_after_open(
                 digests,
             )
 
-    # The rejected publication was rolled back; the replacement's bytes
-    # never appeared under a final name.
-    assert not (backup_dir / archive).exists()
+    # The published link referenced the replacement, not this run's
+    # verified inode, so rollback leaves it in place with a warning
+    # instead of unlinking a file this run did not create.
+    assert (backup_dir / archive).read_bytes() == b"attacker-bytes"
+    assert not (backup_dir / checksum_name(archive)).exists()
+    # The temporary downloads remain for the caller's cleanup.
+    assert temp_paths[archive].is_file()
+    assert temp_paths[checksum_name(archive)].is_file()
+
+
+def test_publish_downloads_rejects_final_replaced_during_verification(
+    backup_dir: Path,
+) -> None:
+    """A final path replaced while the digest is re-read must fail.
+
+    The digest re-check hashes the held inode, which says nothing about
+    what the final name contains: the final directory entry can be
+    unlinked and replaced between the identity check and the digest
+    re-read, leaving an attacker-controlled file at the published name
+    while the call reports success. The entry is re-checked against the
+    held inode after hashing, so the replacement is rejected.
+    """
+    import unittest.mock
+
+    archive = files_archive_name(TS)
+    temp_paths = make_temp_set(backup_dir, archive)
+    digests = digests_for(temp_paths)
+
+    original_assert = backup._assert_published_inode
+
+    def replacing_after_first_check(handle: BinaryIO, final_path: Path):
+        original_assert(handle, final_path)
+        if final_path.name == archive:
+            # Simulate a writer unlinking the published file and
+            # planting different bytes at the final name after the
+            # first identity check, before the digest re-read.
+            final_path.unlink()
+            final_path.write_bytes(b"attacker-bytes")
+
+    with unittest.mock.patch.object(
+        backup, "_assert_published_inode", replacing_after_first_check
+    ):
+        with pytest.raises(
+            WPSSHBackupError, match="was replaced after verification"
+        ):
+            backup.publish_downloads(
+                temp_paths,
+                [archive],
+                backup_dir,
+                digests,
+            )
+
+    # The replacement is not this run's verified inode, so rollback
+    # leaves it in place with a warning instead of unlinking a file
+    # this run did not create.
+    assert (backup_dir / archive).read_bytes() == b"attacker-bytes"
     assert not (backup_dir / checksum_name(archive)).exists()
     # The temporary downloads remain for the caller's cleanup.
     assert temp_paths[archive].is_file()

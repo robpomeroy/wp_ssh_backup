@@ -170,7 +170,8 @@ often but you rarely upload new files.
    `.part` files are held open through no-follow handles across
    publication, so a symlink planted at a `.part` path is refused and
    the published link is confirmed to reference the verified inode,
-   whose digest is re-checked after linking. A file that appears at a
+   whose digest is re-checked after linking before the final directory
+   entry is confirmed once more. A file that appears at a
    final name after the pre-check —
    from another backup process or a local attacker who can write
    `BACKUP_DIR` — can never be silently overwritten. If publication

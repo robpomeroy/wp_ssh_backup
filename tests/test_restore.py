@@ -1628,6 +1628,52 @@ def test_extract_files_rejects_chained_symlink_escape(
     assert posixpath.join(SITE_ROOT, "wp-config.php") not in client.remote_fs
 
 
+def test_extract_files_follows_dotted_symlink_chain(
+    tmp_path: Path,
+) -> None:
+    """A './'-prefixed link chain must be resolved to its terminal.
+
+    GNU tar preserves each member's raw spelling (./uploads/a), but
+    _validate_members normalizes names before resolving links. If the
+    link map keeps the raw spelling while lookups use the normalised
+    form, the second hop (./uploads/b) is never found, the chain stops
+    at an intermediate target, and link_targets omits the real terminal
+    -- so a pre-existing symlink at the terminal would not be blocked by
+    the destination-tree audit even though extraction resolves to it.
+    """
+    import io
+    import tarfile
+
+    backup_dir = tmp_path / "backups"
+    set_files = make_local_set(backup_dir, TS)
+    client = FakeSSHClient(SITE_ROOT, wp_cli="/usr/bin/wp")
+
+    archive_name = files_archive_name(TS)
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as tar:
+        info = tarfile.TarInfo("wp-config.php")
+        data = b"<?php\n"
+        info.size = len(data)
+        tar.addfile(info, io.BytesIO(data))
+        # './uploads/a' -> 'b' (resolves to uploads/b) and
+        # './uploads/b' -> '../index.php' (terminal, inside the root).
+        first = tarfile.TarInfo("./uploads/a")
+        first.type = tarfile.SYMTYPE
+        first.linkname = "b"
+        tar.addfile(first)
+        second = tarfile.TarInfo("./uploads/b")
+        second.type = tarfile.SYMTYPE
+        second.linkname = "../index.php"
+        tar.addfile(second)
+    client.remote_fs[archive_name] = buffer.getvalue()
+
+    writes = restore._validate_members(archive_name, client)
+
+    # The chain must be followed through the dotted spelling to its
+    # terminal; the intermediate (uploads/b) must not be reported as a
+    # final resolved target.
+    assert "index.php" in writes.link_targets
+    assert "uploads/b" not in writes.link_targets
 def test_extract_files_rejects_absolute_symlink(tmp_path: Path) -> None:
     """A symlink with an absolute target must be rejected."""
     import io

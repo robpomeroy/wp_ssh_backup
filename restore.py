@@ -718,7 +718,11 @@ def _validate_members(
                 f"{kind!r} in tar listing line {line!r}"
             )
         if kind == "l" and len(fields) >= 8 and fields[-2] == "->":
-            links[fields[-3]] = fields[-1]
+            # Store the link name in the same normalised form resolution
+            # uses: the raw tar spelling (e.g. './uploads/a') must not
+            # create a chain keyed differently from the lookups, or an
+            # escape through a second link would pass validation.
+            links[posixpath.normpath(fields[-3].lstrip("/"))] = fields[-1]
         elif (
             kind == "h"
             and len(fields) >= 9
