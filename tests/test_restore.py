@@ -702,6 +702,55 @@ def test_import_database_rejects_directory_member(tmp_path: Path) -> None:
     assert not any(path.startswith(staging) for path in client.remote_fs)
 
 
+def test_require_gnu_tar_rejects_busybox_tar(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-GNU tar must fail the preflight before any upload."""
+    client = FakeSSHClient(SITE_ROOT, wp_cli="/usr/bin/wp")
+
+    def busybox_tar_version(
+        command: str, stdout: object, stderr: object
+    ) -> int:
+        stdout.write(b"BusyBox v1.36.1 multi-call binary.\n")
+        return 0
+
+    monkeypatch.setattr(client, "_tar_version", busybox_tar_version)
+
+    with pytest.raises(WPSSHBackupError, match="GNU tar is required"):
+        restore._require_gnu_tar(client)
+
+
+def test_run_restore_requires_gnu_tar_before_upload(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-GNU tar aborts the restore before anything is uploaded."""
+    set_files = make_local_set(tmp_path / "backups", TS)
+    client = FakeSSHClient(SITE_ROOT, wp_cli="/usr/bin/wp")
+    config = make_config(tmp_path)
+
+    def busybox_tar_version(
+        command: str, stdout: object, stderr: object
+    ) -> int:
+        stdout.write(b"BusyBox v1.36.1 multi-call binary.\n")
+        return 0
+
+    monkeypatch.setattr(client, "_tar_version", busybox_tar_version)
+
+    with pytest.raises(WPSSHBackupError, match="GNU tar is required"):
+        restore.run_restore(
+            client, config, set_files, True, False,
+            staging_bid="20261014T1000Z",
+        )
+
+    # Nothing was uploaded: no SFTP put reached the fake.
+    staging = staging_dir_for(SITE_ROOT, "20261014T1000Z")
+    assert not any(path.startswith(staging) for path in client.remote_fs)
+    # Staging was cleaned up by the failure handler.
+    assert staging not in client.directories
+
+
 def test_extract_files_rejects_traversal_member(tmp_path: Path) -> None:
     """A member named with ../ traversal must block extraction."""
     import io
@@ -797,7 +846,10 @@ def test_run_restore_rejects_special_members_before_extraction(
         )
 
     # Rejected before any extraction or listing; staging was cleaned up.
-    assert not any(command.startswith("tar ") for command in client.commands)
+    assert not any(
+        command.startswith("tar x") or command.startswith("tar -")
+        for command in client.commands
+    )
     assert client.remote_fs == {live_path: b"original site configuration"}
     staging = staging_dir_for(SITE_ROOT, "20261014T1000Z")
     assert staging not in client.directories

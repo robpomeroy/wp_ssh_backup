@@ -21,9 +21,12 @@ server.
   ```
 - SSH access to your WordPress hosting server (key-based authentication is
   recommended).
-- On the server: `tar`, `gzip` and `sha256sum` (present on virtually all Linux
-  hosts). For database backups, either [WP-CLI](https://wp-cli.org/) or
-  `mysqldump` must be available.
+- On the server: GNU tar, `gzip` and `sha256sum` (present on virtually all
+  Linux hosts). For database backups, either [WP-CLI](https://wp-cli.org/) or
+  `mysqldump` must be available. Restore requires GNU tar specifically: it
+  validates archive members with `tar --quoting-style=shell-always`, which
+  BusyBox and BSD tar reject. The restore CLI checks for GNU tar before
+  uploading anything and reports a clear error if it is missing.
 
 ## Installation
 

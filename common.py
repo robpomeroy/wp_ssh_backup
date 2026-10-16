@@ -1154,7 +1154,7 @@ def find_backup_sets(backup_dir: Path) -> dict[str, list[Path]]:
     if not backup_dir.is_dir():
         return sets
     for path in sorted(backup_dir.iterdir()):
-        if not path.is_file():
+        if path.is_symlink() or not path.is_file():
             continue
         match = BACKUP_FILE_RE.match(path.name)
         if match:

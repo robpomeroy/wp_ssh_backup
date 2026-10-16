@@ -248,6 +248,28 @@ def latest_set(
 # ---------------------------------------------------------------------------
 
 
+def _require_gnu_tar(client: paramiko.SSHClient) -> None:
+    """
+    Require GNU tar on the remote host before any restore work.
+
+    Archive validation runs `tar --quoting-style=shell-always`, which
+    BusyBox and BSD tar reject as an unknown option; without this check
+    every restore involving an archive would fail on such hosts, after
+    the upload. `tar --version` prints "tar (GNU tar) ..." on GNU tar
+    and fails or prints nothing of the sort elsewhere.
+
+    Raises:
+        WPSSHBackupError: If GNU tar is not available.
+    """
+    code, out, _ = run_remote_cmd(client, "tar --version")
+    if code != 0 or "(GNU tar)" not in out:
+        raise WPSSHBackupError(
+            "GNU tar is required on the remote host for restore "
+            "(BusyBox and BSD tar are not supported): "
+            f"`tar --version` reported {out.strip() or 'no output'}."
+        )
+
+
 def upload_artifacts(
     sftp: paramiko.SFTPClient,
     set_files: dict[str, Path],
@@ -845,6 +867,10 @@ def run_restore(
         run_remote_cmd_checked(
             client, f"chmod 700 {shquote(staging)}"
         )
+
+        # GNU tar is needed for archive validation; check before any
+        # upload so an unsupported host fails fast and cleanly.
+        _require_gnu_tar(client)
 
         with client.open_sftp() as sftp:
             upload_artifacts(sftp, set_files, archive_names, staging)

@@ -437,6 +437,58 @@ def test_publish_downloads_refuses_overwrite_of_existing(
     assert temp_checksum.is_file()
 
 
+@pytest.mark.parametrize("kind", ["file", "dangling-symlink", "live-symlink"])
+def test_publish_downloads_refuses_existing_symlink(
+    tmp_path: Path, backup_dir: Path, kind: str
+) -> None:
+    """A symlink at a final name must be rejected, not replaced.
+
+    Path.exists() is False for a dangling symlink, so the existence
+    check alone would let Path.replace() silently replace it.
+    """
+    import os
+
+    if kind != "file" and os.name == "nt":
+        pytest.skip("symlink creation requires privileges on Windows")
+
+    archive = files_archive_name(TS)
+    final_path = backup_dir / archive
+    target = tmp_path / "target"
+    if kind == "dangling-symlink":
+        final_path.symlink_to(tmp_path / "missing-target")
+    elif kind == "live-symlink":
+        target.write_bytes(b"prior-content")
+        final_path.symlink_to(target)
+    else:
+        final_path.write_bytes(b"prior-content")
+    temp_archive = backup_dir / (archive + ".part")
+    temp_archive.write_bytes(b"payload")
+    temp_checksum = backup_dir / (checksum_name(archive) + ".part")
+    temp_checksum.write_text(f"{'a' * 64}  {archive}\n")
+
+    with pytest.raises(FileExistsError, match="Refusing to overwrite"):
+        backup.publish_downloads(
+            {
+                archive: temp_archive,
+                checksum_name(archive): temp_checksum,
+            },
+            [archive],
+            backup_dir,
+        )
+
+    # The pre-existing path is untouched; nothing was moved.
+    assert temp_archive.is_file()
+    assert temp_checksum.is_file()
+    if kind == "dangling-symlink":
+        assert final_path.is_symlink()
+        assert not final_path.exists()
+    elif kind == "live-symlink":
+        assert final_path.is_symlink()
+        assert target.read_bytes() == b"prior-content"
+    else:
+        assert final_path.read_bytes() == b"prior-content"
+
+
 def test_publish_downloads_rolls_back_partial_publication(
     tmp_path: Path, backup_dir: Path
 ) -> None:

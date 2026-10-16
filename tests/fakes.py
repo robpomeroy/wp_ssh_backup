@@ -215,6 +215,8 @@ class FakeSSHClient:
             return self._rm_f(command)
         if command.startswith("test -x "):
             return 0 if self.wp_cli else 1
+        if command == "tar --version":
+            return self._tar_version(command, stdout, stderr)
         if command.startswith("command -v "):
             if self.wp_cli:
                 stdout.write(f"{self.wp_cli}\n".encode())
@@ -249,6 +251,13 @@ class FakeSSHClient:
         return 127
 
     # -- individual commands ------------------------------------------------
+
+    def _tar_version(
+        self, command: str, stdout: io.BytesIO, stderr: io.BytesIO
+    ) -> int:
+        """tar --version: GNU tar by default; tests may override."""
+        stdout.write(b"tar (GNU tar) 1.35\n")
+        return 0
 
     def _quoted(self, command: str) -> list[str]:
         return re.findall(r"'([^']*)'", command)

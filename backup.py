@@ -322,10 +322,13 @@ def publish_downloads(
     # Pre-check: refuse to overwrite anything that already exists under
     # a final name (e.g. a file from another run) BEFORE moving the
     # first file, so pre-existing data is preserved and the publication
-    # never ends up half-done because of it.
+    # never ends up half-done because of it. Symlinks are rejected too,
+    # including dangling ones: Path.exists() is False for a broken link,
+    # but Path.replace() would silently replace it, breaking the
+    # preservation promise.
     for final in finals:
         final_path = backup_dir / final
-        if final_path.exists():
+        if final_path.exists() or final_path.is_symlink():
             raise FileExistsError(
                 f"Refusing to overwrite existing backup file: {final_path}"
             )
