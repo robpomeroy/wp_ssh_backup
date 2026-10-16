@@ -8,13 +8,19 @@ database dump.
 from __future__ import annotations
 
 import argparse
+import errno
+import hashlib
+import os
 import posixpath
 import shlex
+import stat
 import sys
 import tarfile
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from typing import BinaryIO, Iterator
 
 import paramiko
 
@@ -274,33 +280,155 @@ def _require_gnu_tar(client: paramiko.SSHClient) -> None:
 def upload_artifacts(
     sftp: paramiko.SFTPClient,
     set_files: dict[str, Path],
+    handles: dict[Path, BinaryIO],
     archive_names: list[str],
     staging: str,
 ) -> None:
     for name in archive_names:
         sftp_upload_checked(
-            sftp, set_files[name], posixpath.join(staging, name)
+            sftp, handles[set_files[name]], posixpath.join(staging, name)
         )
         sftp_upload_checked(
             sftp,
-            set_files[checksum_name(name)],
+            handles[set_files[checksum_name(name)]],
             posixpath.join(staging, checksum_name(name)),
         )
 
 
+def _open_nofollow_regular(path: Path) -> int:
+    """
+    Open a local file through a file descriptor that cannot follow a
+    symlink at the final path component.
+
+    On POSIX, O_NOFOLLOW makes the open fail with ELOOP when the leaf is
+    a symlink. Windows has no O_NOFOLLOW, so the descriptor is opened
+    and then compared against lstat(): a symlink leaf resolves to a
+    different device/inode pair than the link itself, and the mismatch
+    is rejected the same way. The descriptor is also required to be a
+    regular file, so a directory (openable on some platforms) or any
+    other non-regular object is rejected.
+
+    Raises:
+        MissingArtifactError: If the path does not exist.
+        WPSSHBackupError: If the leaf is a symlink or not a regular
+            file.
+    """
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_BINARY", 0)
+        # A no-op for regular files, but stops a planted FIFO from
+        # blocking the open forever on POSIX; the S_ISREG check below
+        # rejects it.
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    try:
+        try:
+            return os.open(path, flags | nofollow)
+        except OSError as exc:
+            # ELOOP from open() always means a symlink problem: either
+            # O_NOFOLLOW rejected a symlinked leaf, or the path itself
+            # contains a symlink loop. Translate it either way.
+            if exc.errno in (errno.ELOOP, errno.EMLINK):
+                raise WPSSHBackupError(
+                    f"Refusing to upload through symlink: {path}"
+                ) from exc
+            if exc.errno == errno.ENOENT:
+                raise MissingArtifactError(
+                    f"Local file missing: {path}"
+                ) from exc
+            raise
+    except OSError as exc:
+        if exc.errno == errno.ENOENT:
+            raise MissingArtifactError(
+                f"Local file missing: {path}"
+            ) from exc
+        raise WPSSHBackupError(
+            f"Refusing to upload {path.name}: cannot open local file: {exc}"
+        ) from exc
+
+
+def _assert_nofollow_regular(fd: int, path: Path) -> None:
+    """Reject a descriptor whose leaf was (or is) a symlink or non-file.
+
+    On platforms without O_NOFOLLOW the open itself cannot detect a
+    symlinked leaf, so the descriptor's identity is compared against the
+    leaf's lstat(): a symlink resolves to the target's device/inode,
+    which differs from the link's own.
+    """
+    fd_stat = os.fstat(fd)
+    if not stat.S_ISREG(fd_stat.st_mode):
+        os.close(fd)
+        raise WPSSHBackupError(
+            f"Refusing to upload {path.name}: not a regular file"
+        )
+    if not getattr(os, "O_NOFOLLOW", 0):
+        leaf_stat = os.lstat(path)
+        if (leaf_stat.st_dev, leaf_stat.st_ino) != (
+            fd_stat.st_dev,
+            fd_stat.st_ino,
+        ):
+            os.close(fd)
+            raise WPSSHBackupError(
+                f"Refusing to upload through symlink: {path}"
+            )
+
+
+@contextmanager
+def _held_local_files(
+    paths: list[Path],
+) -> Iterator[dict[Path, BinaryIO]]:
+    """
+    Open each path once through a no-follow descriptor and hold it open
+    for the whole context.
+
+    Everything a restore reads from these paths — member-type
+    validation, digest computation and the uploaded bytes — must come
+    from the same opened file, so a writer that swaps the pathname for a
+    symlink (or replaces the file) after the initial check cannot make
+    the restore upload or validate different bytes than the ones it
+    already inspected.
+    """
+    handles: dict[Path, BinaryIO] = {}
+    try:
+        for path in paths:
+            fd = _open_nofollow_regular(path)
+            try:
+                _assert_nofollow_regular(fd, path)
+                handles[path] = os.fdopen(fd, "rb")
+            except BaseException:
+                # fdopen took ownership only on success; make sure a
+                # failed assertion does not leak the descriptor.
+                if path not in handles:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+                raise
+        yield handles
+    finally:
+        for handle in handles.values():
+            handle.close()
+
+
 def sftp_upload_checked(
-    sftp: paramiko.SFTPClient, local: Path, remote: str
+    sftp: paramiko.SFTPClient, handle: BinaryIO, remote: str
 ) -> None:
-    if not local.is_file():
-        raise MissingArtifactError(f"Local file missing: {local}")
-    sftp.put(str(local), remote)
+    """Upload from an already-opened, held file object.
+
+    The caller opens the local file no-follow and keeps the descriptor
+    open until validation and upload are done, so the bytes uploaded are
+    the bytes the local checks inspected — not whatever a concurrent
+    writer may have swapped into the pathname meanwhile.
+    """
+    sftp.putfo(handle, remote)
 
 
 def verify_remote_checksums(
     client: paramiko.SSHClient,
     staging: str,
     archive_names: list[str],
-) -> None:
+) -> dict[str, str]:
     """
     Verify each uploaded archive against its uploaded .sha256 manifest.
 
@@ -311,9 +439,15 @@ def verify_remote_checksums(
     entry naming exactly the requested archive (no path separators, so no
     traversal), and the archive's bytes are then hashed directly with
     `sha256sum` and compared to the manifest's digest.
+
+    Returns:
+        Mapping of archive name to the digest the remote host computed
+        for the uploaded archive bytes. Callers can use these digests to
+        bind later local checks to the exact uploaded bytes.
     """
     sftp = client.open_sftp()
     try:
+        digests: dict[str, str] = {}
         for name in archive_names:
             checksum_remote = posixpath.join(staging, checksum_name(name))
             try:
@@ -366,6 +500,8 @@ def verify_remote_checksums(
                     f"expected {entries[name]}, got "
                     f"{actual.get(name, '(none)')}"
                 )
+            digests[name] = actual[name]
+        return digests
     finally:
         sftp.close()
 
@@ -379,9 +515,41 @@ _ALLOWED_MEMBER_TYPES = frozenset({
 })
 
 
-def _validate_local_member_types(archive: Path) -> None:
+class _HashingReader:
+    """A file-like wrapper that hashes every byte read through it."""
+
+    def __init__(self, handle: BinaryIO) -> None:
+        self._handle = handle
+        self._digest = hashlib.sha256()
+
+    def read(self, size: int = -1) -> bytes:
+        data = self._handle.read(size)
+        self._digest.update(data)
+        return data
+
+    def hexdigest(self) -> str:
+        return self._digest.hexdigest()
+
+
+def _validate_local_member_types(
+    archive: Path,
+    handle: BinaryIO,
+) -> str:
     """
-    Reject a files archive containing any non-allowed member type.
+    Reject a files archive containing any non-allowed member type, and
+    return the archive's SHA-256 digest.
+
+    The remote check ran against the uploaded bytes; this local check
+    must therefore bind its verdict to those same bytes. The digest is
+    computed over the exact bytes this call inspected, in the same pass,
+    so the caller can require it to equal the digest the remote host
+    computed for the uploaded archive: re-reading the pathname later
+    could validate different bytes than the ones uploaded and extracted.
+
+    The archive is read from the caller's held, no-follow file object —
+    the same descriptor the upload will use — so a pathname swapped for
+    a symlink or a different file after the initial open cannot change
+    which bytes are validated or uploaded.
 
     The remote check relies on tar's verbose listing, whose type letters
     vary between implementations and versions (e.g. a contiguous file may
@@ -395,10 +563,17 @@ def _validate_local_member_types(archive: Path) -> None:
         WPSSHBackupError: If a member type is unsupported or the archive
             cannot be read.
     """
-    if not archive.is_file():
-        raise MissingArtifactError(f"Local file missing: {archive}")
     try:
-        with tarfile.open(archive, mode="r:gz") as tar:
+        # The upload may already have read this handle to EOF; restart
+        # from the beginning so validation and the digest cover the
+        # whole held file.
+        handle.seek(0)
+        # A hashing reader between the file and tarfile's streaming
+        # mode hashes exactly the bytes tarfile inspects, in one
+        # pass; the trailing drain covers bytes gzip buffers past
+        # the last member.
+        reader = _HashingReader(handle)
+        with tarfile.open(fileobj=reader, mode="r|gz") as tar:
             for member in tar:
                 if member.type not in _ALLOWED_MEMBER_TYPES:
                     raise WPSSHBackupError(
@@ -407,11 +582,14 @@ def _validate_local_member_types(archive: Path) -> None:
                         "only regular files, directories and links are "
                         "allowed."
                     )
+        while handle.read(1024 * 1024):
+            pass
     except (tarfile.TarError, EOFError, OSError) as exc:
         raise WPSSHBackupError(
             f"Refusing to restore {archive.name}: cannot read archive "
             f"members: {exc}"
         ) from exc
+    return reader.hexdigest()
 
 
 @dataclass(frozen=True)
@@ -834,7 +1012,7 @@ def import_database(
 
     sftp = client.open_sftp()
     try:
-        write_remote_file(sftp, cnf_path, cnf_body, mode=0o600)
+        write_remote_file(client, sftp, cnf_path, cnf_body, mode=0o600)
     finally:
         sftp.close()
 
@@ -916,25 +1094,51 @@ def run_restore(
         # upload so an unsupported host fails fast and cleanly.
         _require_gnu_tar(client)
 
-        with client.open_sftp() as sftp:
-            upload_artifacts(sftp, set_files, archive_names, staging)
-        verify_remote_checksums(client, staging, archive_names)
-        print("Remote checksum verification passed.")
-
-        if include_files:
-            # Checked after checksum verification so a corrupt archive is
-            # reported as a checksum failure, and before any extraction.
-            _validate_local_member_types(
-                set_files[files_archive_name(backup_bid)]
+        # Every local artifact is opened once through a no-follow
+        # descriptor and held open until it has been validated and
+        # uploaded, so a writer swapping a pathname for a symlink (or a
+        # different file) after the initial open cannot make the restore
+        # upload or validate different bytes than the ones it inspected.
+        with _held_local_files(
+            [set_files[name] for name in archive_names]
+            + [set_files[checksum_name(name)] for name in archive_names]
+        ) as handles:
+            with client.open_sftp() as sftp:
+                upload_artifacts(
+                    sftp, set_files, handles, archive_names, staging
+                )
+            remote_digests = verify_remote_checksums(
+                client, staging, archive_names
             )
-            started = _now()
-            extract_files(client, config, staging, backup_bid)
-            print(f"Files extracted ({_now() - started:.1f}s).")
+            print("Remote checksum verification passed.")
 
-        if include_database:
-            started = _now()
-            import_database(client, config, staging, backup_bid)
-            print(f"Database imported ({_now() - started:.1f}s).")
+            if include_files:
+                # Checked after checksum verification so a corrupt archive is
+                # reported as a checksum failure, and before any extraction.
+                # The digest returned here is computed over the exact bytes
+                # the type check inspected; requiring it to equal the digest
+                # the remote host computed for the uploaded archive binds the
+                # type verdict to the uploaded bytes, so a pathname swapped
+                # between upload and this check cannot smuggle a different
+                # archive past the type validation.
+                files_name = files_archive_name(backup_bid)
+                local_digest = _validate_local_member_types(
+                    set_files[files_name], handles[set_files[files_name]]
+                )
+                if local_digest != remote_digests[files_name]:
+                    raise ChecksumError(
+                        "Local files archive changed after upload: the member "
+                        "type check inspected different bytes than the "
+                        "uploaded archive. Refusing to extract."
+                    )
+                started = _now()
+                extract_files(client, config, staging, backup_bid)
+                print(f"Files extracted ({_now() - started:.1f}s).")
+
+            if include_database:
+                started = _now()
+                import_database(client, config, staging, backup_bid)
+                print(f"Database imported ({_now() - started:.1f}s).")
     except (
         WPSSHBackupError,
         OSError,

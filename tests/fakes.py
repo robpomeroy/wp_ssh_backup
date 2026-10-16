@@ -70,6 +70,10 @@ class FakeSFTPClient:
         with open(local_path, "rb") as handle:
             self.remote_fs[remote_path] = handle.read()
 
+    def putfo(self, fileobj: object, remote_path: str) -> None:
+        """Mirror paramiko's putfo: stream an open file object up."""
+        self.remote_fs[remote_path] = fileobj.read()  # type: ignore[attr-defined]
+
 
 class _FakeReadFile:
     def __init__(self, data: bytes | None) -> None:
@@ -121,6 +125,10 @@ class FakeSSHClient:
         # Verbose-listing type letter for contiguous (CONTTYPE) members.
         # GNU tar 1.35 prints 'C'; other tar implementations may print '-'.
         self.contiguous_listing_kind = "C"
+        # Server umask for a fresh shell; `umask NNN` commands update it
+        # for the rest of that command only (each exec_command is a new
+        # shell, so exec_command resets it).
+        self.umask = 0o022
 
     # -- paramiko API -------------------------------------------------------
 
@@ -157,6 +165,7 @@ class FakeSSHClient:
 
     def exec_command(self, command: str, timeout: float | None = None):
         self.commands.append(command)
+        self.umask = 0o022
         stdout = io.BytesIO()
         stderr = io.BytesIO()
         exit_code = self._execute(command, stdout, stderr)
@@ -205,6 +214,20 @@ class FakeSSHClient:
             return self._mkdir_p(command)
         if command.startswith("chmod "):
             return self._chmod(command, stderr)
+        if command.startswith("umask "):
+            match = re.match(r"umask\s+([0-7]{3,4})$", command)
+            if match:
+                self.umask = int(match.group(1), 8)
+                return 0
+        if command.startswith(": > "):
+            targets = self._quoted(command)
+            if targets:
+                # `: > 'p'` creates p as an empty regular file with the
+                # shell's creation mode 0666 & ~umask, mirroring the
+                # server-side creation write_remote_file relies on.
+                self.remote_fs[targets[0]] = b""
+                self.sftp.modes[targets[0]] = 0o666 & ~self.umask
+                return 0
         if command.startswith("trap "):
             # Registering an EXIT handler is a no-op here; the cleanup the
             # trap would perform is covered by the explicit rm -f calls.

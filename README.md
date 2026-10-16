@@ -225,7 +225,15 @@ and validated symbolic and hard links. Special members (including FIFOs,
 devices and contiguous files) and unknown member types are rejected before any
 site file is replaced. After checksum verification, the type flags are read
 directly from the local archive, so the check does not depend on how the
-server's `tar` labels member types; the server-side listing is checked as well.
+server's `tar` labels member types; the server-side listing is checked as
+well. The type check also hashes the exact bytes it inspected and requires
+that digest to match the one the server computed for the uploaded archive,
+so a local pathname replaced between upload and validation cannot approve a
+different archive than the one that will be extracted. Local artifacts are
+opened once through no-follow file descriptors and held open until they
+have been validated and uploaded, so a symlink planted at an artifact path
+(or a file swapped in after the initial open) cannot change which bytes
+are uploaded or validated.
 
 **Warning:** restoring overwrites the current site contents and database. Take a
 fresh backup immediately beforehand if you may need to roll back:
@@ -301,7 +309,8 @@ host or credentials are available there.
   `authorize_host.py` before first use (see *Host key verification*).
 - Database credentials are never passed on remote command lines; they are
   supplied through a temporary option file that is deleted immediately after
-  use.
+  use. The option file is created owner-only (0600) on the server before any
+  credentials are written to it.
 - The `.env` file contains secrets — keep it out of version control.
 
 ## Licence

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import posixpath
 from pathlib import Path
@@ -877,6 +878,204 @@ def test_extract_files_rejects_special_members_in_listing(
     assert not any(command.startswith("tar xzf ") for command in client.commands)
     assert client.remote_fs[live_path] == b"original site configuration"
     assert posixpath.join(SITE_ROOT, "uploads/special") not in client.remote_fs
+
+
+def test_run_restore_binds_member_type_check_to_uploaded_digest(
+    tmp_path: Path,
+) -> None:
+    """A pathname swapped after upload cannot pass the type check while
+    the uploaded archive keeps its special members."""
+    set_files = make_local_set(tmp_path / "backups", TS)
+    client = FakeSSHClient(SITE_ROOT, wp_cli="/usr/bin/wp")
+    config = make_config(tmp_path)
+    live_path = posixpath.join(SITE_ROOT, "wp-config.php")
+    client.remote_fs[live_path] = b"original site configuration"
+    archive_name = files_archive_name(TS)
+    uploaded = _archive_with_special_member(b"6")  # FIFO member
+    set_files[archive_name].write_bytes(uploaded)
+    set_files[checksum_name(archive_name)].write_text(
+        f"{hashlib.sha256(uploaded).hexdigest()}  {archive_name}\n"
+    )
+
+    original_putfo = client.sftp.putfo
+
+    def putfo_then_swap(fileobj: object, remote_path: str) -> None:
+        original_putfo(fileobj, remote_path)
+        if remote_path.endswith(archive_name):
+            # After the upload, replace the local pathname with a benign
+            # archive. The held descriptor must keep the type check and
+            # the digest binding on the bytes that were uploaded.
+            set_files[archive_name].write_bytes(
+                _archive_with_special_member(b"0")
+            )
+
+    client.sftp.putfo = putfo_then_swap  # type: ignore[method-assign]
+
+    with pytest.raises(ChecksumError, match="changed after upload"):
+        restore.run_restore(
+            client, config, set_files, True, False,
+            staging_bid="20261014T1000Z",
+        )
+
+    # Nothing was extracted: the live file is untouched.
+    assert client.remote_fs[live_path] == b"original site configuration"
+    assert posixpath.join(SITE_ROOT, "uploads/special") not in client.remote_fs
+    staging = staging_dir_for(SITE_ROOT, "20261014T1000Z")
+    assert staging not in client.directories
+
+
+def test_run_restore_rejects_local_archive_changed_after_upload(
+    tmp_path: Path,
+) -> None:
+    """A benign archive modified after upload must also fail the digest
+    binding, not just a swap that hides special members."""
+    set_files = make_local_set(tmp_path / "backups", TS)
+    client = FakeSSHClient(SITE_ROOT, wp_cli="/usr/bin/wp")
+    config = make_config(tmp_path)
+    archive_name = files_archive_name(TS)
+
+    original_putfo = client.sftp.putfo
+
+    def putfo_then_append(fileobj: object, remote_path: str) -> None:
+        original_putfo(fileobj, remote_path)
+        if remote_path.endswith(archive_name):
+            set_files[archive_name].write_bytes(
+                set_files[archive_name].read_bytes() + b"trailing"
+            )
+
+    client.sftp.putfo = putfo_then_append  # type: ignore[method-assign]
+
+    with pytest.raises(ChecksumError, match="changed after upload"):
+        restore.run_restore(
+            client, config, set_files, True, False,
+            staging_bid="20261014T1000Z",
+        )
+
+    staging = staging_dir_for(SITE_ROOT, "20261014T1000Z")
+    assert staging not in client.directories
+
+
+def test_run_restore_rejects_unreadable_local_archive(tmp_path: Path) -> None:
+    """A local archive that cannot be parsed must abort before upload."""
+    set_files = make_local_set(tmp_path / "backups", TS)
+    client = FakeSSHClient(SITE_ROOT, wp_cli="/usr/bin/wp")
+    config = make_config(tmp_path)
+    archive_name = files_archive_name(TS)
+    data = b"corrupted"
+    set_files[archive_name].write_bytes(data)
+    set_files[checksum_name(archive_name)].write_text(
+        f"{hashlib.sha256(data).hexdigest()}  {archive_name}\n"
+    )
+
+    with pytest.raises(WPSSHBackupError, match="cannot read archive"):
+        restore.run_restore(
+            client, config, set_files, True, False,
+            staging_bid="20261014T1000Z",
+        )
+
+    # Nothing was uploaded: the type check runs before upload_artifacts.
+    staging = staging_dir_for(SITE_ROOT, "20261014T1000Z")
+    assert not any(path.startswith(staging) for path in client.remote_fs)
+
+
+def test_run_restore_rejects_symlinked_archive_leaf(tmp_path: Path) -> None:
+    """A symlink at an archive filename is refused, not followed.
+
+    O_NOFOLLOW is unavailable on Windows, where this suite runs, so the
+    open is monkeypatched to fail the way a POSIX no-follow open fails
+    on a symlinked leaf.
+    """
+    set_files = make_local_set(tmp_path / "backups", TS)
+    client = FakeSSHClient(SITE_ROOT, wp_cli="/usr/bin/wp")
+    config = make_config(tmp_path)
+
+    def open_rejects_symlink(path: object, flags: int) -> int:
+        raise OSError(errno.ELOOP, "Too many levels of symbolic links")
+
+    monkeypatch_open = pytest.MonkeyPatch()
+    monkeypatch_open.setattr(restore.os, "open", open_rejects_symlink)
+    try:
+        with pytest.raises(WPSSHBackupError, match="through symlink"):
+            restore.run_restore(
+                client, config, set_files, True, False,
+                staging_bid="20261014T1000Z",
+            )
+    finally:
+        monkeypatch_open.undo()
+
+    # Nothing was uploaded and staging was cleaned up.
+    staging = staging_dir_for(SITE_ROOT, "20261014T1000Z")
+    assert not any(path.startswith(staging) for path in client.remote_fs)
+    assert staging not in client.directories
+
+
+def test_run_restore_rejects_missing_archive_leaf(tmp_path: Path) -> None:
+    """A vanished artifact is reported as a missing file, cleanly."""
+    set_files = make_local_set(tmp_path / "backups", TS)
+    client = FakeSSHClient(SITE_ROOT, wp_cli="/usr/bin/wp")
+    config = make_config(tmp_path)
+    set_files[files_archive_name(TS)].unlink()
+
+    with pytest.raises(MissingArtifactError, match="Local file missing"):
+        restore.run_restore(
+            client, config, set_files, True, False,
+            staging_bid="20261014T1000Z",
+        )
+
+    staging = staging_dir_for(SITE_ROOT, "20261014T1000Z")
+    assert not any(path.startswith(staging) for path in client.remote_fs)
+    assert staging not in client.directories
+
+
+def test_run_restore_uploads_bytes_from_held_descriptor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Uploads stream from the held no-follow descriptors.
+
+    Each artifact pathname is opened exactly once, before any upload,
+    and the uploaded bytes are read from that descriptor — the restore
+    never re-opens the pathname to upload, so a writer swapping the path
+    after the initial open cannot change what gets uploaded.
+    """
+    set_files = make_local_set(tmp_path / "backups", TS)
+    client = FakeSSHClient(SITE_ROOT, wp_cli="/usr/bin/wp")
+    config = make_config(tmp_path)
+    archive_name = files_archive_name(TS)
+    original_bytes = set_files[archive_name].read_bytes()
+
+    real_open = restore.os.open
+    opened: list[str] = []
+
+    def counting_open(path: object, flags: int) -> int:
+        fd = real_open(path, flags)  # type: ignore[arg-type]
+        opened.append(str(path))
+        return fd
+
+    monkeypatch.setattr(restore.os, "open", counting_open)
+
+    uploaded: dict[str, bytes] = {}
+    original_putfo = client.sftp.putfo
+
+    def recording_putfo(fileobj: object, remote_path: str) -> None:
+        original_putfo(fileobj, remote_path)
+        uploaded[remote_path] = client.remote_fs[remote_path]
+
+    monkeypatch.setattr(client.sftp, "putfo", recording_putfo)
+
+    restore.run_restore(
+        client, config, set_files, True, False,
+        staging_bid="20261014T1000Z",
+    )
+
+    staging = staging_dir_for(SITE_ROOT, "20261014T1000Z")
+    # Exactly one no-follow open per artifact: the upload streamed from
+    # the held descriptor instead of re-opening the pathname.
+    assert sorted(Path(p).name for p in opened) == sorted([
+        archive_name,
+        checksum_name(archive_name),
+    ])
+    assert uploaded[posixpath.join(staging, archive_name)] == original_bytes
 
 
 def test_extract_files_allows_internal_symlink(tmp_path: Path) -> None:
@@ -1908,28 +2107,30 @@ def test_run_restore_honest_manifest_still_passes(tmp_path: Path) -> None:
 
 def test_write_remote_file_sets_mode_600(tmp_path: Path) -> None:
     client = FakeSSHClient(SITE_ROOT)
-    write_remote_file(client.sftp, "/tmp/secret.cnf", "[client]\n", mode=0o600)
+    write_remote_file(client, client.sftp, "/tmp/secret.cnf", "[client]\n")
     assert client.sftp.modes["/tmp/secret.cnf"] == 0o600
 
 
-def test_write_remote_file_restores_umask(tmp_path: Path) -> None:
-    """The umask must be restored after the write, even if it fails."""
-    import os
-
+def test_write_remote_file_creates_restricted_before_write(
+    tmp_path: Path,
+) -> None:
+    """The path is recreated server-side under umask 077 before any
+    content is uploaded, so the secret is never readable by others."""
     client = FakeSSHClient(SITE_ROOT)
-    before = os.umask(0o077)
-    os.umask(before)
-    try:
-        write_remote_file(client.sftp, "/tmp/x.cnf", "x")
-        # The previous umask is restored after the write.
-        assert os.umask(0o077) == before
-        os.umask(before)
-        # The written file was created restricted (SFTP servers apply the
-        # remote umask at creation time; the fake mirrors this by opening
-        # under the caller's umask and recording the resulting default).
-        assert client.sftp.modes.get("/tmp/x.cnf") is not None
-    finally:
-        os.umask(before)
+    path = "/tmp/secret.cnf"
+    # A pre-existing symlink at the path must be removed, not truncated
+    # through (rm -f does not follow links).
+    client.remote_fs[path] = b"-> /etc/shadow"
+    write_remote_file(client, client.sftp, path, "secret")
+    # The creation command ran under umask 077 and cleared the path first.
+    creation = [c for c in client.commands if "umask 077" in c]
+    assert len(creation) == 1
+    assert "rm -f" in creation[0]
+    # The symlink was replaced by a fresh regular file: the content was
+    # written into the new file, not through the link.
+    assert client.remote_fs[path] == b"secret"
+    # Created owner-only at creation time (0666 & ~077), then chmod 0600.
+    assert client.sftp.modes[path] == 0o600
 
 
 @pytest.mark.parametrize("error_type", [PermissionError, OSError])

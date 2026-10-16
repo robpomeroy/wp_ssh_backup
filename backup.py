@@ -133,7 +133,7 @@ def create_db_dump(
 
     sftp = client.open_sftp()
     try:
-        write_remote_file(sftp, cnf_path, cnf_body, mode=0o600)
+        write_remote_file(client, sftp, cnf_path, cnf_body, mode=0o600)
     finally:
         sftp.close()
 

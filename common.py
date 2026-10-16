@@ -472,6 +472,7 @@ def remote_path_exists(sftp: paramiko.SFTPClient, remote_path: str) -> bool:
 
 
 def write_remote_file(
+    client: paramiko.SSHClient,
     sftp: paramiko.SFTPClient,
     remote_path: str,
     content: str | bytes,
@@ -481,6 +482,7 @@ def write_remote_file(
     Write content to a remote file via SFTP, creating or overwriting it.
 
     Args:
+        client: An active SSH client connected to the remote host.
         sftp: An active SFTP client connected to the remote host.
         remote_path: The path on the remote host where the file should be
             written.
@@ -491,20 +493,30 @@ def write_remote_file(
         None.
 
     Note:
-        The process umask is tightened to 077 for the duration of the
-        write so the SFTP server creates the file already restricted to
-        the requesting user (SFTP servers apply their umask at creation
-        time). Relying on a post-write chmod alone would leave the secret
-        readable to other host users during the write window. The
-        previous umask is restored afterwards.
+        paramiko's SFTP open sends an empty attribute block, so the server
+        creates the file with its own default mode (typically
+        0666 & ~umask, i.e. group/other readable) and a client-side umask
+        cannot influence a remote server. The path is therefore recreated
+        through a server-side shell command running under umask 077
+        BEFORE any content is uploaded: an existing file or symlink at
+        the path is removed (so the creation cannot truncate through a
+        link) and a fresh owner-only regular file takes its place, so the
+        secret is never readable by other host users at any point. A
+        final chmod enforces the requested mode.
     """
     data = content.encode("utf-8") if isinstance(content, str) else content
-    old_umask = os.umask(0o077)
-    try:
-        with sftp.open(remote_path, "wb") as handle:
-            handle.write(data)
-    finally:
-        os.umask(old_umask)
+    # Recreate the path server-side under umask 077 before any content
+    # exists: rm -f clears a pre-existing file or symlink, and the `: >`
+    # redirection then creates a fresh regular file 0600 at the instant
+    # of creation. Neither a creation mode nor a client-side umask can
+    # reach the server through paramiko's SFTP open.
+    run_remote_cmd_checked(
+        client,
+        f"rm -f {shquote(remote_path)} && umask 077"
+        f" && : > {shquote(remote_path)}",
+    )
+    with sftp.open(remote_path, "wb") as handle:
+        handle.write(data)
     sftp.chmod(remote_path, mode)
 
 
