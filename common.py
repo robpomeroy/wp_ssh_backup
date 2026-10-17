@@ -380,7 +380,7 @@ def run_remote_cmd_checked(
 def sftp_download(
     sftp: paramiko.SFTPClient, remote_path: str, local_path: str | Path,
     *,
-    created_paths: list[Path] | None = None,
+    created_paths: list[tuple[Path, tuple[int, int]]] | None = None,
     downloaded_fds: dict[Path, int] | None = None,
 ) -> Path:
     """
@@ -410,8 +410,11 @@ def sftp_download(
         sftp: An active SFTP client connected to the remote host.
         remote_path: The path to the file on the remote host.
         local_path: The local path where the file should be saved.
-        created_paths: If supplied, records the destination immediately after
-            exclusive creation, including when the subsequent transfer fails.
+        created_paths: If supplied, records (path, (st_dev, st_ino)) of
+            the destination immediately after exclusive creation,
+            including when the subsequent transfer fails. Cleanup can
+            then remove the path only while it still refers to the inode
+            this call created, never a replacement another run planted.
         downloaded_fds: If supplied, records the open descriptor of the
             destination after a successful transfer, keyed by the local
             Path. The caller takes ownership of the descriptor and must
@@ -434,7 +437,8 @@ def sftp_download(
     fd = os.open(local, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
     try:
         if created_paths is not None:
-            created_paths.append(local)
+            st = os.fstat(fd)
+            created_paths.append((local, (st.st_dev, st.st_ino)))
         stream = os.fdopen(fd, "wb", closefd=False)
         try:
             sftp.getfo(remote_path, stream)

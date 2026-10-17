@@ -1529,6 +1529,117 @@ def test_extract_files_rejects_preexisting_link_at_member_path(
     )
 
 
+def test_extract_files_rejects_preexisting_hardlink_at_member_path(
+    tmp_path: Path,
+) -> None:
+    """A pre-existing hard link at a member path must block extraction.
+
+    A hard-linked wp-config.php shares its inode with a file outside the
+    site root (e.g. authorized_keys). Extracting a regular member over it
+    truncates the shared inode, overwriting the linked file outside the
+    site — GNU tar's default unlink-first behavior avoids this, but
+    --overwrite and other tar implementations truncate in place, so the
+    audit must reject hard-linked write targets rather than rely on the
+    implementation detail.
+    """
+    import io
+    import tarfile
+
+    backup_dir = tmp_path / "backups"
+    set_files = make_local_set(backup_dir, TS)
+    client = FakeSSHClient(SITE_ROOT, wp_cli="/usr/bin/wp")
+    config = make_config(tmp_path)
+
+    # The site tree already contains wp-config.php hard-linked to a file
+    # outside the site root.
+    client.remote_fs[posixpath.join(SITE_ROOT, "wp-config.php")] = (
+        b"<?php\n"
+    )
+    client.remote_hardlinks[posixpath.join(SITE_ROOT, "wp-config.php")] = (
+        "/home/user/.ssh/authorized_keys"
+    )
+
+    archive_name = files_archive_name(TS)
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as tar:
+        info = tarfile.TarInfo("wp-config.php")
+        data = b"<?php\n"
+        info.size = len(data)
+        tar.addfile(info, io.BytesIO(data))
+    archive_path = set_files[archive_name]
+    archive_path.write_bytes(buffer.getvalue())
+    checksum_path = set_files[checksum_name(archive_name)]
+    checksum_path.write_text(
+        f"{hashlib.sha256(buffer.getvalue()).hexdigest()}  {archive_name}\n"
+    )
+
+    with pytest.raises(WPSSHBackupError, match="already exists as a hard link"):
+        restore.run_restore(
+            client,
+            config,
+            set_files,
+            True,
+            False,
+            staging_bid="20261014T1000Z",
+        )
+
+    # The pre-existing hard-linked file was not replaced by extraction.
+    assert (
+        client.remote_fs[posixpath.join(SITE_ROOT, "wp-config.php")]
+        == b"<?php\n"
+    )
+
+
+def test_extract_files_ignores_unrelated_hardlink(
+    tmp_path: Path,
+) -> None:
+    """A pre-existing hard link in an untouched directory must not block."""
+    import io
+    import tarfile
+
+    backup_dir = tmp_path / "backups"
+    set_files = make_local_set(backup_dir, TS)
+    client = FakeSSHClient(SITE_ROOT, wp_cli="/usr/bin/wp")
+    config = make_config(tmp_path)
+
+    # other-dir is NOT written by the archive, so its hard link is not
+    # this restore's business.
+    client.remote_fs[posixpath.join(SITE_ROOT, "other-dir/linked")] = (
+        b"content"
+    )
+    client.remote_hardlinks[posixpath.join(SITE_ROOT, "other-dir/linked")] = (
+        "/home/user/elsewhere"
+    )
+
+    archive_name = files_archive_name(TS)
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as tar:
+        info = tarfile.TarInfo("wp-config.php")
+        data = b"<?php\n"
+        info.size = len(data)
+        tar.addfile(info, io.BytesIO(data))
+    archive_path = set_files[archive_name]
+    archive_path.write_bytes(buffer.getvalue())
+    checksum_path = set_files[checksum_name(archive_name)]
+    checksum_path.write_text(
+        f"{hashlib.sha256(buffer.getvalue()).hexdigest()}  {archive_name}\n"
+    )
+
+    restore.run_restore(
+        client, config, set_files, True, False, staging_bid="20261014T1000Z"
+    )
+
+    assert (
+        client.remote_fs[posixpath.join(SITE_ROOT, "wp-config.php")]
+        == b"<?php\n"
+    )
+    # The untouched hard link is still there.
+    assert (
+        client.remote_fs[posixpath.join(SITE_ROOT, "other-dir/linked")]
+        == b"content"
+    )
+
+
 def test_extract_files_rejects_link_completing_archive_chain(
     tmp_path: Path,
 ) -> None:

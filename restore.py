@@ -783,8 +783,8 @@ def _audit_destination_tree(
     writes: _ArchiveWrites,
 ) -> None:
     """
-    Reject pre-existing symlinks in the site tree that extraction would
-    traverse or replace.
+    Reject pre-existing symlinks and hard links in the site tree that
+    extraction would traverse or replace.
 
     _validate_members only sees the archive's contents, but tar extracts into
     the EXISTING site tree: if 'uploads' is already a symlink to a directory
@@ -795,13 +795,25 @@ def _audit_destination_tree(
     does not traverse symlinked directories by default), so the audit sees the
     real tree.
 
-    Only symlinks that extraction would actually traverse or replace are
+    A pre-existing HARD link at a member path is an escape too: the inode is
+    shared with another name (possibly outside the site root, e.g. a
+    hard-linked wp-config.php and authorized_keys). Extracting a regular
+    member over it truncates the shared inode, so the linked file outside the
+    site is overwritten with the archive's bytes. GNU tar's default extraction
+    unlinks the destination first (leaving the outside link intact), but that
+    is an implementation detail — `--overwrite` and other tar implementations
+    truncate in place — so the audit rejects hard-linked write targets
+    instead of relying on it. `find <root> -type f -links +1` lists files
+    whose link count is greater than one (i.e. hard-linked).
+
+    Only links that extraction would actually traverse or replace are
     rejected: a symlink is a problem when it sits at the site root itself,
     at a directory the archive writes into (an ancestor of a member path),
     at a member path itself (extraction would replace it), or at a path an
-    archive symlink resolves to (it would complete the escape chain). An
-    untouched pre-existing symlink elsewhere in the site is not this
-    restore's business.
+    archive symlink resolves to (it would complete the escape chain); a hard
+    link is a problem when it sits at a member path itself (extraction would
+    write over the shared inode). An untouched pre-existing link elsewhere in
+    the site is not this restore's business.
 
     Args:
         client: An active SSH client connected to the remote host.
@@ -812,7 +824,8 @@ def _audit_destination_tree(
     Raises:
         WPSSHBackupError: If a pre-existing symlink sits at the site root,
             at a member path, in a directory the archive writes into, or
-            at a path an archive symlink resolves to.
+            at a path an archive symlink resolves to; or if a pre-existing
+            hard link sits at a member path.
     """
     if not writes.member_paths and not writes.link_targets:
         return
@@ -857,6 +870,29 @@ def _audit_destination_tree(
                 f"Refusing to extract: {link!r} already exists as a "
                 "symlink in the site tree; an archive symlink resolves "
                 "to it and would follow it. Remove it and re-run."
+            )
+    # Pre-existing hard links at member paths: extracting a regular member
+    # over a hard-linked file truncates the shared inode, overwriting the
+    # linked file outside the site root. find -links +1 lists files whose
+    # link count is greater than one; only member paths matter (directories
+    # cannot be hard-linked, so ancestors are not a concern).
+    command = (
+        f"find {shquote(site_root)} -type f -links +1 -print0"
+    )
+    out = run_remote_cmd_checked(client, command, timeout=600)
+    for raw in out.split("\0"):
+        if not raw:
+            continue
+        hard = raw.rstrip("/")
+        rel_hard = posixpath.relpath(hard, site_root)
+        if rel_hard in writes.member_paths:
+            # Extraction would write a regular member over this path,
+            # truncating the inode it shares with another name (possibly
+            # outside the site root).
+            raise WPSSHBackupError(
+                f"Refusing to extract: {hard!r} already exists as a hard "
+                "link in the site tree; extraction would overwrite the "
+                "shared inode. Remove it and re-run."
             )
 
 

@@ -176,7 +176,12 @@ often but you rarely upload new files.
    divert verification or publication to unverified bytes. The
    published link is confirmed to reference the verified inode, whose
    digest is re-checked after linking before the final directory entry
-      is confirmed once more. Each checksum manifest must contain exactly
+   is confirmed once more. On Linux the hard link is created from the
+   held descriptor itself (`linkat` with `AT_EMPTY_PATH`); on macOS/BSD
+   and on filesystems or kernels that reject that flag, publication
+   falls back to a no-replace rename of the verified file, which is
+   re-opened no-follow and re-identified so the same verified inode is
+   published. Each checksum manifest must contain exactly
       one entry naming the archive it accompanies (matching the restore
       verifier), so a manifest with extra entries is refused rather than
       published as a complete set that restore would later reject.
@@ -189,9 +194,11 @@ often but you rarely upload new files.
    partial downloads are deleted and the remote staging directory is
    **kept** so the transfer can be retried; otherwise the staging
    directory is deleted. Failed-run cleanup removes only temporary
-   files created by that run, preserving pre-existing `.part` paths.
-   Cleanup failures are reported as warnings without hiding the original
-   error.
+   files created by that run: each `.part` path is unlinked only while
+   it still refers to the inode this run created, so a path replaced by
+   another process is left in place (with a warning) rather than
+   deleted. Cleanup failures are reported as warnings without hiding
+   the original error.
 7. Local backup sets older than `RETENTION_DAYS` are pruned.
 
 If local pruning or the final size calculation fails after a verified download,
@@ -249,6 +256,17 @@ opened once through no-follow file descriptors and held open until they
 have been validated and uploaded, so a symlink planted at an artifact path
 (or a file swapped in after the initial open) cannot change which bytes
 are uploaded or validated.
+
+Before extraction, the existing site tree is audited for links that
+extraction would traverse or replace: a pre-existing symlink at the site
+root, at a member path, in a directory the archive writes into, or at a
+path an archive symlink resolves to is rejected (it would divert writes
+outside the site or complete an escape chain), and a pre-existing hard
+link at a member path is rejected too — extracting a regular member over
+it truncates the shared inode, overwriting the linked file (which may
+live outside the site root, e.g. a hard-linked `wp-config.php` and
+`authorized_keys`). Links elsewhere in the site that the archive never
+touches are left alone.
 
 **Warning:** restoring overwrites the current site contents and database. Take a
 fresh backup immediately beforehand if you may need to roll back:

@@ -117,6 +117,10 @@ class FakeSSHClient:
         self.fail_on: dict[str, int] = {}
         self.directories: set[str] = set()
         self.directory_modes: dict[str, int] = {}
+        # Pre-existing hard links in the remote tree: a path mapped to the
+        # path it shares an inode with. `find -type f -links +1` lists
+        # these paths (link count > 1).
+        self.remote_hardlinks: dict[str, str] = {}
         # Host-key simulation: the key the "server" presents, and the set of
         # fingerprints the "client" already trusts.
         self.server_key: object | None = None
@@ -259,6 +263,8 @@ class FakeSSHClient:
             return self._tar_list(command, stdout, stderr, verbose=False)
         if re.search(r"^find\s+", command) and "-type l" in command:
             return self._find_type_l(command, stdout, stderr)
+        if re.search(r"^find\s+", command) and "-links +1" in command:
+            return self._find_hardlinks(command, stdout, stderr)
         if "mysqldump" in command:
             return self._mysqldump(command, stderr)
         if (
@@ -532,6 +538,33 @@ class FakeSSHClient:
             if path.startswith(prefix) and data.startswith(b"-> ")
         ]
         for path in sorted(links):
+            stdout.write(path.encode() + b"\0")
+        return 0
+
+    def _find_hardlinks(
+        self, command: str, stdout: io.BytesIO, stderr: io.BytesIO
+    ) -> int:
+        """find <root> -type f -links +1 -print0: list hard-linked files.
+
+        The fake records pre-existing hard links in remote_hardlinks (a
+        path mapped to the path it shares an inode with). Like real
+        find, only regular files with a link count greater than one are
+        listed, and the root itself is never listed.
+        """
+        match = re.search(
+            r"^find\s+'([^']+)'\s+-type f\s+-links \+1\s+-print0$", command
+        )
+        if not match:
+            stderr.write(f"find: unsupported syntax: {command}\n".encode())
+            return 1
+        root = match.group(1).rstrip("/")
+        prefix = root + "/"
+        hardlinks = [
+            path
+            for path in self.remote_hardlinks
+            if path.startswith(prefix)
+        ]
+        for path in sorted(hardlinks):
             stdout.write(path.encode() + b"\0")
         return 0
 

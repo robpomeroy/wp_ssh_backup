@@ -231,9 +231,37 @@ def _temp_download_name(name: str) -> str:
     return name + ".part"
 
 
-def _discard_temp_downloads(created_paths: list[Path]) -> None:
-    """Remove only owned temporary files without masking the original error."""
-    for path in created_paths:
+def _discard_temp_downloads(
+    created_paths: list[tuple[Path, tuple[int, int]]],
+) -> None:
+    """Remove only owned temporary files without masking the original error.
+
+    Each entry records the (st_dev, st_ino) of the inode this run
+    created. The path is unlinked only while it still refers to that
+    inode: a concurrent writer who replaced the .part pathname (after a
+    download or a transfer failure) planted a different inode, and
+    removing it would delete another run's file. A replaced path is left
+    in place with a warning.
+    """
+    for path, identity in created_paths:
+        try:
+            st = os.lstat(path)
+        except FileNotFoundError:
+            # Already gone (e.g. published and unlinked); nothing to do.
+            continue
+        except OSError as exc:
+            print(
+                f"WARNING: could not check temporary download {path}: {exc}",
+                file=sys.stderr,
+            )
+            continue
+        if (st.st_dev, st.st_ino) != identity:
+            print(
+                f"WARNING: temporary download {path} was replaced by "
+                "another file; leaving it in place",
+                file=sys.stderr,
+            )
+            continue
         try:
             path.unlink(missing_ok=True)
         except OSError as exc:
@@ -249,7 +277,7 @@ def download_artifacts(
     archive_names: list[str],
     backup_dir: Path,
     *,
-    created_paths: list[Path] | None = None,
+    created_paths: list[tuple[Path, tuple[int, int]]] | None = None,
 ) -> tuple[dict[str, Path], dict[Path, int]]:
     """
     Download each archive and its .sha256 file into backup_dir.
@@ -274,8 +302,10 @@ def download_artifacts(
         staging: The remote staging directory containing the archives.
         archive_names: A list of archive filenames to download.
         backup_dir: The local directory where the files will be stored.
-        created_paths: If supplied, records files created by this run, even
-            if a transfer fails before this function returns.
+        created_paths: If supplied, records (path, (st_dev, st_ino)) of
+            files created by this run, even if a transfer fails before
+            this function returns, so cleanup can remove a path only
+            while it still refers to this run's inode.
 
     Returns:
         A tuple of (temp_paths, downloaded_fds): temp_paths maps each
@@ -435,7 +465,13 @@ def _held_temp_downloads(
     finally:
         if close_on_exit:
             for handle in wrapped:
-                fd = handle.fileno()
+                # The rename fallback (_publish_by_rename) closes the
+                # handle it consumed, so only close handles that are
+                # still open.
+                try:
+                    fd = handle.fileno()
+                except ValueError:
+                    continue
                 handle.close()
                 try:
                     os.close(fd)
@@ -532,13 +568,19 @@ def _publish_no_replace(
     download handed over) — the source-inode binding and the no-replace
     creation are one atomic operation: a writer who can modify
     BACKUP_DIR cannot make publication link a replacement inode, even by
-    swapping the .part pathname after verification. On filesystems
-    without hard-link support (or on Windows), falls back to
-    os.rename(), which also refuses to replace an existing destination;
-    the descriptor is closed first because Windows refuses to rename an
-    open file, and the renamed file is re-opened no-follow and
-    re-identified so the fallback publishes the same inode that was
-    verified.
+    swapping the .part pathname after verification. linkat(AT_EMPTY_PATH)
+    is Linux-specific: on macOS/BSD and on filesystems or kernels that
+    reject the flag (EINVAL, ENOTSUP, EOPNOTSUPP, ENOSYS, or a
+    permission error from a filesystem that refuses it), publication
+    falls back to a no-replace rename of the held inode's pathname
+    (_publish_by_rename), which re-opens the renamed file no-follow and
+    re-identifies it so the fallback publishes the same inode that was
+    verified. On Windows, os.link() by pathname is used: the held
+    descriptor (the download's own O_RDWR fd on the inode it wrote)
+    prevents the .part pathname from being unlinked or replaced while it
+    is held, so linking the pathname cannot publish a different inode
+    than the one verified; on volumes without hard-link support this
+    also falls back to the no-replace rename.
 
     Returns:
         The descriptor-holding file object the published inode must be
@@ -554,7 +596,28 @@ def _publish_no_replace(
         # download descriptor references even if the .part pathname was
         # replaced after verification, and fails with FileExistsError if
         # the final path already exists (no-replace).
-        _link_inode_no_replace(handle.fileno(), final_path)
+        try:
+            _link_inode_no_replace(handle.fileno(), final_path)
+        except FileExistsError:
+            raise
+        except OSError as exc:
+            # linkat(AT_EMPTY_PATH) is Linux-specific: macOS/BSD reject
+            # the flag with EINVAL, and some filesystems/kernels return
+            # ENOTSUP/EOPNOTSUPP/ENOSYS (or EPERM/EACCES when the
+            # operation is refused). Fall back to the no-replace rename,
+            # which is portable and re-identifies the published inode.
+            # Any other error (e.g. ENOENT from a nameless inode on
+            # tmpfs) is a genuine failure and must propagate.
+            if exc.errno in (
+                errno.EINVAL,
+                errno.ENOTSUP,
+                errno.EOPNOTSUPP,
+                errno.ENOSYS,
+                errno.EPERM,
+                errno.EACCES,
+            ):
+                return _publish_by_rename(handle, temp_path, final_path)
+            raise
         return handle
 
     # Windows path: link by pathname. The held descriptor (the
@@ -587,12 +650,19 @@ def _publish_by_rename(
 ) -> BinaryIO:
     """Rename fallback publishing an already-verified inode.
 
-    Windows refuses to rename a file it holds open, so the held
-    descriptor is closed first and the renamed file is re-opened
-    no-follow and re-identified; the caller verifies the published
-    inode through the returned handle. If the renamed file cannot be
-    re-opened and identified, it is removed so no unverified file is
-    left under a final name.
+    Used when the inode-link publication is unavailable: on Windows
+    (which refuses to rename a file it holds open, so the held
+    descriptor is closed first) and on POSIX platforms/filesystems
+    where linkat(AT_EMPTY_PATH) is not supported. os.rename() replaces
+    an existing destination on POSIX, so the caller must have already
+    confirmed final_path does not exist (the pre-check in
+    publish_downloads) — the no-replace guarantee is preserved by that
+    pre-check plus the re-identification below, which rejects a
+    destination that appeared or was replaced in between. The renamed
+    file is re-opened no-follow and re-identified; the caller verifies
+    the published inode through the returned handle. If the renamed
+    file cannot be re-opened and identified, it is removed so no
+    unverified file is left under a final name.
     """
     try:
         os.close(handle.fileno())
@@ -1077,7 +1147,7 @@ def run_backup(
         # default restore could then select the corrupt newest backup
         # instead of a valid older one.
         published = False
-        created_paths: list[Path] = []
+        created_paths: list[tuple[Path, tuple[int, int]]] = []
         downloaded_fds: dict[Path, int] = {}
         try:
             with client.open_sftp() as sftp:

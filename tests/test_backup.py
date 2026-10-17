@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import os
 import posixpath
@@ -664,6 +665,67 @@ def test_publish_downloads_publishes_verified_files(
     assert not temp_paths[checksum_name(archive)].exists()
 
 
+@pytest.mark.parametrize(
+    "errno_value",
+    [
+        errno.EINVAL,
+        errno.ENOTSUP,
+        errno.EOPNOTSUPP,
+        errno.ENOSYS,
+        errno.EPERM,
+        errno.EACCES,
+    ],
+)
+def test_publish_downloads_falls_back_when_linkat_unsupported(
+    backup_dir: Path, errno_value: int
+) -> None:
+    """A POSIX platform without linkat(AT_EMPTY_PATH) still publishes.
+
+    linkat(AT_EMPTY_PATH) is Linux-specific: macOS/BSD reject the flag
+    with EINVAL, and some filesystems/kernels return ENOTSUP,
+    EOPNOTSUPP, ENOSYS, or a permission error. _publish_no_replace must
+    fall back to the no-replace rename on those errors instead of
+    failing the whole backup; the renamed file is re-opened no-follow
+    and re-identified, so the published inode is still the verified one.
+    """
+    import unittest.mock
+
+    archive = files_archive_name(TS)
+    temp_paths = make_temp_set(backup_dir, archive)
+    digests = digests_for(temp_paths)
+
+    original_link = backup._link_inode_no_replace
+
+    def unsupported_link(link_fd: int, final_path: Path) -> None:
+        raise OSError(
+            errno_value,
+            os.strerror(errno_value),
+            str(final_path),
+        )
+
+    with unittest.mock.patch.object(
+        backup, "_link_inode_no_replace", unsupported_link
+    ):
+        local_paths = backup.publish_downloads(
+            temp_paths,
+            [archive],
+            backup_dir,
+            digests,
+            make_downloaded_fds(temp_paths),
+        )
+
+    # The rename fallback published the verified bytes under the final
+    # names, and the temporary downloads were consumed.
+    assert local_paths[archive] == backup_dir / archive
+    assert (backup_dir / archive).read_bytes() == b"payload"
+    assert (backup_dir / checksum_name(archive)).is_file()
+    assert not temp_paths[archive].exists()
+    assert not temp_paths[checksum_name(archive)].exists()
+    # The fallback must not have been reached through the Windows
+    # os.link path: _link_inode_no_replace was the only thing patched.
+    assert original_link is backup._link_inode_no_replace
+
+
 def test_publish_downloads_refuses_overwrite_of_existing(
     backup_dir: Path,
 ) -> None:
@@ -1301,6 +1363,40 @@ def test_run_backup_sftp_failure_discards_temp_downloads(
     assert list(backup_dir.iterdir()) == []
     # The remote staging dir is removed on non-checksum failures.
     assert not any(path.startswith(staging) for path in client.remote_fs)
+
+
+def test_run_backup_cleanup_preserves_replaced_temp(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """Cleanup must not unlink a .part replaced by another run's file.
+
+    _discard_temp_downloads() records the inode each download created
+    and removes the path only while it still refers to that inode. If a
+    concurrent writer replaces the .part pathname after the transfer
+    fails, the replacement is a different inode and must be left in
+    place with a warning, never unlinked.
+    """
+    path = tmp_path / "wp-files-20261014T0930Z.tar.gz.part"
+    path.write_bytes(b"this-run-bytes")
+    identity = (os.stat(path).st_dev, os.stat(path).st_ino)
+    # A concurrent writer replaces the pathname with a different inode.
+    # unlink+write_bytes can reuse the freed inode on some filesystems
+    # (ext4), so the replacement is staged at a fresh path and renamed
+    # over the original — a guaranteed different inode.
+    replacement = tmp_path / "replacement.part"
+    replacement.write_bytes(b"other-run-bytes")
+    os.replace(replacement, path)
+
+    backup._discard_temp_downloads([(path, identity)])
+
+    # The replacement is preserved, with a warning.
+    assert path.exists()
+    assert path.read_bytes() == b"other-run-bytes"
+    warning = capsys.readouterr().err
+    assert "WARNING:" in warning
+    assert "replaced by another file" in warning
+    assert str(path) in warning
 
 
 @pytest.mark.parametrize("artifact", ["archive", "checksum"])
