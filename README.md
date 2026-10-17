@@ -167,11 +167,20 @@ often but you rarely upload new files.
    under their final names, using an atomic no-replace operation (a hard
    link, or a no-replace rename on filesystems without hard-link
    support) created from the verified file's own open descriptor: the
-   `.part` files are held open through no-follow handles across
-   publication, so a symlink planted at a `.part` path is refused and
-   the published link is confirmed to reference the verified inode,
-   whose digest is re-checked after linking before the final directory
-   entry is confirmed once more. A file that appears at a
+   descriptor each download wrote through is handed over and held open,
+   so verification hashes and publication links the very inode the
+   transfer created — never a re-opened `.part` pathname. A writer who
+   can modify `BACKUP_DIR` cannot substitute a self-consistent
+   (archive, manifest) pair after the download (the replacement is a
+   different inode), and a symlink planted at a `.part` path cannot
+   divert verification or publication to unverified bytes. The
+   published link is confirmed to reference the verified inode, whose
+   digest is re-checked after linking before the final directory entry
+      is confirmed once more. Each checksum manifest must contain exactly
+      one entry naming the archive it accompanies (matching the restore
+      verifier), so a manifest with extra entries is refused rather than
+      published as a complete set that restore would later reject.
+      A file that appears at a
    final name after the pre-check —
    from another backup process or a local attacker who can write
    `BACKUP_DIR` — can never be silently overwritten. If publication

@@ -11,6 +11,7 @@ import argparse
 from contextlib import contextmanager
 from pathlib import Path
 from typing import BinaryIO, Generator
+import ctypes
 import errno
 import hashlib
 import os
@@ -42,14 +43,12 @@ from common import (
     remove_remote_staging,
     run_remote_cmd,
     run_remote_cmd_checked,
-    sha256_file,
     shquote,
     sftp_download,
     split_db_host,
     staging_dir_for,
     trap_rm_action,
     write_remote_file,
-    verify_local_checksum,
 )
 
 
@@ -251,7 +250,7 @@ def download_artifacts(
     backup_dir: Path,
     *,
     created_paths: list[Path] | None = None,
-) -> dict[str, Path]:
+) -> tuple[dict[str, Path], dict[Path, int]]:
     """
     Download each archive and its .sha256 file into backup_dir.
 
@@ -260,6 +259,15 @@ def download_artifacts(
     a backup set: the suffix does not match the backup filename pattern,
     and publish_downloads() links the files under their final names only
     after checksum verification has passed.
+
+    The descriptor each download wrote through is handed to the caller,
+    so verification hashes and publication links the very inode the
+    transfer created. A writer who can modify BACKUP_DIR cannot
+    substitute a self-consistent (archive, manifest) pair after the
+    transfer: hashing and linking the held descriptors (never re-opening
+    the .part pathnames) binds the checksum to the downloaded bytes. The
+    caller owns every descriptor in the returned mapping and must close
+    them.
 
     Args:
         sftp: An active SFTP client connected to the remote host.
@@ -270,24 +278,44 @@ def download_artifacts(
             if a transfer fails before this function returns.
 
     Returns:
-        A dictionary mapping each archive's final name (and its checksum
-        filename) to the temporary local Path it was downloaded to.
+        A tuple of (temp_paths, downloaded_fds): temp_paths maps each
+        archive's final name (and its checksum filename) to the local
+        .part Path it was downloaded to; downloaded_fds maps each of
+        those paths to the open descriptor of the inode the download
+        created. The caller takes ownership of every descriptor and must
+        close it after verification and publication.
     """
     local_paths: dict[str, Path] = {}
-    for name in archive_names:
-        local_paths[name] = sftp_download(
-            sftp,
-            posixpath.join(staging, name),
-            backup_dir / _temp_download_name(name),
-            created_paths=created_paths,
-        )
-        local_paths[checksum_name(name)] = sftp_download(
-            sftp,
-            posixpath.join(staging, checksum_name(name)),
-            backup_dir / _temp_download_name(checksum_name(name)),
-            created_paths=created_paths,
-        )
-    return local_paths
+    downloaded_fds: dict[Path, int] = {}
+    try:
+        for name in archive_names:
+            local_paths[name] = sftp_download(
+                sftp,
+                posixpath.join(staging, name),
+                backup_dir / _temp_download_name(name),
+                created_paths=created_paths,
+                downloaded_fds=downloaded_fds,
+            )
+            local_paths[checksum_name(name)] = sftp_download(
+                sftp,
+                posixpath.join(staging, checksum_name(name)),
+                backup_dir / _temp_download_name(checksum_name(name)),
+                created_paths=created_paths,
+                downloaded_fds=downloaded_fds,
+            )
+    except BaseException:
+        # A later transfer failed; close the descriptors already handed
+        # over so the caller's _discard_temp_downloads() can unlink the
+        # .part files even on platforms that refuse to unlink a file
+        # held open (Windows). The unlinked path cleanup is the
+        # caller's job via created_paths.
+        for fd in downloaded_fds.values():
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        raise
+    return local_paths, downloaded_fds
 
 
 def _open_nofollow_regular(path: Path) -> int:
@@ -366,36 +394,123 @@ def _assert_nofollow_regular(fd: int, path: Path) -> None:
 def _held_temp_downloads(
     temp_paths: dict[str, Path],
     finals: list[str],
+    downloaded_fds: dict[Path, int],
+    *,
+    close_on_exit: bool = True,
 ) -> Generator[dict[str, BinaryIO]]:
     """
-    Open each temporary download once through a no-follow descriptor and
-    hold it open for the whole context.
+    Wrap the descriptors handed over by the download as held file handles.
 
-    Publication must read from the same opened file it links: a writer
-    that swaps a .part pathname for a symlink (or replaces the file)
-    after verification cannot make publication link different bytes
-    than the ones that were verified.
+    Verification and publication consume the very descriptors the
+    download wrote through, never re-open the .part pathnames: a writer
+    who swaps a .part path for a symlink (or replaces the file) cannot
+    make verification hash or publication link different bytes than the
+    ones the download created. On POSIX publication links the held
+    inode itself through linkat(AT_EMPTY_PATH) directly from this
+    descriptor; on Windows the held descriptor prevents the pathname
+    from being replaced.
+
+    Each descriptor is wrapped in a file object positioned at the start.
+    Ownership of every descriptor is transferred here: the caller must
+    not close them elsewhere. On exit the handles are closed unless
+    close_on_exit is False, in which case the descriptors stay open for
+    a later consumer (verification keeps them open so publication can
+    reuse the same inode-bound descriptors).
     """
     handles: dict[str, BinaryIO] = {}
+    wrapped: list[BinaryIO] = []
     try:
         for final in finals:
             path = temp_paths[final]
-            fd = _open_nofollow_regular(path)
-            try:
-                _assert_nofollow_regular(fd, path)
-                handles[final] = os.fdopen(fd, "rb")
-            except BaseException:
-                # fdopen took ownership only on success; after a failed
-                # assertion the descriptor is still ours to close.
+            fd = downloaded_fds[path]
+            # closefd=False: the handle reads the caller's descriptor
+            # but does not own it, so wrapping cannot close the fd out
+            # from under a later consumer (verify keeps the same
+            # descriptors open for publication).
+            handle = os.fdopen(fd, "rb", closefd=False)
+            wrapped.append(handle)
+            handle.seek(0)
+            handles[final] = handle
+        yield handles
+    finally:
+        if close_on_exit:
+            for handle in wrapped:
+                fd = handle.fileno()
+                handle.close()
                 try:
                     os.close(fd)
                 except OSError:
                     pass
-                raise
-        yield handles
-    finally:
-        for handle in handles.values():
-            handle.close()
+
+
+def _link_inode_no_replace(link_fd: int, final_path: Path) -> None:
+    """
+    Create final_path as a hard link to the inode referenced by link_fd.
+
+    The link is created from the descriptor itself (linkat() with
+    AT_EMPTY_PATH), not from a pathname: a writer who can modify
+    BACKUP_DIR cannot make publication link a different inode than the
+    one the caller verified, even by replacing the .part pathname
+    between verification and publication. The operation is no-replace:
+    if final_path already exists (or appears before the link), it fails
+    with FileExistsError instead of overwriting.
+
+    On POSIX, link_fd may be any descriptor referencing the file whose
+    inode is to be published (the download's own O_RDWR descriptor
+    works). AT_EMPTY_PATH requires the fd to reference a file the caller
+    can read; it needs no privileges. Not available on Windows; callers
+    there must use the rename fallback (_publish_by_rename) instead.
+
+    Raises:
+        FileExistsError: If final_path already exists.
+        NotImplementedError: On platforms without linkat()/AT_EMPTY_PATH.
+        OSError: If the link cannot be created for any other reason.
+    """
+    if os.name != "posix":
+        raise NotImplementedError(
+            "inode-based publication is not available on this platform"
+        )
+    libc = _linkat_libc()
+    final_bytes = os.fsencode(str(final_path))
+    rc = libc.linkat(
+        link_fd,
+        b"",
+        _AT_FDCWD,
+        final_bytes,
+        _AT_EMPTY_PATH,
+    )
+    if rc != 0:
+        err = ctypes.get_errno()
+        if err == errno.EEXIST:
+            raise FileExistsError(
+                f"Refusing to overwrite existing backup file: {final_path}"
+            )
+        raise OSError(err, os.strerror(err), str(final_path))
+
+
+# linkat() and its flags: Python does not expose AT_EMPTY_PATH, so the
+# libc call is wrapped here. Loaded lazily and cached: the return value
+# is a plain ctypes function object that stays valid for the process
+# lifetime.
+_AT_FDCWD = -100
+_AT_EMPTY_PATH = 0x1000
+_linkat_cache: ctypes.CDLL | None = None
+
+
+def _linkat_libc() -> ctypes.CDLL:
+    global _linkat_cache
+    if _linkat_cache is None:
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.linkat.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+        ]
+        libc.linkat.restype = ctypes.c_int
+        _linkat_cache = libc
+    return _linkat_cache
 
 
 def _publish_no_replace(
@@ -412,14 +527,17 @@ def _publish_no_replace(
     the target's unverified inode. The caller confirms that the created
     link references the held inode and re-verifies its digest.
 
-    Uses os.link() so the publication either happens or fails with
-    FileExistsError: there is no window in which another process can
-    create final_path and have it silently overwritten. On filesystems
-    without hard-link support (some Windows volumes), falls back to
-    os.rename(), which on Windows also refuses to replace an existing
-    destination; the descriptor is closed first because Windows refuses
-    to rename an open file, and the renamed file is re-opened no-follow
-    and re-identified so the fallback publishes the same inode that was
+    On POSIX the hard link is created by linking the held descriptor's
+    inode itself (linkat with AT_EMPTY_PATH on the O_RDWR descriptor the
+    download handed over) — the source-inode binding and the no-replace
+    creation are one atomic operation: a writer who can modify
+    BACKUP_DIR cannot make publication link a replacement inode, even by
+    swapping the .part pathname after verification. On filesystems
+    without hard-link support (or on Windows), falls back to
+    os.rename(), which also refuses to replace an existing destination;
+    the descriptor is closed first because Windows refuses to rename an
+    open file, and the renamed file is re-opened no-follow and
+    re-identified so the fallback publishes the same inode that was
     verified.
 
     Returns:
@@ -430,6 +548,21 @@ def _publish_no_replace(
     Raises:
         FileExistsError: If final_path already exists.
     """
+    if os.name == "posix":
+        # POSIX path: link the held inode itself, not the pathname.
+        # linkat(AT_EMPTY_PATH) publishes exactly the inode the held
+        # download descriptor references even if the .part pathname was
+        # replaced after verification, and fails with FileExistsError if
+        # the final path already exists (no-replace).
+        _link_inode_no_replace(handle.fileno(), final_path)
+        return handle
+
+    # Windows path: link by pathname. The held descriptor (the
+    # download's own O_RDWR fd on the inode it wrote) prevents the .part
+    # pathname from being unlinked or replaced while it is held, so
+    # linking the pathname cannot publish a different inode than the one
+    # verified. os.link() keeps the temporary file in place; a later
+    # rollback removes only the final links this run created.
     try:
         os.link(temp_path, final_path)
     except FileExistsError as exc:
@@ -437,8 +570,12 @@ def _publish_no_replace(
             f"Refusing to overwrite existing backup file: {final_path}"
         ) from exc
     except OSError:
-        if os.name != "nt":
-            raise
+        # Hard links unsupported (some Windows volumes): fall back to
+        # rename, which also refuses to replace an existing destination.
+        # The descriptor is closed first because Windows refuses to
+        # rename an open file; the renamed file is re-opened no-follow
+        # and re-identified so the fallback publishes the same inode
+        # that was verified.
         return _publish_by_rename(handle, temp_path, final_path)
     return handle
 
@@ -457,6 +594,10 @@ def _publish_by_rename(
     re-opened and identified, it is removed so no unverified file is
     left under a final name.
     """
+    try:
+        os.close(handle.fileno())
+    except OSError:
+        pass
     handle.close()
     try:
         os.rename(temp_path, final_path)
@@ -560,6 +701,7 @@ def publish_downloads(
     archive_names: list[str],
     backup_dir: Path,
     digests: dict[str, str],
+    downloaded_fds: dict[Path, int],
 ) -> dict[str, Path]:
     """
     Publish verified temporary downloads under their final names.
@@ -568,11 +710,12 @@ def publish_downloads(
     file that reaches BACKUP_DIR under its final name is always a
     checksum-verified artifact.
 
-    Every temporary download is opened once through a no-follow
-    descriptor and held open across publication, so the bytes published
-    are the bytes that were verified: a writer that swaps a .part path
-    for a symlink (or replaces the file) after verification cannot make
-    publication link different bytes than the ones that were verified.
+    The descriptors the download handed over are held open across
+    publication, and the links are created from those descriptors'
+    inodes — never by re-opening the .part pathnames: a writer that
+    swaps a .part path for a symlink (or replaces the file) after
+    verification cannot make publication link different bytes than the
+    ones that were verified.
 
     Publication is transactional and atomic: each final path is created
     with a no-replace operation from the held descriptor's inode (hard
@@ -601,6 +744,10 @@ def publish_downloads(
         backup_dir: The local directory that receives the final names.
         digests: The digest each final name's bytes must still have at
             publication time, as returned by verify_downloads().
+        downloaded_fds: The open descriptors handed over by
+            download_artifacts() for the .part files that were
+            verified. Ownership is transferred; they are closed after
+            publication.
 
     Returns:
         A dictionary mapping each archive and its checksum filename to
@@ -637,7 +784,9 @@ def publish_downloads(
 
     published: list[tuple[Path, tuple[int, int]]] = []
     try:
-        with _held_temp_downloads(temp_paths, finals) as handles:
+        with _held_temp_downloads(
+            temp_paths, finals, downloaded_fds
+        ) as handles:
             for final in finals:
                 final_path = backup_dir / final
                 # Record the held inode before publication: it is the
@@ -710,17 +859,40 @@ def publish_downloads(
     return {final: backup_dir / final for final in finals}
 
 
+def _sha256_handle(handle: BinaryIO) -> str:
+    """SHA-256 of the opened file's bytes, from the current position."""
+    digest = hashlib.sha256()
+    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+        digest.update(chunk)
+    return digest.hexdigest()
+
+
 def verify_downloads(
     local_paths: dict[str, Path],
     archive_names: list[str],
+    downloaded_fds: dict[Path, int],
 ) -> dict[str, str]:
     """
     Recompute SHA-256 locally using the downloaded .sha256 files.
+
+    Verification is bound to the inodes sftp_download() created: the
+    descriptors handed over by the download are hashed directly, never
+    re-opened through a pathname. A writer who can modify BACKUP_DIR
+    cannot substitute a self-consistent (archive, manifest) pair after
+    the download — the pair is a different inode, so hashing the held
+    descriptors verifies the bytes the transfer wrote, not whatever a
+    replaced .part pathname now points at. The manifest is parsed and
+    the digests are computed through the held descriptors.
 
     Args:
         local_paths: A dictionary mapping each archive and its checksum
             filename to the corresponding local Path object.
         archive_names: A list of archive filenames to verify.
+        downloaded_fds: The open descriptors of the .part files
+            returned by download_artifacts(), keyed by their Paths.
+            They are kept open after verification so publication can
+            reuse the same inode-bound descriptors; the caller (or the
+            final publication) closes them.
 
     Returns:
         A dictionary mapping each final name to the digest its bytes
@@ -731,31 +903,71 @@ def verify_downloads(
         verified here.
     """
     digests: dict[str, str] = {}
+    finals: list[str] = []
     for name in archive_names:
-        local_path = local_paths[name]
-        if not local_path.is_file():
-            raise MissingArtifactError(
-                f"Downloaded file missing: {local_path}"
-            )
-        checksum_file = local_paths[checksum_name(name)]
-        try:
-            text = checksum_file.read_text(encoding="utf-8")
-        except UnicodeDecodeError as exc:
-            # An undecodable manifest is a checksum failure, not a crash:
-            # raising ChecksumError keeps the remote staging dir for retry
-            # and reports the problem through the normal error path.
-            raise ChecksumError(
-                f"{checksum_file} is not valid UTF-8 and cannot be parsed "
-                f"as a checksum manifest: {exc}"
-            ) from exc
-        parsed = parse_sha256sum_output(text)
-        if name not in parsed:
-            raise ChecksumError(
-                f"{checksum_file} contains no digest for {name}"
-            )
-        verify_local_checksum(local_path, parsed[name])
-        digests[name] = parsed[name]
-        digests[checksum_name(name)] = sha256_file(checksum_file)
+        finals.extend((name, checksum_name(name)))
+    with _held_temp_downloads(
+        local_paths, finals, downloaded_fds, close_on_exit=False
+    ) as handles:
+        for name in archive_names:
+            local_path = local_paths[name]
+            checksum_file = local_paths[checksum_name(name)]
+            # The manifest is decoded from the held descriptor's bytes:
+            # the same inode publication will trust, never a re-opened
+            # path that may have been swapped since verification began.
+            manifest_handle = handles[checksum_name(name)]
+            manifest_handle.seek(0)
+            try:
+                text = manifest_handle.read().decode("utf-8")
+            except UnicodeDecodeError as exc:
+                # An undecodable manifest is a checksum failure, not a
+                # crash: raising ChecksumError keeps the remote staging
+                # dir for retry and reports the problem through the
+                # normal error path.
+                raise ChecksumError(
+                    f"{checksum_file} is not valid UTF-8 and cannot be "
+                    f"parsed as a checksum manifest: {exc}"
+                ) from exc
+            parsed = parse_sha256sum_output(text)
+            # The manifest must contain exactly one entry naming exactly
+            # the requested archive, matching verify_remote_checksums():
+            # a manifest with the valid entry plus arbitrary extras would
+            # be accepted here and published as a complete backup set,
+            # only to be rejected later by restore's remote verifier.
+            # Reject any path component in ANY entry name before anything
+            # else: a manifest may only reference plain filenames, never
+            # paths (no traversal).
+            for entry_name in parsed:
+                if (
+                    "/" in entry_name
+                    or "\\" in entry_name
+                    or posixpath.basename(entry_name) != entry_name
+                    or entry_name in (".", "..")
+                ):
+                    raise ChecksumError(
+                        f"{checksum_file} names a path outside the "
+                        f"staging directory: {entry_name}"
+                    )
+            if len(parsed) != 1:
+                raise ChecksumError(
+                    f"{checksum_file} must contain exactly one entry, "
+                    f"found {len(parsed)}"
+                )
+            if name not in parsed:
+                raise ChecksumError(
+                    f"{checksum_file} contains no digest for {name}"
+                )
+            archive_handle = handles[name]
+            archive_handle.seek(0)
+            actual = _sha256_handle(archive_handle)
+            if actual.lower() != parsed[name].lower():
+                raise ChecksumError(
+                    f"Checksum mismatch for {local_path}: expected "
+                    f"{parsed[name]}, got {actual}"
+                )
+            digests[name] = parsed[name]
+            manifest_handle.seek(0)
+            digests[checksum_name(name)] = _sha256_handle(manifest_handle)
     return digests
 
 
@@ -866,23 +1078,37 @@ def run_backup(
         # instead of a valid older one.
         published = False
         created_paths: list[Path] = []
+        downloaded_fds: dict[Path, int] = {}
         try:
             with client.open_sftp() as sftp:
-                temp_paths = download_artifacts(
+                temp_paths, downloaded_fds = download_artifacts(
                     sftp, staging, archive_names, backup_dir,
                     created_paths=created_paths,
                 )
-            digests = verify_downloads(temp_paths, archive_names)
+            digests = verify_downloads(
+                temp_paths, archive_names, downloaded_fds
+            )
             local_paths = publish_downloads(
-                temp_paths, archive_names, backup_dir, digests
+                temp_paths, archive_names, backup_dir, digests,
+                downloaded_fds,
             )
             published = True
         finally:
             if not published:
-                # Remove every file this run downloaded, whether the
-                # failure was a checksum mismatch or a dropped transfer.
-                # The remote staging decision is made by the handlers
-                # below (kept for a checksum retry, removed otherwise).
+                # Close the download descriptors first (a failure before
+                # or inside verify/publish leaves them open; closing is
+                # idempotent). Then remove every file this run
+                # downloaded, whether the failure was a checksum
+                # mismatch or a dropped transfer. The remote staging
+                # decision is made by the handlers below (kept for a
+                # checksum retry, removed otherwise). Closing first lets
+                # _discard_temp_downloads() unlink the .part files even
+                # on platforms that refuse to unlink a file held open.
+                for fd in downloaded_fds.values():
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
                 _discard_temp_downloads(created_paths)
         print("Local checksum verification passed.")
     except ChecksumError:

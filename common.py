@@ -379,7 +379,9 @@ def run_remote_cmd_checked(
 
 def sftp_download(
     sftp: paramiko.SFTPClient, remote_path: str, local_path: str | Path,
-    *, created_paths: list[Path] | None = None,
+    *,
+    created_paths: list[Path] | None = None,
+    downloaded_fds: dict[Path, int] | None = None,
 ) -> Path:
     """
     Download a file from the remote host via SFTP into local_path.
@@ -393,12 +395,27 @@ def sftp_download(
     the call raises instead, so an attacker-planted link cannot redirect
     the download.
 
+    On success the caller is handed the very descriptor this call wrote
+    through, opened read/write on the inode it created, so verification
+    and publication can hash and link that inode without ever re-opening
+    the pathname. A writer who can modify BACKUP_DIR cannot substitute a
+    self-consistent (archive, manifest) pair after the transfer: the
+    replacement is a different inode, and hashing/linking the held
+    descriptor (not the path) keeps the checksum and the publication
+    bound to the downloaded bytes. The caller owns the returned
+    descriptor and must close it (the descriptor is also recorded in
+    downloaded_fds for cleanup).
+
     Args:
         sftp: An active SFTP client connected to the remote host.
         remote_path: The path to the file on the remote host.
         local_path: The local path where the file should be saved.
         created_paths: If supplied, records the destination immediately after
             exclusive creation, including when the subsequent transfer fails.
+        downloaded_fds: If supplied, records the open descriptor of the
+            destination after a successful transfer, keyed by the local
+            Path. The caller takes ownership of the descriptor and must
+            close it.
 
     Returns:
         The local path to the downloaded file as a Path object.
@@ -409,10 +426,12 @@ def sftp_download(
     """
     local = Path(local_path)
     local.parent.mkdir(parents=True, exist_ok=True)
-    # O_CREAT | O_EXCL | O_WRONLY, 0600: fails if anything (including a
+    # O_CREAT | O_EXCL | O_RDWR, 0600: fails if anything (including a
     # symlink, which os.open with O_EXCL never follows to its target)
-    # already exists at the path, then streams into a private file.
-    fd = os.open(local, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    # already exists at the path, then streams into a private file. The
+    # descriptor is opened read/write so the same inode can be hashed
+    # and linked later without re-opening the (possibly swapped) path.
+    fd = os.open(local, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
     try:
         if created_paths is not None:
             created_paths.append(local)
@@ -420,17 +439,21 @@ def sftp_download(
         try:
             sftp.getfo(remote_path, stream)
         finally:
-            # Flush and close the wrapper WITHOUT closing the raw fd;
-            # the fd is closed in the outer finally. Closing the wrapper
-            # alone leaves the fd dangling until GC, which pytest
-            # reports as an unraisable exception.
+            # Flush and detach the wrapper WITHOUT closing the raw fd;
+            # closing the wrapper alone would leave the fd dangling
+            # until GC, which pytest reports as an unraisable exception.
             stream.flush()
-            os.close(fd)
-            fd = -1  # Marker: already closed.
             stream.detach()
-    finally:
-        if fd >= 0:
+    except BaseException:
+        try:
             os.close(fd)
+        except OSError:
+            pass
+        raise
+    if downloaded_fds is not None:
+        downloaded_fds[local] = fd
+    else:
+        os.close(fd)
     return local
 
 

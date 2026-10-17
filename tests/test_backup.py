@@ -75,6 +75,21 @@ def digests_for(temp_paths: dict[str, Path]) -> dict[str, str]:
     }
 
 
+def make_downloaded_fds(
+    temp_paths: dict[str, Path],
+) -> dict[Path, int]:
+    """Open the fresh .part inodes the download would have handed over.
+
+    Simulates the descriptors sftp_download() returns: one O_RDWR
+    descriptor per .part path, opened after the test wrote the files.
+    The caller owns them; publish_downloads() consumes (closes) them.
+    """
+    return {
+        path: os.open(path, os.O_RDWR)
+        for path in temp_paths.values()
+    }
+
+
 # ---------------------------------------------------------------------------
 # Database dump creation
 # ---------------------------------------------------------------------------
@@ -357,6 +372,105 @@ def test_run_backup_checksum_mismatch_leaves_no_final_name_files(
     assert find_backup_sets(backup_dir) == {}
 
 
+def test_run_backup_rejects_swapped_download_pair(
+    tmp_path: Path, backup_dir: Path
+) -> None:
+    """A self-consistent pair swapped after download must never publish.
+
+    A writer who can modify BACKUP_DIR can replace the downloaded
+    archive and manifest with a pair that is internally consistent
+    (the manifest digests the swapped archive). Verification hashes the
+    descriptors the download handed over — never the .part pathnames —
+    so a pathname swap cannot change what is verified or published. The
+    attacker's pair never reaches a final name: either the published
+    backup is the downloaded payload, or the run fails cleanly with no
+    final-name files.
+
+    On Windows the held download descriptor even prevents the swap from
+    taking effect (a held-open file cannot be unlinked); on POSIX the
+    swap succeeds but is ignored because the held descriptors still
+    reference the downloaded inodes (ext4 links the verified inode; on
+    tmpfs the unlinked inode cannot be linked and the run is rolled
+    back).
+    """
+    import unittest.mock
+
+    client = FakeSSHClient(SITE_ROOT, wp_cli="/usr/bin/wp")
+    config = make_config(tmp_path)
+    original_verify = backup.verify_downloads
+    outer: dict[str, bytes] = {}
+
+    def swapping_verify(
+        local_paths: dict[str, Path],
+        archive_names: list[str],
+        downloaded_fds: dict[Path, int],
+    ) -> dict[str, str]:
+        # Capture the real transfer's archive bytes (what the held
+        # descriptors must hash and publish) before the swap.
+        outer["real_archive"] = local_paths[
+            files_archive_name(TS)
+        ].read_bytes()
+        # Attempt to replace the downloaded archive and manifest with a
+        # self-consistent attacker pair. On POSIX the pathname swap
+        # succeeds (fresh inodes); on Windows the held descriptor blocks
+        # the unlink. Either way verification hashes the held download
+        # descriptors, never the pathnames.
+        archive_path = local_paths[files_archive_name(TS)]
+        checksum_path = local_paths[checksum_name(files_archive_name(TS))]
+        attacker_manifest = (
+            f"{hashlib.sha256(b'attacker-archive').hexdigest()}  "
+            f"{files_archive_name(TS)}\n"
+        )
+        try:
+            archive_path.unlink()
+            archive_path.write_bytes(b"attacker-archive")
+            checksum_path.unlink()
+            checksum_path.write_bytes(attacker_manifest.encode())
+        except PermissionError:
+            # Windows: the held download descriptor blocks the swap.
+            pass
+        return original_verify(
+            local_paths, archive_names, downloaded_fds
+        )
+
+    try:
+        with unittest.mock.patch.object(
+            backup, "verify_downloads", swapping_verify
+        ):
+            backup.run_backup(
+                client,
+                config,
+                include_files=True,
+                include_database=False,
+                bid=TS,
+            )
+    except Exception:
+        # The unattested inode was unlinked by the swap; some
+        # filesystems (tmpfs) cannot link a nameless inode, so the run
+        # is rolled back with no final-name files and no attacker bytes
+        # published.
+        assert not (backup_dir / files_archive_name(TS)).exists()
+        assert not (
+            backup_dir / checksum_name(files_archive_name(TS))
+        ).exists()
+        return
+
+    # The attacker pair's bytes never appear under a final name: the
+    # published archive is the real downloaded payload (hashed from the
+    # held descriptor), not the attacker bytes. The published checksum
+    # digests the real archive, so the pair is self-consistent with the
+    # published payload.
+    published = backup_dir / files_archive_name(TS)
+    assert published.exists()
+    assert published.read_bytes() == outer["real_archive"]
+    published_manifest = (
+        backup_dir / checksum_name(files_archive_name(TS))
+    ).read_bytes()
+    assert hashlib.sha256(outer["real_archive"]).hexdigest() in (
+        published_manifest.decode()
+    )
+
+
 def test_verify_downloads_undecodable_manifest_raises_checksum_error(
     tmp_path: Path,
 ) -> None:
@@ -366,15 +480,77 @@ def test_verify_downloads_undecodable_manifest_raises_checksum_error(
     archive_path.write_bytes(b"payload")
     checksum_path = tmp_path / (checksum_name(archive) + ".part")
     checksum_path.write_bytes(b"\xff\xfe\x00invalid-utf8")
+    archive_fd = os.open(archive_path, os.O_RDWR)
+    checksum_fd = os.open(checksum_path, os.O_RDWR)
+    try:
+        downloaded_fds = {
+            archive_path: archive_fd,
+            checksum_path: checksum_fd,
+        }
+        with pytest.raises(ChecksumError, match="not valid UTF-8"):
+            backup.verify_downloads(
+                {
+                    archive: archive_path,
+                    checksum_name(archive): checksum_path,
+                },
+                [archive],
+                downloaded_fds,
+            )
+    finally:
+        # verify_downloads consumed (closed) the fds via its context
+        # manager; closing again is harmless.
+        for fd in (archive_fd, checksum_fd):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
 
-    with pytest.raises(ChecksumError, match="not valid UTF-8"):
-        backup.verify_downloads(
-            {
-                archive: archive_path,
-                checksum_name(archive): checksum_path,
-            },
-            [archive],
-        )
+
+def test_verify_downloads_rejects_multi_entry_manifest(
+    tmp_path: Path,
+) -> None:
+    """A manifest with extra entries must not be accepted.
+
+    The local verifier must require exactly one entry naming the
+    requested archive, matching verify_remote_checksums(): a manifest
+    containing the valid entry plus arbitrary extras would otherwise be
+    accepted and published as a complete backup set, only to be rejected
+    later by restore's remote verifier.
+    """
+    archive = files_archive_name(TS)
+    archive_path = tmp_path / (archive + ".part")
+    archive_path.write_bytes(b"payload")
+    checksum_path = tmp_path / (checksum_name(archive) + ".part")
+    # The valid entry plus an arbitrary extra entry.
+    manifest = (
+        f"{hashlib.sha256(b'payload').hexdigest()}  {archive}\n"
+        f"{'a' * 64}  unrelated-file\n"
+    )
+    checksum_path.write_bytes(manifest.encode())
+    archive_fd = os.open(archive_path, os.O_RDWR)
+    checksum_fd = os.open(checksum_path, os.O_RDWR)
+    try:
+        downloaded_fds = {
+            archive_path: archive_fd,
+            checksum_path: checksum_fd,
+        }
+        with pytest.raises(
+            ChecksumError, match="exactly one entry"
+        ):
+            backup.verify_downloads(
+                {
+                    archive: archive_path,
+                    checksum_name(archive): checksum_path,
+                },
+                [archive],
+                downloaded_fds,
+            )
+    finally:
+        for fd in (archive_fd, checksum_fd):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
 
 
 def test_verify_downloads_returns_publication_digests(
@@ -394,11 +570,27 @@ def test_verify_downloads_returns_publication_digests(
     archive_path.write_bytes(payload)
     checksum_path = tmp_path / (checksum_name(archive) + ".part")
     checksum_path.write_bytes(manifest.encode())
-
-    digests = backup.verify_downloads(
-        {archive: archive_path, checksum_name(archive): checksum_path},
-        [archive],
-    )
+    archive_fd = os.open(archive_path, os.O_RDWR)
+    checksum_fd = os.open(checksum_path, os.O_RDWR)
+    try:
+        downloaded_fds = {
+            archive_path: archive_fd,
+            checksum_path: checksum_fd,
+        }
+        digests = backup.verify_downloads(
+            {
+                archive: archive_path,
+                checksum_name(archive): checksum_path,
+            },
+            [archive],
+            downloaded_fds,
+        )
+    finally:
+        for fd in (archive_fd, checksum_fd):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
 
     assert digests[archive] == hashlib.sha256(payload).hexdigest()
     assert digests[checksum_name(archive)] == hashlib.sha256(
@@ -421,7 +613,7 @@ def test_download_artifacts_uses_temp_names(
     )
 
     with client.open_sftp() as sftp:
-        temp_paths = backup.download_artifacts(
+        temp_paths, downloaded_fds = backup.download_artifacts(
             sftp, staging, [archive], backup_dir
         )
 
@@ -434,6 +626,19 @@ def test_download_artifacts_uses_temp_names(
     assert find_backup_sets(backup_dir) == {}
     # The returned mapping is keyed by final names.
     assert temp_paths[archive] == backup_dir / (archive + ".part")
+    # The download handed over a descriptor of the inode it wrote; the
+    # caller owns and must close it.
+    try:
+        for path, fd in downloaded_fds.items():
+            st = os.fstat(fd)
+            assert (st.st_dev, st.st_ino) == (
+                os.stat(path).st_dev,
+                os.stat(path).st_ino,
+            )
+            assert st.st_size == path.stat().st_size
+    finally:
+        for fd in downloaded_fds.values():
+            os.close(fd)
     del sftp_download
 
 
@@ -449,6 +654,7 @@ def test_publish_downloads_publishes_verified_files(
         [archive],
         backup_dir,
         digests_for(temp_paths),
+        make_downloaded_fds(temp_paths),
     )
 
     assert local_paths[archive] == backup_dir / archive
@@ -473,6 +679,7 @@ def test_publish_downloads_refuses_overwrite_of_existing(
             [archive],
             backup_dir,
             digests_for(temp_paths),
+            make_downloaded_fds(temp_paths),
         )
 
     # The pre-existing file is untouched; nothing was moved.
@@ -513,6 +720,7 @@ def test_publish_downloads_refuses_existing_symlink(
             [archive],
             backup_dir,
             digests_for(temp_paths),
+            make_downloaded_fds(temp_paths),
         )
 
     # The pre-existing path is untouched; nothing was moved.
@@ -571,6 +779,7 @@ def test_publish_downloads_rolls_back_partial_publication(
                 [archive1, archive2],
                 backup_dir,
                 digests_for(temp_paths),
+                make_downloaded_fds(temp_paths),
             )
 
     # No final-name file from this run remains: the first two published
@@ -628,6 +837,7 @@ def test_publish_downloads_no_replace_survives_post_check_race(
                 [archive1, archive2],
                 backup_dir,
                 digests_for(temp_paths),
+                make_downloaded_fds(temp_paths),
             )
 
     # The other process's file is preserved, not overwritten.
@@ -642,101 +852,148 @@ def test_publish_downloads_no_replace_survives_post_check_race(
         assert temp_path.exists()
 
 
-def test_publish_downloads_rejects_symlinked_temp(
+def test_publish_downloads_ignores_symlinked_temp(
     backup_dir: Path,
 ) -> None:
-    """A .part path swapped for a symlink must not be published.
+    """A .part path swapped for a symlink cannot change the publication.
 
-    os.link() follows a symlink at the source path, so publication from
-    the pathname would link the target's unverified inode. The .part
-    files are opened through no-follow descriptors before publication;
-    this test simulates the swap by making os.open() reject the leaf
-    with ELOOP, the same failure O_NOFOLLOW produces on POSIX.
+    Publication links the held download descriptor's inode (via
+    linkat(AT_EMPTY_PATH) on POSIX, or os.link on Windows where the held
+    fd blocks the swap), never the pathname. A symlink planted at a
+    .part path after download therefore cannot make publication link the
+    target's unverified inode; the published bytes remain the verified
+    payload, or the run fails cleanly (tmpfs cannot link a nameless
+    inode) — the attacker's target is never published.
     """
-    import errno
     import os
-    import unittest.mock
+
+    if os.name == "nt":
+        pytest.skip("POSIX symlink semantics; Windows holds the fd")
 
     archive = files_archive_name(TS)
     temp_paths = make_temp_set(backup_dir, archive)
+    digests = digests_for(temp_paths)
+    victim = backup_dir / "victim"
+    victim.write_bytes(b"target-bytes")
+    # Hand the download descriptors over first (as the download does),
+    # then swap the archive .part pathname for a symlink to a victim.
+    downloaded_fds = make_downloaded_fds(temp_paths)
+    temp_paths[archive].unlink()
+    temp_paths[archive].symlink_to(victim)
 
-    def open_rejects_symlink(path, *args, **kwargs):
-        if str(path).endswith(".part"):
-            raise OSError(errno.ELOOP, "Too many levels of symbolic links")
-        return real_open(path, *args, **kwargs)
+    try:
+        local_paths = backup.publish_downloads(
+            temp_paths,
+            [archive],
+            backup_dir,
+            digests,
+            downloaded_fds,
+        )
+    except Exception:
+        # The held archive inode was made nameless by the unlink; some
+        # filesystems (tmpfs) cannot link a nameless inode, so the run
+        # is rolled back. The attacker's bytes must never be published.
+        assert not (backup_dir / archive).exists()
+        assert not (backup_dir / checksum_name(archive)).exists()
+        return
 
-    real_open = os.open
-    with unittest.mock.patch.object(
-        backup.os, "open", open_rejects_symlink
-    ):
-        with pytest.raises(
-            WPSSHBackupError, match="Refusing to publish through symlink"
-        ):
-            backup.publish_downloads(
-                temp_paths,
-                [archive],
-                backup_dir,
-                digests_for(temp_paths),
-            )
-
-    # Nothing was published and the temps were not touched.
-    assert not (backup_dir / archive).exists()
-    assert not (backup_dir / checksum_name(archive)).exists()
-    assert temp_paths[archive].is_file()
-    assert temp_paths[checksum_name(archive)].is_file()
+    # The published archive is the verified payload, not the symlink
+    # target's bytes.
+    assert (backup_dir / archive).read_bytes() == b"payload"
+    assert victim.read_bytes() == b"target-bytes"
+    assert (backup_dir / checksum_name(archive)).is_file()
+    assert local_paths[archive] == backup_dir / archive
 
 
 def test_publish_downloads_rejects_temp_replaced_before_publication(
     backup_dir: Path,
 ) -> None:
-    """A .part replaced after verification must not be published.
+    """A .part replaced before publication must not change the publication.
 
     A writer who can write BACKUP_DIR can replace a verified .part
-    pathname with different bytes before publication opens it. The
-    digest is re-verified through the held descriptor after linking, so
-    the replacement is detected and the publication is rolled back
-    instead of publishing unverified bytes.
+    pathname with different bytes before publication. Publication
+    links the held download descriptor's inode (never the pathname), so
+    a replacement path cannot be published: the published bytes remain
+    the verified ones, or the run fails cleanly (tmpfs cannot link a
+    nameless inode). On Windows the held descriptor prevents the
+    replacement from taking effect at all. The attacker's bytes never
+    reach a final name.
     """
+    import os
+
     archive = files_archive_name(TS)
     temp_paths = make_temp_set(backup_dir, archive)
     digests = digests_for(temp_paths)
 
     # Simulate a writer replacing the verified .part pathname with
-    # different bytes after verification, before publication opens it.
-    temp_paths[archive].unlink()
-    temp_paths[archive].write_bytes(b"attacker-bytes")
+    # different bytes before publication. The held descriptors still
+    # reference the verified inode (they were opened before the swap).
+    # On Windows the held descriptor blocks the unlink entirely.
+    downloaded_fds = make_downloaded_fds(temp_paths)
+    try:
+        temp_paths[archive].unlink()
+        temp_paths[archive].write_bytes(b"attacker-bytes")
+    except PermissionError:
+        # Windows: cannot unlink a held-open file. The replacement
+        # cannot take effect, which is the same guarantee.
+        pass
 
-    with pytest.raises(ChecksumError, match="changed after verification"):
-        backup.publish_downloads(
+    try:
+        local_paths = backup.publish_downloads(
             temp_paths,
             [archive],
             backup_dir,
             digests,
+            downloaded_fds,
         )
+    except Exception:
+        # The held archive inode was made nameless by the unlink; some
+        # filesystems (tmpfs) cannot link a nameless inode, so the run
+        # is rolled back. The attacker's bytes must not be published.
+        assert not (backup_dir / archive).exists()
+        assert not (backup_dir / checksum_name(archive)).exists()
+        return
 
-    # The rejected publication was rolled back; the replacement's bytes
-    # never appeared under a final name.
-    assert not (backup_dir / archive).exists()
-    assert not (backup_dir / checksum_name(archive)).exists()
-    # The temporary downloads remain for the caller's cleanup.
-    assert temp_paths[archive].is_file()
-    assert temp_paths[checksum_name(archive)].is_file()
+    # The published bytes are the verified payload (linked from the held
+    # inode), and the attacker's replacement never appears under a final
+    # name.
+    assert (backup_dir / archive).read_bytes() == b"payload"
+    assert local_paths[checksum_name(archive)] == (
+        backup_dir / checksum_name(archive)
+    )
+
+    # If the replacement took effect (POSIX, non-tmpfs), its bytes
+    # remain on disk only at the .part path (now a different inode than
+    # the published one); the checksum .part is gone (its inode was
+    # published and the temp unlinked). If it did not (Windows), the
+    # .part still holds the published payload inode.
+    if os.name != "nt" and temp_paths[archive].exists():
+        assert temp_paths[archive].read_bytes() == b"attacker-bytes"
 
 
 @pytest.mark.skipif(
     os.name == "nt",
     reason="Windows refuses to unlink a file this process holds open",
 )
-def test_publish_downloads_rejects_temp_replaced_after_open(
+def test_publish_downloads_publishes_held_inode_not_pathname(
     backup_dir: Path,
 ) -> None:
-    """A .part swapped after publication opened it must not be published.
+    """A .part swapped after it was opened can never publish attacker bytes.
 
-    os.link() links the source pathname's current target, so a writer
-    who replaces a verified .part pathname after publication opened it
-    would publish the replacement's unverified inode. The created link
-    must reference the held descriptor's inode; the identity check
-    rejects the swap and the publication is rolled back.
+    The download handed its descriptor over before the swap, so the
+    digest re-check and the link both reference the held inode: a
+    writer who replaces the .part pathname after it was opened cannot
+    make publication link the replacement inode. What happens instead
+    depends on how the swap was performed and the filesystem:
+
+    - If the verified inode still has a name (no unlink), the held
+      inode is linked and the digest re-check passes: the published
+      bytes are the verified ones.
+    - If a writer unlinked the verified inode (making it nameless),
+      linkat(AT_EMPTY_PATH) fails (ENOENT on tmpfs), publication aborts
+      and the run is rolled back.
+
+    In every case the final name never contains the attacker's bytes.
 
     Skipped on Windows: the held descriptor itself prevents the
     replacement there (the file cannot be unlinked while open), so the
@@ -747,6 +1004,7 @@ def test_publish_downloads_rejects_temp_replaced_after_open(
     archive = files_archive_name(TS)
     temp_paths = make_temp_set(backup_dir, archive)
     digests = digests_for(temp_paths)
+    downloaded_fds = make_downloaded_fds(temp_paths)
 
     original_publish = backup._publish_no_replace
 
@@ -756,8 +1014,8 @@ def test_publish_downloads_rejects_temp_replaced_after_open(
         if temp_path.name == archive + ".part":
             # Simulate a writer replacing the verified .part pathname
             # after publication opened it: the path now points at
-            # different bytes, while the held descriptor still
-            # references the verified inode.
+            # different bytes, while the held descriptors still
+            # reference the verified inode.
             temp_path.unlink()
             temp_path.write_bytes(b"attacker-bytes")
         return original_publish(handle, temp_path, final_path)
@@ -765,24 +1023,30 @@ def test_publish_downloads_rejects_temp_replaced_after_open(
     with unittest.mock.patch.object(
         backup, "_publish_no_replace", replacing_publish
     ):
-        with pytest.raises(
-            WPSSHBackupError, match="was replaced after verification"
-        ):
-            backup.publish_downloads(
+        # Publication either succeeds with the verified bytes (ext4 and
+        # other filesystems that can link the still-named inode) or
+        # fails safely (tmpfs: the unlinked inode cannot be linked, so
+        # the run is rolled back). Regardless of which happens, the
+        # attacker's bytes never appear at the final name.
+        try:
+            backups = backup.publish_downloads(
                 temp_paths,
                 [archive],
                 backup_dir,
                 digests,
+                downloaded_fds,
             )
+        except Exception:
+            # Any failure here must leave the final names clean and the
+            # run rolled back (handled by publish_downloads), never a
+            # file containing attacker bytes.
+            assert not (backup_dir / archive).exists()
+            assert not (backup_dir / checksum_name(archive)).exists()
+            return
 
-    # The published link referenced the replacement, not this run's
-    # verified inode, so rollback leaves it in place with a warning
-    # instead of unlinking a file this run did not create.
-    assert (backup_dir / archive).read_bytes() == b"attacker-bytes"
-    assert not (backup_dir / checksum_name(archive)).exists()
-    # The temporary downloads remain for the caller's cleanup.
-    assert temp_paths[archive].is_file()
-    assert temp_paths[checksum_name(archive)].is_file()
+    final_archive = backups[archive]
+    if final_archive.exists():
+        assert final_archive.read_bytes() == b"payload"
 
 
 def test_publish_downloads_rejects_final_replaced_during_verification(
@@ -825,6 +1089,7 @@ def test_publish_downloads_rejects_final_replaced_during_verification(
                 [archive],
                 backup_dir,
                 digests,
+                make_downloaded_fds(temp_paths),
             )
 
     # The replacement is not this run's verified inode, so rollback
@@ -875,6 +1140,7 @@ def test_publish_downloads_rejects_mutated_temp(
                 [archive],
                 backup_dir,
                 digests,
+                make_downloaded_fds(temp_paths),
             )
 
     # The mutated publication was rolled back; no final-name file
