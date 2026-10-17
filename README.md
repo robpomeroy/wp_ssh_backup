@@ -179,9 +179,14 @@ often but you rarely upload new files.
    is confirmed once more. On Linux the hard link is created from the
    held descriptor itself (`linkat` with `AT_EMPTY_PATH`); on macOS/BSD
    and on filesystems or kernels that reject that flag, publication
-   falls back to a no-replace rename of the verified file, which is
-   re-opened no-follow and re-identified so the same verified inode is
-   published. Each checksum manifest must contain exactly
+      falls back to a hard link from the verified `.part` pathname (which
+      is atomic and refuses to replace an existing destination), and on
+      Windows to a no-replace rename of the verified file; in both
+      fallbacks the published file is re-opened no-follow and
+      re-identified so the same verified inode is published. The fallback
+      cleanup removes a final entry only while it still references the
+      inode this run published, so a replacement installed by another
+      process is never deleted. Each checksum manifest must contain exactly
       one entry naming the archive it accompanies (matching the restore
       verifier), so a manifest with extra entries is refused rather than
       published as a complete set that restore would later reject.

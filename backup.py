@@ -241,34 +241,13 @@ def _discard_temp_downloads(
     inode: a concurrent writer who replaced the .part pathname (after a
     download or a transfer failure) planted a different inode, and
     removing it would delete another run's file. A replaced path is left
-    in place with a warning.
+    in place with a warning. The check and the unlink are atomic: the
+    path is first renamed to a unique quarantine name only this process
+    knows, so a concurrent writer cannot swap the pathname between the
+    identity check and the unlink (see _unlink_if_same_inode_atomic).
     """
     for path, identity in created_paths:
-        try:
-            st = os.lstat(path)
-        except FileNotFoundError:
-            # Already gone (e.g. published and unlinked); nothing to do.
-            continue
-        except OSError as exc:
-            print(
-                f"WARNING: could not check temporary download {path}: {exc}",
-                file=sys.stderr,
-            )
-            continue
-        if (st.st_dev, st.st_ino) != identity:
-            print(
-                f"WARNING: temporary download {path} was replaced by "
-                "another file; leaving it in place",
-                file=sys.stderr,
-            )
-            continue
-        try:
-            path.unlink(missing_ok=True)
-        except OSError as exc:
-            print(
-                f"WARNING: could not remove temporary download {path}: {exc}",
-                file=sys.stderr,
-            )
+        _unlink_if_same_inode_atomic(path, identity)
 
 
 def download_artifacts(
@@ -572,15 +551,16 @@ def _publish_no_replace(
     is Linux-specific: on macOS/BSD and on filesystems or kernels that
     reject the flag (EINVAL, ENOTSUP, EOPNOTSUPP, ENOSYS, or a
     permission error from a filesystem that refuses it), publication
-    falls back to a no-replace rename of the held inode's pathname
-    (_publish_by_rename), which re-opens the renamed file no-follow and
-    re-identifies it so the fallback publishes the same inode that was
-    verified. On Windows, os.link() by pathname is used: the held
-    descriptor (the download's own O_RDWR fd on the inode it wrote)
-    prevents the .part pathname from being unlinked or replaced while it
-    is held, so linking the pathname cannot publish a different inode
-    than the one verified; on volumes without hard-link support this
-    also falls back to the no-replace rename.
+    falls back to _publish_by_rename, which on POSIX creates the final
+    entry with an atomic no-replace hard link (os.rename would silently
+    replace a destination that appeared after the pre-check) and
+    re-opens it no-follow and re-identifies it so the fallback publishes
+    the same inode that was verified. On Windows, os.link() by pathname
+    is used: the held descriptor (the download's own O_RDWR fd on the
+    inode it wrote) prevents the .part pathname from being unlinked or
+    replaced while it is held, so linking the pathname cannot publish a
+    different inode than the one verified; on volumes without hard-link
+    support this also falls back to the no-replace rename.
 
     Returns:
         The descriptor-holding file object the published inode must be
@@ -643,32 +623,223 @@ def _publish_no_replace(
     return handle
 
 
+_quarantine_counter = 0
+
+
+def _quarantine_name(path: Path) -> Path:
+    """A unique same-directory name only this process knows.
+
+    The name is generated in the same directory as path so the rename
+    below is atomic (same filesystem), and it is never guessable by a
+    concurrent writer: only the cleaner knows it, so a later
+    lstat/compare/unlink on the quarantine name cannot be raced by a
+    writer swapping the original pathname.
+    """
+    global _quarantine_counter
+    _quarantine_counter += 1
+    return path.with_name(
+        f".{path.name}.quarantine-{os.getpid()}-{_quarantine_counter}"
+    )
+
+
+def _unlink_if_same_inode_atomic(
+    path: Path,
+    identity: tuple[int, int] | None,
+    *,
+    warn: bool = True,
+    what: str = "temporary download",
+    check_error_message: str = "could not check {what} {path}: {exc}",
+    remove_error_message: str = "could not remove {what} {path}: {exc}",
+    replaced_message: str = (
+        "{what} {path} was replaced by another file; leaving it in place"
+    ),
+) -> None:
+    """Remove path only while it still references identity; else leave it.
+
+    The check-then-unlink sequence is made atomic by first renaming the
+    path to a unique quarantine name only this process knows: the
+    rename claims whatever is currently at path in one atomic step, so
+    a concurrent writer can no longer swap the pathname between the
+    identity check and the unlink. The quarantined inode is then
+    compared against identity and unlinked only on a match; a
+    replacement (a different inode) is renamed back to path
+    (best-effort) and left in place with a warning. If path was already
+    gone, the rename fails with FileNotFoundError and nothing is done.
+
+    Args:
+        path: The pathname to remove while it still references identity.
+        identity: The (st_dev, st_ino) of the inode this run created;
+            None means "no identity recorded" and nothing is removed.
+        warn: Whether to print warnings to stderr. The silent callers
+            (the rename fallback's failure cleanup) pass False.
+        what: The kind of file named in warnings, e.g. "temporary
+            download" or "published backup file".
+        check_error_message: Warning template when the path cannot be
+            claimed; may use {what}, {path} and {exc}.
+        remove_error_message: Warning template when the owned inode
+            cannot be unlinked; may use {what}, {path} and {exc}.
+        replaced_message: Warning template for a replaced path; may use
+            {what} and {path}.
+    """
+    if identity is None:
+        return
+    quarantine = _quarantine_name(path)
+    try:
+        os.rename(path, quarantine)
+    except FileNotFoundError:
+        # Already gone (e.g. published and unlinked); nothing to do.
+        return
+    except OSError as exc:
+        if warn:
+            print(
+                "WARNING: "
+                + check_error_message.format(what=what, path=path, exc=exc),
+                file=sys.stderr,
+            )
+        return
+    try:
+        st = os.lstat(quarantine)
+    except OSError:
+        # The quarantine name is only known to this process, so a
+        # missing entry means the rename did not take effect; nothing
+        # to do.
+        return
+    if (st.st_dev, st.st_ino) == identity:
+        try:
+            os.unlink(quarantine)
+        except OSError as exc:
+            # The owned inode could not be removed (e.g. a permission
+            # error or a platform that refuses to unlink an open file).
+            # Restore it to the original pathname so the file is not
+            # stranded under the quarantine name, then warn.
+            try:
+                os.rename(quarantine, path)
+            except OSError:
+                pass
+            if warn:
+                print(
+                    "WARNING: "
+                    + remove_error_message.format(
+                        what=what, path=path, exc=exc
+                    ),
+                    file=sys.stderr,
+                )
+        return
+    # The quarantined inode is not this run's: the path had been
+    # replaced before the rename. Restore the replacement (best-effort)
+    # and warn rather than deleting a file this run did not create.
+    try:
+        os.rename(quarantine, path)
+    except OSError as exc:
+        if warn:
+            print(
+                f"WARNING: could not restore replaced {what} {path}: {exc}",
+                file=sys.stderr,
+            )
+        return
+    if warn:
+        print(
+            "WARNING: " + replaced_message.format(what=what, path=path),
+            file=sys.stderr,
+        )
+
+
+def _unlink_if_same_inode(
+    path: Path, identity: tuple[int, int] | None
+) -> None:
+    """Remove path only while it still references identity; else leave it.
+
+    Used by the rename fallback's failure cleanup: the fallback created
+    the final entry, so it may remove it — but only while the entry
+    still references the inode it published. A replacement installed by
+    another process after the publication no longer references that
+    inode and is left in place rather than deleted. The check and the
+    unlink are atomic: the path is first renamed to a unique quarantine
+    name only this process knows, so a concurrent writer cannot swap
+    the pathname between the identity check and the unlink.
+    """
+    _unlink_if_same_inode_atomic(path, identity, warn=False)
+
+
 def _publish_by_rename(
     handle: BinaryIO,
     temp_path: Path,
     final_path: Path,
 ) -> BinaryIO:
-    """Rename fallback publishing an already-verified inode.
+    """Fallback publishing an already-verified inode without replacing.
 
     Used when the inode-link publication is unavailable: on Windows
     (which refuses to rename a file it holds open, so the held
     descriptor is closed first) and on POSIX platforms/filesystems
-    where linkat(AT_EMPTY_PATH) is not supported. os.rename() replaces
-    an existing destination on POSIX, so the caller must have already
-    confirmed final_path does not exist (the pre-check in
-    publish_downloads) — the no-replace guarantee is preserved by that
-    pre-check plus the re-identification below, which rejects a
-    destination that appeared or was replaced in between. The renamed
-    file is re-opened no-follow and re-identified; the caller verifies
-    the published inode through the returned handle. If the renamed
-    file cannot be re-opened and identified, it is removed so no
-    unverified file is left under a final name.
+    where linkat(AT_EMPTY_PATH) is not supported. The publication is
+    no-replace on both platforms: Windows os.rename() refuses to
+    replace an existing destination, and on POSIX a hard link is used
+    instead of os.rename() (which would silently replace a destination
+    that appeared after the caller's pre-check). The published file is
+    re-opened no-follow and re-identified; the caller verifies the
+    published inode through the returned handle. If the published file
+    cannot be re-opened and identified, it is removed — but only while
+    it still references the inode this run published; a replacement
+    installed by another process is left in place.
     """
+    if os.name == "posix":
+        # POSIX: os.rename() replaces an existing destination, so the
+        # no-replace guarantee is provided by a hard link instead,
+        # which fails with FileExistsError if the destination exists.
+        # The temporary pathname is kept in place; the caller's cleanup
+        # removes it later. The source pathname could have been swapped
+        # for a symlink after verification (os.link follows a symlink
+        # source on POSIX); the caller's identity re-check rejects that
+        # and rolls the final entry back.
+        try:
+            os.link(temp_path, final_path)
+        except FileExistsError as exc:
+            raise FileExistsError(
+                f"Refusing to overwrite existing backup file: {final_path}"
+            ) from exc
+        try:
+            linked = os.lstat(final_path)
+            linked_identity = (linked.st_dev, linked.st_ino)
+        except OSError:
+            linked_identity = None
+        try:
+            fd = _open_nofollow_regular(final_path)
+        except BaseException:
+            _unlink_if_same_inode(final_path, linked_identity)
+            raise
+        try:
+            _assert_nofollow_regular(fd, final_path)
+            new_handle = os.fdopen(fd, "rb")
+        except BaseException:
+            # fdopen took ownership only on success; after a failed
+            # assertion the descriptor is still ours to close.
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            _unlink_if_same_inode(final_path, linked_identity)
+            raise
+        return new_handle
+
+    # Windows: os.rename() refuses to replace an existing destination,
+    # so it is the no-replace primitive here. The descriptor is closed
+    # first because Windows refuses to rename an open file. The handle
+    # wraps the caller's descriptor without owning it (closefd=False),
+    # so the raw descriptor is closed once here and the wrapper is then
+    # marked closed; the caller's cleanup skips it via fileno().
     try:
-        os.close(handle.fileno())
+        fd = handle.fileno()
+    except ValueError:
+        fd = None
+    if fd is not None:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+    try:
+        handle.close()
     except OSError:
         pass
-    handle.close()
     try:
         os.rename(temp_path, final_path)
     except FileExistsError as exc:
@@ -676,12 +847,14 @@ def _publish_by_rename(
             f"Refusing to overwrite existing backup file: {final_path}"
         ) from exc
     try:
+        renamed = os.lstat(final_path)
+        renamed_identity = (renamed.st_dev, renamed.st_ino)
+    except OSError:
+        renamed_identity = None
+    try:
         fd = _open_nofollow_regular(final_path)
     except BaseException:
-        try:
-            final_path.unlink(missing_ok=True)
-        except OSError:
-            pass
+        _unlink_if_same_inode(final_path, renamed_identity)
         raise
     try:
         _assert_nofollow_regular(fd, final_path)
@@ -693,10 +866,7 @@ def _publish_by_rename(
             os.close(fd)
         except OSError:
             pass
-        try:
-            final_path.unlink(missing_ok=True)
-        except OSError:
-            pass
+        _unlink_if_same_inode(final_path, renamed_identity)
         raise
     return new_handle
 
@@ -852,6 +1022,19 @@ def publish_downloads(
                 f"Refusing to overwrite existing backup file: {final_path}"
             )
 
+    # Record the inode each temporary download was created with, so the
+    # success-path cleanup below removes a temp only while it still
+    # references that inode. A writer who replaced a .part pathname
+    # after the download planted a different inode; removing it would
+    # delete another run's file, so the replacement is left in place
+    # with a warning.
+    temp_identities: dict[Path, tuple[int, int]] = {}
+    for final in finals:
+        temp_path = temp_paths[final]
+        fd = downloaded_fds[temp_path]
+        fd_stat = os.fstat(fd)
+        temp_identities[temp_path] = (fd_stat.st_dev, fd_stat.st_ino)
+
     published: list[tuple[Path, tuple[int, int]]] = []
     try:
         with _held_temp_downloads(
@@ -885,47 +1068,39 @@ def publish_downloads(
         # _discard_temp_downloads() cleanup — which must never touch
         # final paths it did not create — discards them.
         for final_path, identity in reversed(published):
-            try:
-                final_stat = os.lstat(final_path)
-            except FileNotFoundError:
-                continue
-            except OSError as exc:
-                print(
-                    "WARNING: could not roll back published backup file "
-                    f"{final_path}: {exc}",
-                    file=sys.stderr,
-                )
-                continue
-            if (final_stat.st_dev, final_stat.st_ino) != identity:
-                print(
-                    "WARNING: published backup file "
-                    f"{final_path} was replaced during publication; "
-                    "leaving the replacement in place",
-                    file=sys.stderr,
-                )
-                continue
-            try:
-                final_path.unlink(missing_ok=True)
-            except OSError as exc:
-                print(
-                    "WARNING: could not roll back published backup file "
-                    f"{final_path}: {exc}",
-                    file=sys.stderr,
-                )
+            _unlink_if_same_inode_atomic(
+                final_path,
+                identity,
+                what="published backup file",
+                check_error_message=(
+                    "could not roll back {what} {path}: {exc}"
+                ),
+                remove_error_message=(
+                    "could not roll back {what} {path}: {exc}"
+                ),
+                replaced_message=(
+                    "{what} {path} was replaced during publication; "
+                    "leaving the replacement in place"
+                ),
+            )
         raise
     # Publication succeeded: remove the temporary downloads. A leftover
     # temp is only a warning — the finals are complete and verified, so
-    # publication is not undone over a cleanup failure.
+    # publication is not undone over a cleanup failure. A temp path is
+    # removed only while it still references the inode this run created
+    # (recorded above); a path replaced by another process is left in
+    # place with a warning rather than deleted.
     for final in finals:
         temp_path = temp_paths[final]
-        try:
-            temp_path.unlink(missing_ok=True)
-        except OSError as exc:
-            print(
-                f"WARNING: could not remove temporary download {temp_path}: "
-                f"{exc}",
-                file=sys.stderr,
-            )
+        identity = temp_identities[temp_path]
+        _unlink_if_same_inode_atomic(
+            temp_path,
+            identity,
+            replaced_message=(
+                "{what} {path} was replaced during publication; "
+                "leaving the replacement in place"
+            ),
+        )
     return {final: backup_dir / final for final in finals}
 
 

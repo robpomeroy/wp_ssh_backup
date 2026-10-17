@@ -665,6 +665,59 @@ def test_publish_downloads_publishes_verified_files(
     assert not temp_paths[checksum_name(archive)].exists()
 
 
+def test_publish_downloads_success_cleanup_leaves_replaced_temp(
+    backup_dir: Path,
+) -> None:
+    """Success-path temp cleanup removes only temps this run created.
+
+    Regression: after a successful publication the temporary .part
+    paths were unlinked unconditionally, so a writer who replaced a
+    .part path with a different inode during publication would have the
+    replacement deleted. The cleanup now removes a temp only while it
+    still references the inode this run created; a replaced path is
+    left in place with a warning.
+    """
+    if os.name == "nt":
+        pytest.skip(
+            "Windows publication links the .part pathname, so a temp "
+            "replaced before publication fails the identity check "
+            "instead of reaching the success-path cleanup"
+        )
+
+    archive = files_archive_name(TS)
+    temp_paths = make_temp_set(backup_dir, archive)
+    digests = digests_for(temp_paths)
+    downloaded_fds = make_downloaded_fds(temp_paths)
+
+    # Replace the archive .part path with a different inode before
+    # publication, as a concurrent writer would. The held descriptor
+    # still references the original inode, so publication succeeds; the
+    # success-path cleanup must leave the replacement alone. A scratch
+    # hard link keeps the original inode named so the publication can
+    # link it even on filesystems that refuse to link nameless inodes
+    # (tmpfs).
+    scratch = backup_dir / "scratch-link"
+    os.link(temp_paths[archive], scratch)
+    replacement = backup_dir / "replacement"
+    replacement.write_bytes(b"other")
+    os.replace(replacement, temp_paths[archive])
+
+    local_paths = backup.publish_downloads(
+        temp_paths,
+        [archive],
+        backup_dir,
+        digests,
+        downloaded_fds,
+    )
+
+    assert local_paths[archive] == backup_dir / archive
+    assert (backup_dir / archive).read_bytes() == b"payload"
+    # The replaced temp is left in place, not deleted.
+    assert temp_paths[archive].read_bytes() == b"other"
+    # The untouched checksum temp was removed by the cleanup.
+    assert not temp_paths[checksum_name(archive)].exists()
+
+
 @pytest.mark.parametrize(
     "errno_value",
     [
@@ -724,6 +777,116 @@ def test_publish_downloads_falls_back_when_linkat_unsupported(
     # The fallback must not have been reached through the Windows
     # os.link path: _link_inode_no_replace was the only thing patched.
     assert original_link is backup._link_inode_no_replace
+
+
+def test_publish_by_rename_publishes_verified_inode(
+    tmp_path: Path,
+) -> None:
+    """The rename fallback publishes the verified bytes and returns a
+    handle to the published inode, without a double-close error.
+
+    Regression: the fallback used to close the raw descriptor and then
+    close the fdopen wrapper, which on Python raises
+    OSError: [Errno 9] Bad file descriptor when the wrapper owns the
+    descriptor, aborting every POSIX linkat fallback before the
+    publication. The descriptor is now closed exactly once.
+    """
+    temp = tmp_path / "a.part"
+    final = tmp_path / "a"
+    temp.write_bytes(b"payload")
+    fd = os.open(temp, os.O_RDWR)
+    handle = os.fdopen(fd, "rb", closefd=False)
+    # The fallback closes the descriptor it consumed on Windows and
+    # leaves it open on POSIX (the caller's cleanup closes it). The
+    # test does not close it here: on Windows the descriptor number is
+    # reused by the re-opened final file, so closing it would close the
+    # returned handle's descriptor.
+    new_handle = backup._publish_by_rename(handle, temp, final)
+    try:
+        assert final.read_bytes() == b"payload"
+        assert new_handle.read() == b"payload"
+    finally:
+        new_handle.close()
+
+
+def test_publish_by_rename_refuses_existing_destination(
+    tmp_path: Path,
+) -> None:
+    """A destination that appears after the pre-check is never replaced.
+
+    Regression: on POSIX the fallback used os.rename(), which silently
+    replaces an existing destination, so a concurrent backup (or a
+    local writer) that created final_path after the pre-check would be
+    overwritten. The fallback now uses an atomic no-replace primitive
+    (a hard link on POSIX, Windows rename which refuses to replace) and
+    fails with FileExistsError instead.
+    """
+    temp = tmp_path / "a.part"
+    final = tmp_path / "a"
+    temp.write_bytes(b"payload")
+    final.write_bytes(b"existing")
+    fd = os.open(temp, os.O_RDWR)
+    handle = os.fdopen(fd, "rb", closefd=False)
+    with pytest.raises(FileExistsError):
+        backup._publish_by_rename(handle, temp, final)
+    # The pre-existing destination is untouched and the temp is intact.
+    assert final.read_bytes() == b"existing"
+    assert temp.read_bytes() == b"payload"
+
+
+def test_publish_by_rename_reopen_failure_removes_owned_final(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On reopen failure the fallback removes only the entry it created.
+
+    The published entry still references the inode this run created, so
+    it is removed to avoid leaving an unverified file under a final
+    name.
+    """
+    temp = tmp_path / "a.part"
+    final = tmp_path / "a"
+    temp.write_bytes(b"payload")
+    fd = os.open(temp, os.O_RDWR)
+    handle = os.fdopen(fd, "rb", closefd=False)
+
+    def boom(path: Path) -> int:
+        raise WPSSHBackupError("cannot reopen")
+
+    monkeypatch.setattr(backup, "_open_nofollow_regular", boom)
+    with pytest.raises(WPSSHBackupError, match="cannot reopen"):
+        backup._publish_by_rename(handle, temp, final)
+    assert not final.exists()
+
+
+def test_publish_by_rename_reopen_failure_leaves_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On reopen failure a replacement at final_path is left in place.
+
+    Regression: the fallback used to unlink final_path unconditionally
+    on reopen failure, so a replacement installed by another process
+    after the publication would be deleted. The cleanup now removes the
+    path only while it still references the inode this run published.
+    """
+    temp = tmp_path / "a.part"
+    final = tmp_path / "a"
+    temp.write_bytes(b"payload")
+    fd = os.open(temp, os.O_RDWR)
+    handle = os.fdopen(fd, "rb", closefd=False)
+
+    def boom(path: Path) -> int:
+        # Simulate a writer replacing the published entry with a
+        # different inode before the re-open fails.
+        replacement = tmp_path / "replacement"
+        replacement.write_bytes(b"other")
+        os.replace(replacement, final)
+        raise WPSSHBackupError("cannot reopen")
+
+    monkeypatch.setattr(backup, "_open_nofollow_regular", boom)
+    with pytest.raises(WPSSHBackupError, match="cannot reopen"):
+        backup._publish_by_rename(handle, temp, final)
+    # The replacement is left in place, not deleted.
+    assert final.read_bytes() == b"other"
 
 
 def test_publish_downloads_refuses_overwrite_of_existing(
@@ -1468,7 +1631,7 @@ def test_run_backup_cleanup_failure_preserves_original_exception(
     original_getfo = client.sftp.getfo
     original_error = paramiko.SSHException("original transfer failure")
     archive = backup_dir / (files_archive_name(TS) + ".part")
-    original_unlink = Path.unlink
+    original_unlink = os.unlink
     attempted: list[Path] = []
 
     def getfo(remote_path, local_file):
@@ -1479,16 +1642,22 @@ def test_run_backup_cleanup_failure_preserves_original_exception(
             local_file.seek(0)
             local_file.write(b"\xff")
 
-    def unlink(path: Path, missing_ok: bool = False) -> None:
-        attempted.append(path)
-        if path == archive:
+    def unlink(path, *, dir_fd=None):
+        # Cleanup claims a path by renaming it to a unique quarantine
+        # name first, so the unlink is attempted on the quarantine
+        # name, not the original pathname. Simulate a cleanup failure
+        # for the archive's quarantine entry.
+        attempted.append(Path(path))
+        if archive.name in Path(path).name:
             raise PermissionError("cleanup denied")
-        original_unlink(path, missing_ok=missing_ok)
+        return original_unlink(path, dir_fd=dir_fd)
 
     monkeypatch.setattr(client.sftp, "getfo", getfo)
     with monkeypatch.context() as patch:
-        patch.setattr(Path, "unlink", unlink)
-        expected = paramiko.SSHException if failure == "transfer" else ChecksumError
+        patch.setattr(os, "unlink", unlink)
+        expected = (
+            paramiko.SSHException if failure == "transfer" else ChecksumError
+        )
         with pytest.raises(expected) as caught:
             backup.run_backup(
                 client, make_config(tmp_path),
@@ -1499,7 +1668,10 @@ def test_run_backup_cleanup_failure_preserves_original_exception(
         assert caught.value is original_error
     else:
         assert "not valid UTF-8" in str(caught.value)
-        assert backup_dir / (checksum_name(files_archive_name(TS)) + ".part") in attempted
+        assert any(
+            checksum_name(files_archive_name(TS)) + ".part" in p.name
+            for p in attempted
+        )
     assert list(backup_dir.iterdir()) == [archive]
     warning = capsys.readouterr().err
     assert "WARNING:" in warning
