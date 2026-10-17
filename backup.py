@@ -662,9 +662,12 @@ def _unlink_if_same_inode_atomic(
     a concurrent writer can no longer swap the pathname between the
     identity check and the unlink. The quarantined inode is then
     compared against identity and unlinked only on a match; a
-    replacement (a different inode) is renamed back to path
-    (best-effort) and left in place with a warning. If path was already
-    gone, the rename fails with FileNotFoundError and nothing is done.
+    replacement (a different inode) is restored to path with a
+    no-replace hard link (best-effort) and left in place with a
+    warning; if the destination reappeared after the claim, the
+    quarantined entry is left in place instead of overwriting the
+    newcomer. If path was already gone, the rename fails with
+    FileNotFoundError and nothing is done.
 
     Args:
         path: The pathname to remove while it still references identity.
@@ -728,9 +731,27 @@ def _unlink_if_same_inode_atomic(
     # The quarantined inode is not this run's: the path had been
     # replaced before the rename. Restore the replacement (best-effort)
     # and warn rather than deleting a file this run did not create.
+    # The restore must not clobber a file another process created at
+    # path after the claim: os.rename would replace it, so the
+    # restoration is a no-replace hard link. If the destination
+    # reappeared, the quarantined entry is left in place (it is never
+    # deleted) instead of overwriting the newcomer.
     try:
-        os.rename(quarantine, path)
+        os.link(quarantine, path)
     except OSError as exc:
+        if warn:
+            print(
+                f"WARNING: could not restore replaced {what} {path}: {exc}",
+                file=sys.stderr,
+            )
+        return
+    try:
+        os.unlink(quarantine)
+    except OSError as exc:
+        # The replacement is back at path; the quarantine name is now a
+        # second link to it and removing it is best-effort. On failure
+        # the entry lingers under the hidden name rather than deleting
+        # a file this run does not own.
         if warn:
             print(
                 f"WARNING: could not restore replaced {what} {path}: {exc}",
@@ -1036,6 +1057,11 @@ def publish_downloads(
         temp_identities[temp_path] = (fd_stat.st_dev, fd_stat.st_ino)
 
     published: list[tuple[Path, tuple[int, int]]] = []
+    # Handles _publish_no_replace() returned for a renamed publication
+    # (the fallback used when inode-link publication is unavailable).
+    # _held_temp_downloads only tracks the original download handles,
+    # so these replacement handles are closed here after verification.
+    replacement_handles: list[BinaryIO] = []
     try:
         with _held_temp_downloads(
             temp_paths, finals, downloaded_fds
@@ -1051,6 +1077,8 @@ def publish_downloads(
                 published_handle = _publish_no_replace(
                     handles[final], temp_paths[final], final_path
                 )
+                if published_handle is not handles[final]:
+                    replacement_handles.append(published_handle)
                 handles[final] = published_handle
                 published.append((final_path, identity))
                 _assert_published_inode(published_handle, final_path)
@@ -1084,6 +1112,14 @@ def publish_downloads(
                 ),
             )
         raise
+    finally:
+        # Close the replacement handles the rename fallback returned:
+        # without this it leaked one descriptor per artifact.
+        for handle in replacement_handles:
+            try:
+                handle.close()
+            except OSError:
+                pass
     # Publication succeeded: remove the temporary downloads. A leftover
     # temp is only a warning — the finals are complete and verified, so
     # publication is not undone over a cleanup failure. A temp path is

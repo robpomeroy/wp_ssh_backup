@@ -779,6 +779,66 @@ def test_publish_downloads_falls_back_when_linkat_unsupported(
     assert original_link is backup._link_inode_no_replace
 
 
+def test_publish_downloads_fallback_closes_replacement_handles(
+    backup_dir: Path,
+) -> None:
+    """The rename fallback's replacement handles are closed after verify.
+
+    Regression: _publish_by_rename returns a fresh handle for the
+    renamed file, but _held_temp_downloads only tracks the original
+    download handles, so publish_downloads leaked one descriptor per
+    artifact whenever linkat(AT_EMPTY_PATH) was unavailable (POSIX
+    fallback) or hard links were unsupported (Windows volumes). The
+    replacement handles are now tracked and closed after verification.
+    Holding a reference across the call must observe them closed: on
+the old code they were left to the refcount.
+    """
+    if os.name != "posix":
+        pytest.skip(
+            "the linkat fallback is forced by patching a POSIX-only "
+            "helper and the scenario is POSIX-specific"
+        )
+    import unittest.mock
+
+    archive = files_archive_name(TS)
+    temp_paths = make_temp_set(backup_dir, archive)
+    digests = digests_for(temp_paths)
+    captured: list[BinaryIO] = []
+
+    def unsupported_link(link_fd: int, final_path: Path) -> None:
+        raise OSError(
+            errno.EINVAL, os.strerror(errno.EINVAL), str(final_path)
+        )
+
+    original_verify = backup._verify_published_inode
+
+    def capturing_verify(
+        handle: BinaryIO, final_path: Path, expected_sha256: str
+    ) -> None:
+        captured.append(handle)
+        original_verify(handle, final_path, expected_sha256)
+
+    with unittest.mock.patch.object(
+        backup, "_link_inode_no_replace", unsupported_link
+    ), unittest.mock.patch.object(
+        backup, "_verify_published_inode", capturing_verify
+    ):
+        backup.publish_downloads(
+            temp_paths,
+            [archive],
+            backup_dir,
+            digests,
+            make_downloaded_fds(temp_paths),
+        )
+
+    # Every published handle was the fallback's replacement handle, and
+    # publish_downloads closed them explicitly: a handle still held by
+    # the caller must already be closed rather than waiting on the
+    # refcount.
+    assert captured
+    assert all(handle.closed for handle in captured)
+
+
 def test_publish_by_rename_publishes_verified_inode(
     tmp_path: Path,
 ) -> None:
@@ -1559,6 +1619,58 @@ def test_run_backup_cleanup_preserves_replaced_temp(
     warning = capsys.readouterr().err
     assert "WARNING:" in warning
     assert "replaced by another file" in warning
+    assert str(path) in warning
+
+
+def test_unlink_if_same_inode_atomic_restore_preserves_new_file(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A file that reappears at path after the claim is never overwritten.
+
+    Regression: restoring a replaced path used os.rename(quarantine,
+    path), which replaces any file a concurrent process created at path
+    after the claim — deleting another process's file during cleanup.
+    The restore is now a no-replace hard link, so the newcomer is
+    preserved and the quarantined entry is left in place with a warning
+    instead of overwriting it.
+    """
+    path = tmp_path / "wp-files-x.tar.gz.part"
+    path.write_bytes(b"this-run-bytes")
+    identity = (os.stat(path).st_dev, os.stat(path).st_ino)
+    # A concurrent writer replaces the pathname with a different inode.
+    replacement = tmp_path / "replacement.part"
+    replacement.write_bytes(b"other-run-bytes")
+    os.replace(replacement, path)
+
+    original_rename = os.rename
+
+    def renaming(src, dst):
+        original_rename(src, dst)
+        if Path(src) == path and ".quarantine-" in Path(dst).name:
+            # After the path is claimed for quarantine, another process
+            # creates a fresh file at the original pathname.
+            newcomer = tmp_path / "newcomer.part"
+            newcomer.write_bytes(b"newcomer-bytes")
+            os.replace(newcomer, path)
+
+    monkeypatch.setattr(os, "rename", renaming)
+    backup._unlink_if_same_inode_atomic(path, identity)
+
+    # The newcomer created after the claim is preserved, not clobbered
+    # by the restore of the quarantined replacement.
+    assert path.exists()
+    assert path.read_bytes() == b"newcomer-bytes"
+    # The quarantined replacement was left in place rather than deleted.
+    quarantined = [
+        p for p in tmp_path.iterdir() if ".quarantine-" in p.name
+    ]
+    assert len(quarantined) == 1
+    assert quarantined[0].read_bytes() == b"other-run-bytes"
+    warning = capsys.readouterr().err
+    assert "WARNING:" in warning
+    assert "could not restore replaced" in warning
     assert str(path) in warning
 
 
