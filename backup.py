@@ -1199,6 +1199,17 @@ def publish_downloads(
                     _verify_published_inode(
                         published_handle, final_path, digests[final]
                     )
+            # After the loop, every final is re-checked against the
+            # inode this run verified and published, still under the
+            # publication lock: a writer who unlinked or replaced any
+            # final — including one published and verified earlier in
+            # the loop, while the remaining files published — fails the
+            # run here instead of letting it report success with a
+            # mismatched archive/manifest pair. The check runs INSIDE
+            # this try so a rejection rolls the run back (the finals
+            # this run created are removed; a replaced final no longer
+            # references this run's inode and is left in place).
+            _final_all_finals_recheck(published, backup_dir)
         except BaseException:
             # Roll back the final paths this run created. They were
             # made by this run's no-replace publications, so unlinking
@@ -1236,14 +1247,6 @@ def publish_downloads(
                     handle.close()
                 except OSError:
                     pass
-
-        # Every final is re-checked against the inode this run verified
-        # and published, still under the publication lock: a writer who
-        # unlinked or replaced any final — including one published and
-        # verified earlier in the loop, while the remaining files
-        # published — fails the run here instead of letting it report
-        # success with a mismatched archive/manifest pair.
-        _final_all_finals_recheck(published, backup_dir)
 
         # Publication succeeded: remove the temporary downloads. A
         # leftover temp is only a warning — the finals are complete and
