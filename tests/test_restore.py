@@ -2257,6 +2257,108 @@ def test_extract_files_allows_hard_link_targeting_regular_member(
     )
 
 
+def test_extract_files_allows_dotted_hard_link_target(
+    tmp_path: Path,
+) -> None:
+    """A hard-link target emitted as './member' must be allowed.
+
+    Regression: GNU tar emits hard-link targets with the raw member
+    spelling, e.g. `link to './original'` when the site is tarred with
+    '.' as the member, while regular_members holds the normalised form
+    ('original'). The membership check compared the raw target, so every
+    hard link of a normal backup produced by this tool was rejected.
+    The target is now normalised before the check.
+    """
+    import io
+    import tarfile
+
+    backup_dir = tmp_path / "backups"
+    set_files = make_local_set(backup_dir, TS)
+    client = FakeSSHClient(SITE_ROOT, wp_cli="/usr/bin/wp")
+    config = make_config(tmp_path)
+
+    archive_name = files_archive_name(TS)
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as tar:
+        info = tarfile.TarInfo("wp-config.php")
+        data = b"<?php\n"
+        info.size = len(data)
+        tar.addfile(info, io.BytesIO(data))
+        hard = tarfile.TarInfo("uploads/hard")
+        hard.type = tarfile.LNKTYPE
+        hard.linkname = "./wp-config.php"
+        tar.addfile(hard)
+    archive_path = set_files[archive_name]
+    archive_path.write_bytes(buffer.getvalue())
+    checksum_path = set_files[checksum_name(archive_name)]
+    checksum_path.write_text(
+        f"{hashlib.sha256(buffer.getvalue()).hexdigest()}  {archive_name}\n"
+    )
+
+    restore.run_restore(
+        client, config, set_files, True, False, staging_bid="20261014T1000Z"
+    )
+
+    # The hard link was extracted (fake records it as a link entry).
+    assert (
+        client.remote_fs[posixpath.join(SITE_ROOT, "uploads/hard")]
+        == b"-> ./wp-config.php"
+    )
+
+
+def test_extract_files_rejects_dotted_hard_link_to_non_member(
+    tmp_path: Path,
+) -> None:
+    """A './'-prefixed hard target that is NOT a member must be rejected.
+
+    The normalisation fix must not over-allow: a dotted target still not
+    in regular_members after normalisation is rejected the same way as a
+    bare one.
+    """
+    import io
+    import tarfile
+
+    backup_dir = tmp_path / "backups"
+    set_files = make_local_set(backup_dir, TS)
+    client = FakeSSHClient(SITE_ROOT, wp_cli="/usr/bin/wp")
+    config = make_config(tmp_path)
+
+    # Pre-existing symlink 'untouched/escape' -> outside the site.
+    client.remote_fs[posixpath.join(SITE_ROOT, "untouched/escape")] = (
+        b"-> /home/user/private.txt"
+    )
+
+    archive_name = files_archive_name(TS)
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as tar:
+        info = tarfile.TarInfo("wp-config.php")
+        data = b"<?php\n"
+        info.size = len(data)
+        tar.addfile(info, io.BytesIO(data))
+        hard = tarfile.TarInfo("uploads/copy")
+        hard.type = tarfile.LNKTYPE
+        hard.linkname = "./untouched/escape"
+        tar.addfile(hard)
+    archive_path = set_files[archive_name]
+    archive_path.write_bytes(buffer.getvalue())
+    checksum_path = set_files[checksum_name(archive_name)]
+    checksum_path.write_text(
+        f"{hashlib.sha256(buffer.getvalue()).hexdigest()}  {archive_name}\n"
+    )
+
+    with pytest.raises(WPSSHBackupError, match="not a regular member"):
+        restore.run_restore(
+            client,
+            config,
+            set_files,
+            True,
+            False,
+            staging_bid="20261014T1000Z",
+        )
+
+    assert posixpath.join(SITE_ROOT, "wp-config.php") not in client.remote_fs
+
+
 def test_run_restore_mysqldump_fallback_uses_cnf(tmp_path: Path) -> None:
     backup_dir = tmp_path / "backups"
     set_files = make_local_set(backup_dir, TS)

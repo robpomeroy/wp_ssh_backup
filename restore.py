@@ -809,7 +809,12 @@ def _validate_members(
         # audit rejects such links.
         link_targets.add(resolved)
     for link, target in hard_links:
-        if target.lstrip("/") not in regular_members:
+        # Normalise the target exactly like member names: GNU tar emits
+        # targets as raw spellings (e.g. './original' when the site is
+        # tarred with '.' as the member), while regular_members holds
+        # the normalised forms. Comparing the raw target would reject
+        # every hard link of a normal backup.
+        if posixpath.normpath(target.lstrip("/")) not in regular_members:
             raise WPSSHBackupError(
                 f"Refusing to extract {archive}: hard link {link!r} "
                 f"targets {target!r}, which is not a regular member of "

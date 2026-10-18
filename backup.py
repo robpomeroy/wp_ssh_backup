@@ -874,7 +874,16 @@ def _publish_by_rename(
         # removes it later. The source pathname could have been swapped
         # for a symlink after verification (os.link follows a symlink
         # source on POSIX); the caller's identity re-check rejects that
-        # and rolls the final entry back.
+        # and rolls the final entry back. The source could equally have
+        # been swapped for a DIFFERENT REGULAR file: os.link would link
+        # the replacement without error, so the published final is
+        # compared against the held descriptor's inode (the verified
+        # one) below, not merely checked for being a regular file.
+        try:
+            held = os.fstat(handle.fileno())
+            held_identity = (held.st_dev, held.st_ino)
+        except (OSError, ValueError):
+            held_identity = None
         try:
             os.link(temp_path, final_path)
         except FileExistsError as exc:
@@ -893,6 +902,16 @@ def _publish_by_rename(
             raise
         try:
             _assert_nofollow_regular(fd, final_path)
+            if held_identity is not None:
+                published_stat = os.fstat(fd)
+                if (published_stat.st_dev, published_stat.st_ino) != (
+                    held_identity[0],
+                    held_identity[1],
+                ):
+                    raise WPSSHBackupError(
+                        f"Refusing to publish {final_path}: the temporary "
+                        "download was replaced after verification"
+                    )
             new_handle = os.fdopen(fd, "rb")
         except BaseException:
             # fdopen took ownership only on success; after a failed
@@ -911,6 +930,17 @@ def _publish_by_rename(
     # wraps the caller's descriptor without owning it (closefd=False),
     # so the raw descriptor is closed once here and the wrapper is then
     # marked closed; the caller's cleanup skips it via fileno().
+    # The held inode's identity is captured BEFORE the descriptor is
+    # closed: a writer who replaces temp_path in the close-rename
+    # interval would otherwise move a replacement inode into the final
+    # backup name, and the original inode would be gone. The renamed
+    # file is compared against the captured identity below and rolled
+    # back on mismatch.
+    try:
+        held = os.fstat(handle.fileno())
+        held_identity = (held.st_dev, held.st_ino)
+    except (OSError, ValueError):
+        held_identity = None
     try:
         fd = handle.fileno()
     except ValueError:
@@ -942,6 +972,16 @@ def _publish_by_rename(
         raise
     try:
         _assert_nofollow_regular(fd, final_path)
+        if held_identity is not None:
+            published_stat = os.fstat(fd)
+            if (published_stat.st_dev, published_stat.st_ino) != (
+                held_identity[0],
+                held_identity[1],
+            ):
+                raise WPSSHBackupError(
+                    f"Refusing to publish {final_path}: the temporary "
+                    "download was replaced after verification"
+                )
         new_handle = os.fdopen(fd, "rb")
     except BaseException:
         # fdopen took ownership only on success; after a failed

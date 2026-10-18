@@ -985,6 +985,91 @@ def test_publish_by_rename_publishes_verified_inode(
         new_handle.close()
 
 
+@pytest.mark.skipif(
+    os.name != "posix",
+    reason="the linkat fallback and its source-swap race are POSIX",
+)
+def test_publish_by_rename_rejects_swapped_regular_source(
+    tmp_path: Path,
+) -> None:
+    """A temp path swapped for a different REGULAR file must be rejected.
+
+    Regression: on POSIX the fallback published via os.link(temp_path,
+    final_path); if a writer replaced temp_path with a different regular
+    file after verification, os.link would link the REPLACEMENT, and the
+    final was only checked to be a regular file (never compared against
+    the held descriptor's inode). The fallback now compares the
+    published descriptor against the held inode and rolls back on
+    mismatch, so bytes that were never verified can never be published.
+    """
+    temp = tmp_path / "a.part"
+    final = tmp_path / "a"
+    temp.write_bytes(b"verified-payload")
+    fd = os.open(temp, os.O_RDWR)
+    handle = os.fdopen(fd, "rb", closefd=False)
+    # A writer replaces temp_path with a different regular file while
+    # the held descriptor still references the verified inode.
+    replacement = tmp_path / "replacement.part"
+    replacement.write_bytes(b"attacker-bytes")
+    os.replace(replacement, temp)
+
+    with pytest.raises(
+        WPSSHBackupError, match="was replaced after verification"
+    ):
+        backup._publish_by_rename(handle, temp, final)
+    # The unverified replacement must not sit under the final name.
+    assert not final.exists()
+
+
+@pytest.mark.skipif(
+    os.name != "nt",
+    reason="the rename branch is only reached when os.name is 'nt'",
+)
+def test_publish_by_rename_rejects_swapped_source_before_rename(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A temp path swapped before the Windows rename must be caught.
+
+    Regression: the Windows fallback closed the held descriptor before
+    os.rename(temp_path, final_path); a writer replacing temp_path in
+    that close-rename interval would move a REPLACEMENT inode into the
+    final backup name, and the original inode was no longer retained for
+    comparison. The held inode's identity is now captured before the
+    close and the renamed file is compared against it, rolling back on
+    mismatch.
+
+    The swap is injected by monkeypatching os.rename: Windows refuses to
+    replace a file held open, so the writer's swap can only land in the
+    interval AFTER the fallback closes the descriptor and BEFORE the
+    rename — exactly the window the fix guards.
+    """
+    temp = tmp_path / "a.part"
+    final = tmp_path / "a"
+    temp.write_bytes(b"verified-payload")
+    fd = os.open(temp, os.O_RDWR)
+    handle = os.fdopen(fd, "rb", closefd=False)
+
+    replacement = tmp_path / "replacement.part"
+    replacement.write_bytes(b"attacker-bytes")
+    original_rename = os.rename
+
+    def swap_then_rename(src, dst):
+        if src == temp:
+            # Swap the temp pathname for a different inode just before
+            # the fallback's rename moves it into the final name.
+            os.replace(replacement, temp)
+        return original_rename(src, dst)
+
+    monkeypatch.setattr(backup.os, "rename", swap_then_rename)
+
+    with pytest.raises(
+        WPSSHBackupError, match="was replaced after verification"
+    ):
+        backup._publish_by_rename(handle, temp, final)
+    # The unverified replacement must not sit under the final name.
+    assert not final.exists()
+
+
 def test_publish_by_rename_refuses_existing_destination(
     tmp_path: Path,
 ) -> None:
