@@ -518,6 +518,107 @@ _linkat_cache: ctypes.CDLL | None = None
 _PUBLISH_LOCK_NAME = ".wp-ssh-backup.lock"
 _PUBLISH_LOCK_ATTEMPTS = 40
 _PUBLISH_LOCK_RETRY_DELAY = 0.05
+# A lock whose content cannot be read as a PID is only ever transiently
+# empty: the creator writes its PID immediately after O_EXCL creation.
+# If it stays unparseable for this long, the creator died between
+# os.open and os.write (the exact crash the lock recovery must handle),
+# so the lock is treated as stale.
+_PUBLISH_LOCK_UNPARSEABLE_GRACE = 5.0
+
+
+def _pid_alive(pid: int) -> bool:
+    """Best-effort liveness probe for a lock's owning process.
+
+    Returns False ONLY when the PID is verifiably no longer a process.
+    Any uncertainty — permissions, platforms without a usable probe,
+    a recycled PID belonging to some other live process — returns True,
+    so a lock that might still be held is never stolen.
+
+    On POSIX, signal 0 to a process is a pure liveness check (no signal
+    is delivered). On Windows, signal 0 is rejected by os.kill, so an
+    OpenProcess handle probe is used instead: it has no side effects and
+    fails only when the PID does not name a process at all.
+    """
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            open_process = ctypes.windll.kernel32.OpenProcess
+            open_process.restype = ctypes.c_void_p
+            open_process.argtypes = [
+                ctypes.c_uint32,  # dwDesiredAccess
+                ctypes.c_int,     # bInheritHandle
+                ctypes.c_uint32,  # dwProcessId
+            ]
+            # QUERY_LIMITED_INFORMATION: a no-side-effect probe.
+            handle = open_process(0x1000, False, pid)
+            if handle:
+                ctypes.windll.kernel32.CloseHandle(handle)
+                return True
+            # OpenProcess returned NULL: no such process (or it died
+            # between the check and the handle).
+            return False
+        except (OSError, AttributeError):
+            # Probe unavailable: treat as alive rather than stealing.
+            return True
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # Exists but owned by another account: treat as alive.
+        return True
+    except OSError:
+        # Zombie (ESRCH may surface here on some platforms) or another
+        # probe failure: conservative, treat as alive.
+        return True
+
+
+def _steal_stale_lock(lock: Path) -> bool:
+    """Atomically reclaim a publish lock whose owner is dead.
+
+    Returns True when the lock name has been freed (the caller should
+    retry the O_EXCL creation); False when the lock is held by a live
+    process or staleness cannot be proven, in which case the caller
+    keeps retrying normally.
+
+    The reclaim is a same-directory rename to a unique name only this
+    process knows: two processes racing to steal the same stale lock
+    cannot both win (the loser's rename fails with FileNotFoundError),
+    and a lock that was re-created by a live process between the
+    liveness probe and the rename is simply not the inode being moved.
+    A crash between the rename and the unlink leaves a .stale- file but
+    frees the lock name, which is all that matters.
+    """
+    try:
+        pid = int(lock.read_text(encoding="ascii", errors="strict").strip())
+    except (OSError, ValueError):
+        # Unparseable (the creator died between os.open and os.write, or
+        # the file is garbage). Only reclaim after the grace period: a
+        # transiently-empty live lock is written within microseconds.
+        try:
+            age = time.time() - lock.stat().st_mtime
+        except OSError:
+            return False  # lock vanished; retry creation
+        if age < _PUBLISH_LOCK_UNPARSEABLE_GRACE:
+            return False
+    else:
+        if _pid_alive(pid):
+            return False
+    stale = _quarantine_name(lock)
+    try:
+        os.rename(lock, stale)
+    except FileNotFoundError:
+        # Another process stole it first; the name is free, retry create.
+        return True
+    except OSError:
+        return False
+    try:
+        os.unlink(stale)
+    except OSError:
+        pass
+    return True
 
 
 @contextmanager
@@ -534,6 +635,19 @@ def _exclusive_publish_lock(
     directory. The final all-finals re-check runs under this lock, so no
     cooperative writer can be mid-publication when the run reports
     success.
+
+    Stale locks are reclaimed automatically: the lock records the PID
+    of its creator, and when creation fails because a lock already
+    exists, the recorded PID is probed. A lock whose creator is
+    verifiably dead (a crash, SIGKILL or host shutdown after os.open
+    succeeded) is atomically renamed aside and removed, so a later run
+    acquires the lock instead of failing. A lock whose PID is alive —
+    including a recycled PID owned by an unrelated live process — is
+    never stolen. If the lock content cannot be read as a PID (the
+    creator died between os.open and writing its PID), it is reclaimed
+    only after a grace period. The final error names the administrator
+    recovery path (delete the lock file) for the rare case where
+    staleness cannot be proven.
 
     The lock is released by atomically removing only the inode this
     process created (identity check via _unlink_if_same_inode_atomic):
@@ -554,11 +668,17 @@ def _exclusive_publish_lock(
             )
             break
         except FileExistsError:
+            if _steal_stale_lock(lock):
+                # The stale lock was reclaimed; retry the O_EXCL create
+                # on the next iteration.
+                continue
             time.sleep(_PUBLISH_LOCK_RETRY_DELAY)
     if fd is None:
         raise WPSSHBackupError(
-            f"Another backup is publishing to {backup_dir}; the publish "
-            "lock could not be acquired"
+            f"Another backup appears to be publishing to {backup_dir}. "
+            "If no backup process is running, the publish lock may be "
+            f"stale: delete {lock!s} (and any .wp-ssh-backup.lock.stale-* "
+            "files) and re-run."
         )
     try:
         st = os.fstat(fd)

@@ -927,21 +927,23 @@ def test_publish_downloads_lock_blocks_concurrent_publish(
     backup_dir: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A held publish lock fails the run instead of interleaving."""
+    """A lock held by a live process fails the run instead of interleaving."""
+    import os as _os
     import re
     import unittest.mock
 
     archive = files_archive_name(TS)
     temp_paths = make_temp_set(backup_dir, archive)
     lock = backup_dir / backup._PUBLISH_LOCK_NAME
-    lock.write_bytes(b"12345\n")
+    # A lock written by a LIVE process (our own PID) must not be stolen.
+    lock.write_text(f"{_os.getpid()}\n")
     # Avoid the retry sleeps: the lock is held the whole time.
     monkeypatch.setattr(
         backup, "time", unittest.mock.Mock(sleep=lambda _: None)
     )
 
     with pytest.raises(
-        WPSSHBackupError, match=re.escape("Another backup is publishing")
+        WPSSHBackupError, match=re.escape("Another backup appears")
     ):
         backup.publish_downloads(
             temp_paths,
@@ -951,8 +953,87 @@ def test_publish_downloads_lock_blocks_concurrent_publish(
             make_downloaded_fds(temp_paths),
         )
 
-    # A lock we did not create must not be removed.
+    # A lock held by a live process must not be removed.
     assert lock.exists()
+
+
+def test_publish_downloads_reclaims_stale_lock(
+    backup_dir: Path,
+) -> None:
+    """A lock whose owning PID is dead is reclaimed and the run proceeds.
+
+    Regression: a process killed after os.open succeeded left the
+    O_EXCL lock behind, and every later run retried 40 times and failed
+    permanently until an administrator deleted the hidden lock. The lock
+    records its creator's PID; when that PID is verifiably dead, the
+    lock is atomically renamed aside and removed, and publication
+    proceeds.
+    """
+    archive = files_archive_name(TS)
+    temp_paths = make_temp_set(backup_dir, archive)
+    lock = backup_dir / backup._PUBLISH_LOCK_NAME
+    # A PID far beyond any valid process range: verifiably dead.
+    lock.write_text(f"{2**30}\n")
+
+    backup.publish_downloads(
+        temp_paths,
+        [archive],
+        backup_dir,
+        digests_for(temp_paths),
+        make_downloaded_fds(temp_paths),
+    )
+
+    # The stale lock was reclaimed; the run succeeded and released it.
+    assert (backup_dir / archive).exists()
+    assert not lock.exists()
+    # No .stale- leftovers remain.
+    assert not any(
+        ".lock.stale-" in p.name for p in backup_dir.iterdir()
+    )
+
+
+def test_publish_downloads_lock_unparseable_reclaimed_after_grace(
+    backup_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unparseable lock older than the grace period is reclaimed.
+
+    A creator killed between os.open and writing its PID leaves an empty
+    (or partial) lock. It is only reclaimed after the grace period: a
+    transiently-empty live lock must never be stolen.
+    """
+    archive = files_archive_name(TS)
+    temp_paths = make_temp_set(backup_dir, archive)
+    lock = backup_dir / backup._PUBLISH_LOCK_NAME
+    lock.write_bytes(b"")
+
+    real_time = backup.time
+
+    class _Time:
+        def __init__(self) -> None:
+            self._real = real_time
+
+        def sleep(self, s: float) -> None:
+            self._real.sleep(s)
+
+        def time(self) -> float:
+            # Push "now" past the grace period so the old lock's age
+            # (time() - mtime) exceeds it.
+            past = self._real.time() + backup._PUBLISH_LOCK_UNPARSEABLE_GRACE
+            return past + 1
+
+    monkeypatch.setattr(backup, "time", _Time())
+
+    backup.publish_downloads(
+        temp_paths,
+        [archive],
+        backup_dir,
+        digests_for(temp_paths),
+        make_downloaded_fds(temp_paths),
+    )
+
+    assert (backup_dir / archive).exists()
+    assert not lock.exists()
 
 
 def test_publish_by_rename_publishes_verified_inode(
