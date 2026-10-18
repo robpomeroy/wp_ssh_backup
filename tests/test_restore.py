@@ -1520,6 +1520,68 @@ def test_extract_files_rejects_preexisting_link_in_member_dir(
     assert posixpath.join(SITE_ROOT, "wp-config.php") not in client.remote_fs
 
 
+def test_extract_files_rejects_preexisting_link_in_link_target_dir(
+    tmp_path: Path,
+) -> None:
+    """A pre-existing link in an archive link's resolved target dir blocks.
+
+    Regression: the ancestor audit was built only from member_paths. An
+    archive link 'uploads/link -> target/file' resolves inside the site
+    root, but 'uploads/target' is a directory component of the link's
+    RESOLVED target, not of any member path — so a pre-existing symlink
+    at 'uploads/target' pointing outside the tree escaped the audit, and
+    a later member write (or process) traversing the resolved path would
+    follow it outside the site. The audit now covers ancestors of
+    link_targets too.
+    """
+    import io
+    import tarfile
+
+    backup_dir = tmp_path / "backups"
+    set_files = make_local_set(backup_dir, TS)
+    client = FakeSSHClient(SITE_ROOT, wp_cli="/usr/bin/wp")
+    config = make_config(tmp_path)
+
+    # uploads is a real directory; it contains a symlink 'target' that
+    # points outside the site. The archive only creates a symlink member
+    # whose RESOLVED target passes through 'target' — no member path
+    # itself has 'target' as an ancestor.
+    client.remote_fs[posixpath.join(SITE_ROOT, "uploads/target")] = (
+        b"-> /home/user/private"
+    )
+
+    archive_name = files_archive_name(TS)
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as tar:
+        info = tarfile.TarInfo("wp-config.php")
+        data = b"<?php\n"
+        info.size = len(data)
+        tar.addfile(info, io.BytesIO(data))
+        link = tarfile.TarInfo("uploads/link")
+        link.type = tarfile.SYMTYPE
+        link.linkname = "target/file"
+        tar.addfile(link)
+    archive_path = set_files[archive_name]
+    archive_path.write_bytes(buffer.getvalue())
+    checksum_path = set_files[checksum_name(archive_name)]
+    checksum_path.write_text(
+        f"{hashlib.sha256(buffer.getvalue()).hexdigest()}  {archive_name}\n"
+    )
+
+    with pytest.raises(WPSSHBackupError, match="already exists as a symlink"):
+        restore.run_restore(
+            client,
+            config,
+            set_files,
+            True,
+            False,
+            staging_bid="20261014T1000Z",
+        )
+
+    # Nothing was extracted into the site root.
+    assert posixpath.join(SITE_ROOT, "wp-config.php") not in client.remote_fs
+
+
 def test_extract_files_ignores_unrelated_symlink(
     tmp_path: Path,
 ) -> None:

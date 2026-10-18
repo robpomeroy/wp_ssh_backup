@@ -851,10 +851,12 @@ def _audit_destination_tree(
     Only links that extraction would actually traverse or replace are
     rejected: a symlink is a problem when it sits at the site root itself,
     at a directory the archive writes into (an ancestor of a member path),
-    at a member path itself (extraction would replace it), or at a path an
-    archive symlink resolves to (it would complete the escape chain); a hard
-    link is a problem when it sits at a member path itself (extraction would
-    write over the shared inode). An untouched pre-existing link elsewhere in
+    at a member path itself (extraction would replace it), at a directory
+    in the path an archive symlink resolves to (a later write through the
+    resolved target would follow it), or at a path an archive symlink
+    resolves to (it would complete the escape chain); a hard link is a
+    problem when it sits at a member path itself (extraction would write
+    over the shared inode). An untouched pre-existing link elsewhere in
     the site is not this restore's business.
 
     Args:
@@ -872,11 +874,20 @@ def _audit_destination_tree(
     if not writes.member_paths and not writes.link_targets:
         return
     # Directories extraction writes through: every ancestor directory of
-    # every member path. tar follows a pre-existing symlink sitting at one
-    # of these paths when creating the members beneath it.
+    # every member path, and of every path an archive symlink resolves
+    # to. tar follows a pre-existing symlink sitting at one of these
+    # paths when creating the members beneath it — and a symlink member
+    # is created as a link, but a later member (or a later process)
+    # traversing into the link's resolved target would follow a
+    # pre-existing symlink in one of the target's directory components,
+    # so those directories must be audited too.
     ancestors: set[str] = set()
     for member in writes.member_paths:
         parts = member.split("/")
+        for i in range(1, len(parts)):
+            ancestors.add("/".join(parts[:i]))
+    for target in writes.link_targets:
+        parts = target.split("/")
         for i in range(1, len(parts)):
             ancestors.add("/".join(parts[:i]))
     # -print0 / NUL-separated output keeps spaced names intact; the decoder
