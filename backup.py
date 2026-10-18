@@ -511,6 +511,69 @@ _AT_FDCWD = -100
 _AT_EMPTY_PATH = 0x1000
 _linkat_cache: ctypes.CDLL | None = None
 
+# The publication lock lives in BACKUP_DIR: a cooperative concurrent run
+# acquires the same lock, so two runs cannot interleave their
+# publications. The file name never matches the backup filename pattern,
+# so find_backup_sets() and prune_local_backups() ignore it.
+_PUBLISH_LOCK_NAME = ".wp-ssh-backup.lock"
+_PUBLISH_LOCK_ATTEMPTS = 40
+_PUBLISH_LOCK_RETRY_DELAY = 0.05
+
+
+@contextmanager
+def _exclusive_publish_lock(
+    backup_dir: Path,
+) -> Generator[None, None, None]:
+    """Hold an exclusive lock file in backup_dir across publication.
+
+    The lock is created with O_CREAT | O_EXCL: only one run can hold it
+    at a time, so a cooperative concurrent backup run cannot publish
+    into the directory while this run does. Acquisition retries briefly
+    (a run in its final cleanup releases the lock quickly) and then
+    fails the run rather than publishing into an actively-written
+    directory. The final all-finals re-check runs under this lock, so no
+    cooperative writer can be mid-publication when the run reports
+    success.
+
+    The lock is released by atomically removing only the inode this
+    process created (identity check via _unlink_if_same_inode_atomic):
+    a lock created by a later run after this process crashed or was
+    killed is never unlinked.
+
+    A local attacker who can write BACKUP_DIR can unlink this lock and
+    race the final re-check; that residual window is inherent to a
+    writable directory and is the reason publication also never creates
+    a final path without a no-replace operation.
+    """
+    lock = backup_dir / _PUBLISH_LOCK_NAME
+    fd: int | None = None
+    for _ in range(_PUBLISH_LOCK_ATTEMPTS):
+        try:
+            fd = os.open(
+                lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600
+            )
+            break
+        except FileExistsError:
+            time.sleep(_PUBLISH_LOCK_RETRY_DELAY)
+    if fd is None:
+        raise WPSSHBackupError(
+            f"Another backup is publishing to {backup_dir}; the publish "
+            "lock could not be acquired"
+        )
+    try:
+        st = os.fstat(fd)
+        identity = (st.st_dev, st.st_ino)
+        os.write(fd, f"{os.getpid()}\n".encode())
+        yield
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        # Remove only the lock inode this run created; a lock created by
+        # a later run after we died must not be unlinked.
+        _unlink_if_same_inode_atomic(lock, identity, warn=False)
+
 
 def _linkat_libc() -> ctypes.CDLL:
     global _linkat_cache
@@ -957,6 +1020,42 @@ def _verify_published_inode(
     _assert_published_inode(handle, final_path)
 
 
+def _final_all_finals_recheck(
+    published: list[tuple[Path, tuple[int, int]]],
+    backup_dir: Path,
+) -> None:
+    """
+    Re-check every published final still references its held inode.
+
+    Called under the exclusive publish lock immediately before success
+    is reported, so a cooperative concurrent run cannot be mid-
+    publication while it runs. Each final path's directory entry is
+    compared against the inode this run verified and published: a writer
+    who unlinked or replaced ANY final — not just the last one checked
+    inside the publication loop — is caught here and the run fails and
+    rolls back instead of reporting success with a mismatched
+    archive/manifest pair.
+
+    Raises:
+        WPSSHBackupError: If any final path no longer references the
+            inode this run published.
+    """
+    for final_path, identity in published:
+        try:
+            st = os.lstat(final_path)
+        except OSError as exc:
+            raise WPSSHBackupError(
+                f"Refusing to report success: {final_path} was removed "
+                f"after publication: {exc}"
+            ) from exc
+        if (st.st_dev, st.st_ino) != identity:
+            raise WPSSHBackupError(
+                f"Refusing to report success: {final_path} was replaced "
+                "after publication; the final names no longer reference "
+                "the verified inodes"
+            )
+
+
 def publish_downloads(
     temp_paths: dict[str, Path],
     archive_names: list[str],
@@ -991,12 +1090,19 @@ def publish_downloads(
     The final directory entry can still be unlinked and replaced while
     the digest is re-read, so it is checked against the held inode once
     more after hashing; a replacement is rejected instead of being
-    reported as a successful publication. If publication fails
-    part-way, the final paths this run created are removed so the
-    caller's cleanup can discard the still intact temporary downloads
-    (a path that was replaced after publication no longer references
-    this run's inode and is left in place with a warning). A failed run
-    therefore never leaves a partial final-name set in BACKUP_DIR.
+    reported as a successful publication. After the loop every final is
+    re-checked against its held inode while an exclusive publication
+    lock is held: a writer who replaces an ALREADY-verified final while
+    the remaining files publish — not just the last one — is caught
+    before success is reported, so the run never reports success with a
+    mismatched archive/manifest pair. A cooperative concurrent run
+    cannot interleave its publications either: it acquires the same
+    lock. If publication fails part-way, the final paths this run
+    created are removed so the caller's cleanup can discard the still
+    intact temporary downloads (a path that was replaced after
+    publication no longer references this run's inode and is left in
+    place with a warning). A failed run therefore never leaves a partial
+    final-name set in BACKUP_DIR.
 
     Args:
         temp_paths: Mapping from final names to the temporary paths
@@ -1027,116 +1133,136 @@ def publish_downloads(
     for name in archive_names:
         finals.extend((name, checksum_name(name)))
 
-    # Pre-check: refuse to overwrite anything that already exists under
-    # a final name (e.g. a file from another run) BEFORE publishing the
-    # first file, so the common conflict case fails fast with a friendly
-    # error and no half-done publication. This check alone is not the
-    # guarantee — the no-replace publication below is: it fails if a
-    # path appears here between the check and the publication. Symlinks
-    # are rejected too, including dangling ones: Path.exists() is False
-    # for a broken link, but publication would silently replace it,
-    # breaking the preservation promise.
-    for final in finals:
-        final_path = backup_dir / final
-        if final_path.exists() or final_path.is_symlink():
-            raise FileExistsError(
-                f"Refusing to overwrite existing backup file: {final_path}"
-            )
-
-    # Record the inode each temporary download was created with, so the
-    # success-path cleanup below removes a temp only while it still
-    # references that inode. A writer who replaced a .part pathname
-    # after the download planted a different inode; removing it would
-    # delete another run's file, so the replacement is left in place
-    # with a warning.
-    temp_identities: dict[Path, tuple[int, int]] = {}
-    for final in finals:
-        temp_path = temp_paths[final]
-        fd = downloaded_fds[temp_path]
-        fd_stat = os.fstat(fd)
-        temp_identities[temp_path] = (fd_stat.st_dev, fd_stat.st_ino)
-
-    published: list[tuple[Path, tuple[int, int]]] = []
-    # Handles _publish_no_replace() returned for a renamed publication
-    # (the fallback used when inode-link publication is unavailable).
-    # _held_temp_downloads only tracks the original download handles,
-    # so these replacement handles are closed here after verification.
-    replacement_handles: list[BinaryIO] = []
-    try:
-        with _held_temp_downloads(
-            temp_paths, finals, downloaded_fds
-        ) as handles:
-            for final in finals:
-                final_path = backup_dir / final
-                # Record the held inode before publication: it is the
-                # inode this run verified and intends to publish, and
-                # rollback must recognize it even when publication
-                # linked a replacement instead.
-                fd_stat = os.fstat(handles[final].fileno())
-                identity = (fd_stat.st_dev, fd_stat.st_ino)
-                published_handle = _publish_no_replace(
-                    handles[final], temp_paths[final], final_path
+    # The publication lock is held across the entire operation: the
+    # pre-check, every no-replace publication, the final all-finals
+    # re-check and the temp cleanup all run while this run exclusively
+    # owns the directory for cooperative writers.
+    with _exclusive_publish_lock(backup_dir):
+        # Pre-check: refuse to overwrite anything that already exists
+        # under a final name (e.g. a file from another run) BEFORE
+        # publishing the first file, so the common conflict case fails
+        # fast with a friendly error and no half-done publication. This
+        # check alone is not the guarantee — the no-replace publication
+        # below is: it fails if a path appears here between the check
+        # and the publication. Symlinks are rejected too, including
+        # dangling ones: Path.exists() is False for a broken link, but
+        # publication would silently replace it, breaking the
+        # preservation promise.
+        for final in finals:
+            final_path = backup_dir / final
+            if final_path.exists() or final_path.is_symlink():
+                raise FileExistsError(
+                    f"Refusing to overwrite existing backup file: "
+                    f"{final_path}"
                 )
-                if published_handle is not handles[final]:
-                    replacement_handles.append(published_handle)
-                handles[final] = published_handle
-                published.append((final_path, identity))
-                _assert_published_inode(published_handle, final_path)
-                _verify_published_inode(
-                    published_handle, final_path, digests[final]
+
+        # Record the inode each temporary download was created with, so
+        # the success-path cleanup below removes a temp only while it
+        # still references that inode. A writer who replaced a .part
+        # pathname after the download planted a different inode;
+        # removing it would delete another run's file, so the
+        # replacement is left in place with a warning.
+        temp_identities: dict[Path, tuple[int, int]] = {}
+        for final in finals:
+            temp_path = temp_paths[final]
+            fd = downloaded_fds[temp_path]
+            fd_stat = os.fstat(fd)
+            temp_identities[temp_path] = (fd_stat.st_dev, fd_stat.st_ino)
+
+        published: list[tuple[Path, tuple[int, int]]] = []
+        # Handles _publish_no_replace() returned for a renamed
+        # publication (the fallback used when inode-link publication is
+        # unavailable). _held_temp_downloads only tracks the original
+        # download handles, so these replacement handles are closed here
+        # after verification.
+        replacement_handles: list[BinaryIO] = []
+        try:
+            with _held_temp_downloads(
+                temp_paths, finals, downloaded_fds
+            ) as handles:
+                for final in finals:
+                    final_path = backup_dir / final
+                    # Record the held inode before publication: it is
+                    # the inode this run verified and intends to
+                    # publish, and rollback must recognize it even when
+                    # publication linked a replacement instead.
+                    fd_stat = os.fstat(handles[final].fileno())
+                    identity = (fd_stat.st_dev, fd_stat.st_ino)
+                    published_handle = _publish_no_replace(
+                        handles[final], temp_paths[final], final_path
+                    )
+                    if published_handle is not handles[final]:
+                        replacement_handles.append(published_handle)
+                    handles[final] = published_handle
+                    published.append((final_path, identity))
+                    _assert_published_inode(published_handle, final_path)
+                    _verify_published_inode(
+                        published_handle, final_path, digests[final]
+                    )
+        except BaseException:
+            # Roll back the final paths this run created. They were
+            # made by this run's no-replace publications, so unlinking
+            # them can never remove a pre-existing file. A path that
+            # was unlinked and replaced after publication no longer
+            # references this run's inode; the replacement is left in
+            # place with a warning rather than unlinking a file this
+            # run did not create. The temporary downloads were not
+            # unlinked, so the caller's _discard_temp_downloads()
+            # cleanup — which must never touch final paths it did not
+            # create — discards them.
+            for final_path, identity in reversed(published):
+                _unlink_if_same_inode_atomic(
+                    final_path,
+                    identity,
+                    what="published backup file",
+                    check_error_message=(
+                        "could not roll back {what} {path}: {exc}"
+                    ),
+                    remove_error_message=(
+                        "could not roll back {what} {path}: {exc}"
+                    ),
+                    replaced_message=(
+                        "{what} {path} was replaced during publication; "
+                        "leaving the replacement in place"
+                    ),
                 )
-    except BaseException:
-        # Roll back the final paths this run created. They were made by
-        # this run's no-replace publications, so unlinking them can
-        # never remove a pre-existing file. A path that was unlinked and
-        # replaced after publication no longer references this run's
-        # inode; the replacement is left in place with a warning rather
-        # than unlinking a file this run did not create. The temporary
-        # downloads were not unlinked, so the caller's
-        # _discard_temp_downloads() cleanup — which must never touch
-        # final paths it did not create — discards them.
-        for final_path, identity in reversed(published):
+            raise
+        finally:
+            # Close the replacement handles the rename fallback
+            # returned: without this it leaked one descriptor per
+            # artifact.
+            for handle in replacement_handles:
+                try:
+                    handle.close()
+                except OSError:
+                    pass
+
+        # Every final is re-checked against the inode this run verified
+        # and published, still under the publication lock: a writer who
+        # unlinked or replaced any final — including one published and
+        # verified earlier in the loop, while the remaining files
+        # published — fails the run here instead of letting it report
+        # success with a mismatched archive/manifest pair.
+        _final_all_finals_recheck(published, backup_dir)
+
+        # Publication succeeded: remove the temporary downloads. A
+        # leftover temp is only a warning — the finals are complete and
+        # verified, so publication is not undone over a cleanup
+        # failure. A temp path is removed only while it still
+        # references the inode this run created (recorded above); a
+        # path replaced by another process is left in place with a
+        # warning rather than deleted.
+        for final in finals:
+            temp_path = temp_paths[final]
+            identity = temp_identities[temp_path]
             _unlink_if_same_inode_atomic(
-                final_path,
+                temp_path,
                 identity,
-                what="published backup file",
-                check_error_message=(
-                    "could not roll back {what} {path}: {exc}"
-                ),
-                remove_error_message=(
-                    "could not roll back {what} {path}: {exc}"
-                ),
                 replaced_message=(
                     "{what} {path} was replaced during publication; "
                     "leaving the replacement in place"
                 ),
             )
-        raise
-    finally:
-        # Close the replacement handles the rename fallback returned:
-        # without this it leaked one descriptor per artifact.
-        for handle in replacement_handles:
-            try:
-                handle.close()
-            except OSError:
-                pass
-    # Publication succeeded: remove the temporary downloads. A leftover
-    # temp is only a warning — the finals are complete and verified, so
-    # publication is not undone over a cleanup failure. A temp path is
-    # removed only while it still references the inode this run created
-    # (recorded above); a path replaced by another process is left in
-    # place with a warning rather than deleted.
-    for final in finals:
-        temp_path = temp_paths[final]
-        identity = temp_identities[temp_path]
-        _unlink_if_same_inode_atomic(
-            temp_path,
-            identity,
-            replaced_message=(
-                "{what} {path} was replaced during publication; "
-                "leaving the replacement in place"
-            ),
-        )
     return {final: backup_dir / final for final in finals}
 
 

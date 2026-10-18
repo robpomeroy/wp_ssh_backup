@@ -72,7 +72,8 @@ class FakeSFTPClient:
 
     def putfo(self, fileobj: object, remote_path: str) -> None:
         """Mirror paramiko's putfo: stream an open file object up."""
-        self.remote_fs[remote_path] = fileobj.read()  # type: ignore[attr-defined]
+        self.remote_fs[remote_path] = fileobj.read(
+        )  # type: ignore[attr-defined]
 
 
 class _FakeReadFile:
@@ -182,7 +183,11 @@ class FakeSSHClient:
     # -- command interpretation --------------------------------------------
 
     def _execute(
-        self, command: str, stdout: io.BytesIO, stderr: io.BytesIO
+        self,
+        command: str,
+        stdout: io.BytesIO,
+        stderr: io.BytesIO,
+        cwd: str | None = None,
     ) -> int:
         for pattern, code in self.fail_on.items():
             if pattern in command:
@@ -190,8 +195,8 @@ class FakeSSHClient:
                 return code
 
         # Strip a leading "cd '<dir>' && " prefix, remembering the directory
-        # so relative paths in sha256sum commands can be resolved.
-        cwd: str | None = None
+        # so relative paths in sha256sum commands can be resolved. If the
+        # caller already stripped it (compound recursion), keep their cwd.
         compound = re.match(
             r"^cd\s+'([^']+)'\s+&&\s+(.*)$", command, re.DOTALL
         )
@@ -205,7 +210,7 @@ class FakeSSHClient:
         parts = _split_compound(command)
         if len(parts) > 1:
             for part in parts:
-                code = self._execute(part, stdout, stderr)
+                code = self._execute(part, stdout, stderr, cwd)
                 if code != 0:
                     return code
             return 0
@@ -251,12 +256,14 @@ class FakeSSHClient:
             return 1
         if re.search(r"\bsha256sum\b", command) and " -c " in command:
             return self._sha256sum_check(command, stderr, cwd)
+        if "| cut -d' ' -f1" in command:
+            return self._sha256sum_grep_extract(command, stdout, stderr, cwd)
         if re.search(r"\bsha256sum\b", command):
             return self._sha256sum_generate(command, stdout, stderr, cwd)
         if command.startswith("tar czf "):
             return self._tar_create(command, stderr)
         if command.startswith("tar xzf "):
-            return self._tar_extract(command, stderr)
+            return self._tar_extract(command, stderr, cwd)
         if re.search(r"^tar\s+.*\s-tvzf\s", command):
             return self._tar_list(command, stdout, stderr, verbose=True)
         if re.search(r"^tar\s+.*\s-tzf\s", command):
@@ -416,9 +423,15 @@ class FakeSSHClient:
             return {member: self.remote_fs[full]}
         return {}
 
-    def _tar_extract(self, command: str, stderr: io.BytesIO) -> int:
+    def _tar_extract(
+        self, command: str, stderr: io.BytesIO, compound_cwd: str | None = None
+    ) -> int:
         quoted = self._quoted(command)
         archive_path = quoted[0]
+        # A 'tar xzf <name> -C <dir>' run inside a 'cd <dir1> && ...'
+        # compound resolves <name> against the compound's working dir.
+        if compound_cwd is not None and not posixpath.isabs(archive_path):
+            archive_path = posixpath.join(compound_cwd, archive_path)
         cwd = quoted[1] if "-C" in command else posixpath.dirname(archive_path)
         if archive_path not in self.remote_fs:
             stderr.write(f"tar: {archive_path}: not found\n".encode())
@@ -581,7 +594,6 @@ class FakeSSHClient:
         stderr: io.BytesIO,
         cwd: str | None,
     ) -> int:
-        # Two forms (cd prefix already stripped):
         #   sha256sum '<name>' > '<out>'   (checksum generation)
         #   sha256sum '<name>'             (plain hashing, no redirect)
         match = re.search(r"sha256sum\s+'([^']+)'\s*>\s*'([^']+)'", command)
@@ -610,6 +622,50 @@ class FakeSSHClient:
             return 0
         stderr.write(f"unparsable sha256sum: {command}\n".encode())
         return 2
+
+    def _sha256sum_grep_extract(
+        self,
+        command: str,
+        stdout: io.BytesIO,
+        stderr: io.BytesIO,
+        cwd: str | None,
+    ) -> int:
+        """Form: sha256sum '<name>' | cut -d' ' -f1 | grep -qx '<digest>'.
+
+        This is the digest revalidation half of the one-shot
+        revalidate-and-consume command restore.py issues: it hashes the
+        archive at this instant and succeeds only if the digest still
+        matches the one the earlier verification returned. A mismatch
+        (the archive was swapped after verification) fails the pipeline
+        with exit 1, so the '&& tar xzf' half never runs.
+        """
+        match = re.search(
+            r"sha256sum\s+'([^']+)'\s*\|\s*cut\s+-d' '\s+-f1\s*\|\s*"
+            r"grep\s+-qx\s+'([^']+)'",
+            command,
+        )
+        if not match:
+            stderr.write(
+                b"unparsable sha256sum revalidate: "
+                + command.encode()
+                + b"\n"
+            )
+            return 2
+        name = self._resolve(match.group(1), cwd)
+        expected = match.group(2).lower()
+        if name not in self.remote_fs:
+            stderr.write(
+                f"sha256sum: {name}: No such file or directory\n".encode()
+            )
+            return 1
+        digest = hashlib.sha256(self.remote_fs[name]).hexdigest()
+        if digest != expected:
+            stderr.write(
+                f"sha256sum: {posixpath.basename(name)}: FAILED\n".encode()
+            )
+            return 1
+        stdout.write(f"{digest}\n".encode())
+        return 0
 
     def _sha256sum_check(
         self, command: str, stderr: io.BytesIO, cwd: str | None

@@ -14,6 +14,7 @@ from common import (
     ChecksumError,
     Config,
     MissingArtifactError,
+    RemoteCommandError,
     WPSSHBackupError,
     checksum_name,
     db_archive_name,
@@ -877,7 +878,17 @@ def test_extract_files_rejects_special_members_in_listing(
     )
 
     with pytest.raises(WPSSHBackupError, match="unsupported member type"):
-        restore.extract_files(client, config, staging, TS)
+        restore.extract_files(
+            client,
+            config,
+            staging,
+            TS,
+            expected_digest=hashlib.sha256(
+                client.remote_fs[
+                    posixpath.join(staging, files_archive_name(TS))
+                ]
+            ).hexdigest(),
+        )
 
     assert not any(
         command.startswith("tar xzf ") for command in client.commands)
@@ -1287,6 +1298,129 @@ def test_validate_members_fails_closed_on_undecodable_line(
         restore._validate_members(archive, client)
 
 
+def test_validate_members_rejects_duplicate_symlink_member(
+    tmp_path: Path,
+) -> None:
+    """Duplicate member names must be rejected, not last-wins.
+
+    Regression: the link map was keyed by normalised member name, so a
+    crafted archive could put an escaping symlink first and a safe
+    duplicate last — validation would only see the safe target while
+    tar extracts in archive order. Any duplicate member name is now
+    rejected before extraction.
+    """
+    import io
+    import tarfile
+
+    client = FakeSSHClient(SITE_ROOT, wp_cli="/usr/bin/wp")
+    archive = posixpath.join(
+        staging_dir_for(SITE_ROOT, "20261014T1000Z"),
+        files_archive_name(TS),
+    )
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as tar:
+        info = tarfile.TarInfo("wp-config.php")
+        info.size = len(b"<?php\n")
+        tar.addfile(info, io.BytesIO(b"<?php\n"))
+        escaping = tarfile.TarInfo("uploads/link")
+        escaping.type = tarfile.SYMTYPE
+        escaping.linkname = "../../private.txt"
+        tar.addfile(escaping)
+        safe = tarfile.TarInfo("uploads/link")
+        safe.type = tarfile.SYMTYPE
+        safe.linkname = "safe-target.txt"
+        tar.addfile(safe)
+    client.remote_fs[archive] = buffer.getvalue()
+
+    with pytest.raises(WPSSHBackupError, match="duplicate member"):
+        restore._validate_members(archive, client)
+
+
+def test_validate_members_rejects_duplicate_regular_member(
+    tmp_path: Path,
+) -> None:
+    """Two regular members with the same normalised name are rejected."""
+    import io
+    import tarfile
+
+    client = FakeSSHClient(SITE_ROOT, wp_cli="/usr/bin/wp")
+    archive = posixpath.join(
+        staging_dir_for(SITE_ROOT, "20261014T1000Z"),
+        files_archive_name(TS),
+    )
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as tar:
+        first = tarfile.TarInfo("wp-content/index.php")
+        first.size = len(b"first")
+        tar.addfile(first, io.BytesIO(b"first"))
+        second = tarfile.TarInfo("wp-content/index.php")
+        second.size = len(b"second")
+        tar.addfile(second, io.BytesIO(b"second"))
+    client.remote_fs[archive] = buffer.getvalue()
+
+    with pytest.raises(WPSSHBackupError, match="duplicate member"):
+        restore._validate_members(archive, client)
+
+
+def test_run_restore_rejects_remote_archive_swapped_after_checksum(
+    tmp_path: Path,
+) -> None:
+    """A remote archive swapped after checksum verify must not extract.
+
+    Regression: the checksum was verified while the staging path was
+    mutable, and _validate_members/extract_files later used the same
+    path — a process running as the same SSH user could replace the
+    archive after the check, and tar would validate or extract bytes
+    never covered by the verified digest. The consuming extraction now
+    re-derives the digest inside the same remote command and aborts on
+    any mismatch, so swapped bytes are never extracted.
+    """
+    set_files = make_local_set(tmp_path / "backups", TS)
+    client = FakeSSHClient(SITE_ROOT, wp_cli="/usr/bin/wp")
+    config = make_config(tmp_path)
+    live_path = posixpath.join(SITE_ROOT, "wp-config.php")
+    client.remote_fs[live_path] = b"original site configuration"
+    staging = staging_dir_for(SITE_ROOT, "20261014T1000Z")
+    archive_name = files_archive_name(TS)
+    archive_path = posixpath.join(staging, archive_name)
+    original = _archive_with_special_member(b"0")  # benign regular archive
+    swapped = b"attacker-bytes"  # not a valid tarball; must never be read
+
+    # Stage a valid uploaded archive plus its manifest directly (the
+    # upload itself is not under test), then simulate a same-user
+    # attacker swapping the staging archive AFTER
+    # verify_remote_checksums hashed it, right before the consuming
+    # extraction re-hashes.
+    client.remote_fs[archive_path] = original
+    client.remote_fs[
+        posixpath.join(staging, checksum_name(archive_name))
+    ] = f"{hashlib.sha256(original).hexdigest()}  {archive_name}\n".encode()
+
+    original_execute = client._execute
+
+    def swap_before_extract(command, stdout, stderr, cwd=None):
+        if "sha256sum" in command and "| cut -d' ' -f1" in command:
+            # The extraction revalidation is running: swap the archive
+            # first so the revalidate sees different bytes than the
+            # earlier checksum verification.
+            client.remote_fs[archive_path] = swapped
+        return original_execute(command, stdout, stderr, cwd)
+
+    client._execute = swap_before_extract  # type: ignore[method-assign]
+
+    with pytest.raises(RemoteCommandError):
+        restore.run_restore(
+            client, config, set_files, True, False,
+            staging_bid="20261014T1000Z",
+        )
+
+    # Nothing was extracted; the live tree is untouched.
+    assert client.remote_fs[live_path] == b"original site configuration"
+    assert posixpath.join(SITE_ROOT, "wp-content/index.php") not in (
+        client.remote_fs
+    )
+
+
 def test_extract_files_rejects_preexisting_symlinked_dir(
     tmp_path: Path,
 ) -> None:
@@ -1573,7 +1707,8 @@ def test_extract_files_rejects_preexisting_hardlink_at_member_path(
         f"{hashlib.sha256(buffer.getvalue()).hexdigest()}  {archive_name}\n"
     )
 
-    with pytest.raises(WPSSHBackupError, match="already exists as a hard link"):
+    with pytest.raises(WPSSHBackupError,
+                       match="already exists as a hard link"):
         restore.run_restore(
             client,
             config,
@@ -1755,8 +1890,6 @@ def test_extract_files_follows_dotted_symlink_chain(
     import io
     import tarfile
 
-    backup_dir = tmp_path / "backups"
-    set_files = make_local_set(backup_dir, TS)
     client = FakeSSHClient(SITE_ROOT, wp_cli="/usr/bin/wp")
 
     archive_name = files_archive_name(TS)
@@ -1785,6 +1918,8 @@ def test_extract_files_follows_dotted_symlink_chain(
     # final resolved target.
     assert "index.php" in writes.link_targets
     assert "uploads/b" not in writes.link_targets
+
+
 def test_extract_files_rejects_absolute_symlink(tmp_path: Path) -> None:
     """A symlink with an absolute target must be rejected."""
     import io

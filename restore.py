@@ -603,7 +603,6 @@ class _ArchiveWrites:
     would complete an escape chain during extraction.
     """
 
-
     member_paths: frozenset[str]
     link_targets: frozenset[str]
 
@@ -625,6 +624,12 @@ def _validate_members(
     including chains that would escape via another member.
     Only regular files, directories, and validated links are permitted;
     special and unknown member types are rejected before extraction.
+    Every member name must also be unique after normalisation: duplicate
+    names let a crafted archive hide an escaping symlink under a later
+    safe duplicate (a dict keyed by name would only validate the last
+    occurrence) or make extraction write the same path twice with
+    different types. The backup tool never writes duplicate members, so
+    any duplicate is rejected.
 
     The listing is requested with --quoting-style=shell-always so every
     name and link target is exactly one shell token even when it contains
@@ -657,6 +662,7 @@ def _validate_members(
     )
     out = run_remote_cmd_checked(client, command, timeout=1800)
     member_paths: set[str] = set()
+    seen_first_pass: set[str] = set()
     for line in out.splitlines():
         if not line.strip():
             continue
@@ -676,6 +682,12 @@ def _validate_members(
                 f"Refusing to extract {archive}: member {name!r} escapes "
                 "the site root."
             )
+        if normalised in seen_first_pass:
+            raise WPSSHBackupError(
+                f"Refusing to extract {archive}: duplicate member "
+                f"{normalised!r}"
+            )
+        seen_first_pass.add(normalised)
         member_paths.add(normalised)
     # Symlink targets are only visible in the verbose listing; use the
     # quoted verbose listing to check where links point, following chains
@@ -688,6 +700,7 @@ def _validate_members(
     regular_members: set[str] = set()
     links: dict[str, str] = {}
     hard_links: list[tuple[str, str]] = []
+    seen_names: set[str] = set()
     for line in verbose.splitlines():
         if not line.strip():
             continue
@@ -718,16 +731,30 @@ def _validate_members(
                 f"{kind!r} in tar listing line {line!r}"
             )
         if kind == "l" and len(fields) >= 8 and fields[-2] == "->":
+            normalised = posixpath.normpath(fields[-3].lstrip("/"))
+            if normalised in seen_names:
+                raise WPSSHBackupError(
+                    f"Refusing to extract {archive}: duplicate member "
+                    f"{normalised!r}"
+                )
+            seen_names.add(normalised)
             # Store the link name in the same normalised form resolution
             # uses: the raw tar spelling (e.g. './uploads/a') must not
             # create a chain keyed differently from the lookups, or an
             # escape through a second link would pass validation.
-            links[posixpath.normpath(fields[-3].lstrip("/"))] = fields[-1]
+            links[normalised] = fields[-1]
         elif (
             kind == "h"
             and len(fields) >= 9
             and fields[-3:-1] == ["link", "to"]
         ):
+            normalised = posixpath.normpath(fields[-4].lstrip("/"))
+            if normalised in seen_names:
+                raise WPSSHBackupError(
+                    f"Refusing to extract {archive}: duplicate member "
+                    f"{normalised!r}"
+                )
+            seen_names.add(normalised)
             hard_links.append((fields[-4], fields[-1]))
         elif kind in ("l", "h"):
             raise WPSSHBackupError(
@@ -735,9 +762,24 @@ def _validate_members(
                 f"listing line {line!r}"
             )
         elif kind == "-":
+            normalised = posixpath.normpath(fields[-1].lstrip("/"))
+            if normalised in seen_names:
+                raise WPSSHBackupError(
+                    f"Refusing to extract {archive}: duplicate member "
+                    f"{normalised!r}"
+                )
+            seen_names.add(normalised)
             # Only REGULAR members may serve as hard-link targets; a
             # directory (kind 'd') or anything exotic must not.
-            regular_members.add(fields[-1].lstrip("/"))
+            regular_members.add(normalised)
+        elif kind == "d":
+            normalised = posixpath.normpath(fields[-1].lstrip("/"))
+            if normalised in seen_names:
+                raise WPSSHBackupError(
+                    f"Refusing to extract {archive}: duplicate member "
+                    f"{normalised!r}"
+                )
+            seen_names.add(normalised)
 
     def _resolve_link(link: str, target: str, seen: set[str]) -> str:
         """Resolve link -> target through the archive's own links."""
@@ -901,11 +943,67 @@ def extract_files(
     config: Config,
     staging: str,
     ts: str,
+    expected_digest: str,
 ) -> None:
-    archive = posixpath.join(staging, files_archive_name(ts))
-    writes = _validate_members(archive, client)
+    """Validate and extract the files archive into the site root.
+
+    The archive's checksum was verified earlier (verify_remote_checksums)
+    while the file was still a mutable pathname: a process running as
+    the same SSH user could replace the staging archive afterwards, so
+    tar would validate or extract bytes that were never covered by the
+    returned digest. To keep the validated bytes the consumed bytes, the
+    digest is re-derived and compared inside the SAME remote command
+    that extracts: `sha256sum ... | cut ... | grep -qx <digest> && tar
+    xzf ...` — extraction never starts unless the archive's bytes at
+    that instant still match the digest this run verified.
+
+    Member validation and the destination-tree audit still run first
+    (they are checks, not consumption); the consuming extraction is the
+    one bound to the verified digest, so a swap at any earlier point is
+    caught before tar writes anything.
+
+    Args:
+        client: An active SSH client connected to the remote host.
+        config: The backup configuration.
+        staging: The remote staging directory holding the archive.
+        ts: The backup identifier the archive name is derived from.
+        expected_digest: The SHA-256 digest verify_remote_checksums()
+            computed for the uploaded archive; extraction aborts unless
+            the archive still has it.
+    """
+    name = files_archive_name(ts)
+    writes = _validate_members(posixpath.join(staging, name), client)
     _audit_destination_tree(client, config.wp_site_root, writes)
-    command = f"tar xzf {shquote(archive)} -C {shquote(config.wp_site_root)}"
+    _extract_verified_archive(
+        client, staging, name, expected_digest, config.wp_site_root
+    )
+
+
+def _extract_verified_archive(
+    client: paramiko.SSHClient,
+    staging: str,
+    name: str,
+    expected_digest: str,
+    dest: str,
+) -> None:
+    """Revalidate the archive's digest and extract it in one command.
+
+    The revalidation and the extraction are delivered to the host as a
+    single shell command, so there is no round-trip between the check and
+    the consumption in which a same-user process could swap the archive
+    (the residual window is the microseconds inside one shell, the
+    smallest achievable without holding a remote descriptor).
+
+    Raises:
+        RemoteCommandError: If the digest no longer matches (the archive
+            was replaced after verification) or tar fails.
+    """
+    command = (
+        f"cd {shquote(staging)} && "
+        f"sha256sum {shquote(name)} | cut -d' ' -f1 | "
+        f"grep -qx {shquote(expected_digest.lower())} && "
+        f"tar xzf {shquote(name)} -C {shquote(dest)}"
+    )
     run_remote_cmd_checked(client, command, timeout=3600)
 
 
@@ -1007,8 +1105,25 @@ def import_database(
     config: Config,
     staging: str,
     ts: str,
+    expected_digest: str,
 ) -> None:
-    """Import the database from the DB tarball in the staging dir."""
+    """Import the database from the DB tarball in the staging dir.
+
+    Like extract_files, the DB archive is revalidated (digest compared)
+    inside the same remote command that extracts it, so a same-user
+    process that replaced the staging archive after the earlier checksum
+    verification cannot make tar extract bytes that were never covered
+    by the returned digest.
+
+    Args:
+        client: An active SSH client connected to the remote host.
+        config: The backup configuration.
+        staging: The remote staging directory holding the archive.
+        ts: The backup identifier the archive name is derived from.
+        expected_digest: The SHA-256 digest verify_remote_checksums()
+            computed for the uploaded DB archive; extraction aborts
+            unless the archive still has it.
+    """
     archive = posixpath.join(staging, db_archive_name(ts))
     dump_name = f"wp-db-{ts}.sql"
     dump_path = posixpath.join(staging, dump_name)
@@ -1018,11 +1133,10 @@ def import_database(
     # require exactly the expected regular SQL dump before tar runs.
     _validate_db_members(archive, client, ts)
 
-    # Extract the SQL dump from the tarball.
-    run_remote_cmd_checked(
-        client,
-        f"tar xzf {shquote(archive)} -C {shquote(staging)}",
-        timeout=1800,
+    # Extract the SQL dump from the tarball, revalidating the digest in
+    # the same remote command that extracts.
+    _extract_verified_archive(
+        client, staging, db_archive_name(ts), expected_digest, staging
     )
 
     if wp_cli:
@@ -1172,12 +1286,26 @@ def run_restore(
                         "uploaded archive. Refusing to extract."
                     )
                 started = _now()
-                extract_files(client, config, staging, backup_bid)
+                extract_files(
+                    client,
+                    config,
+                    staging,
+                    backup_bid,
+                    expected_digest=remote_digests[files_name],
+                )
                 print(f"Files extracted ({_now() - started:.1f}s).")
 
             if include_database:
                 started = _now()
-                import_database(client, config, staging, backup_bid)
+                import_database(
+                    client,
+                    config,
+                    staging,
+                    backup_bid,
+                    expected_digest=remote_digests[
+                        db_archive_name(backup_bid)
+                    ],
+                )
                 print(f"Database imported ({_now() - started:.1f}s).")
     except (
         WPSSHBackupError,

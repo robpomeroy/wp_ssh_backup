@@ -839,6 +839,122 @@ the old code they were left to the refcount.
     assert all(handle.closed for handle in captured)
 
 
+def test_publish_downloads_recheck_rejects_replaced_final(
+    backup_dir: Path,
+) -> None:
+    """A final replaced after its own verification must fail the run.
+
+    Regression: the per-final inode check only covered the instant it
+    ran — a final verified early in the loop could be unlinked and
+    replaced while the remaining files published, and publish_downloads
+    would still report success with a mismatched archive/manifest pair.
+    The final all-finals re-check (under the publication lock) now
+    rejects any final that no longer references the inode this run
+    published, and the run rolls back.
+
+    Skipped on Windows: the held download descriptors prevent the
+    replacement there (the scenario is POSIX-specific), and the rollback
+    cannot rename an open file on Windows anyway.
+    """
+    if os.name == "nt":
+        pytest.skip(
+            "Windows publication holds the temp descriptors open, so a "
+            "final cannot be unlinked-and-replaced while they are held; "
+            "the scenario is POSIX-specific"
+        )
+    import unittest.mock
+
+    archive = files_archive_name(TS)
+    temp_paths = make_temp_set(backup_dir, archive)
+    digests = digests_for(temp_paths)
+
+    original_verify = backup._verify_published_inode
+
+    def replacing_verify(
+        handle: BinaryIO, final_path: Path, expected_sha256: str
+    ) -> None:
+        original_verify(handle, final_path, expected_sha256)
+        if final_path.name == archive:
+            # The archive was just verified; a writer now replaces it
+            # with a different inode while the checksum file publishes.
+            (backup_dir / archive).unlink()
+            (backup_dir / archive).write_bytes(b"attacker-bytes")
+
+    with unittest.mock.patch.object(
+        backup, "_verify_published_inode", replacing_verify
+    ):
+        with pytest.raises(
+            WPSSHBackupError, match="Refusing to report success"
+        ):
+            backup.publish_downloads(
+                temp_paths,
+                [archive],
+                backup_dir,
+                digests,
+                make_downloaded_fds(temp_paths),
+            )
+
+    # The attacker's replacement is not this run's inode, so rollback
+    # leaves it in place; the checksum final this run created was rolled
+    # back; the temps remain for the caller's cleanup.
+    assert (backup_dir / archive).read_bytes() == b"attacker-bytes"
+    assert not (backup_dir / checksum_name(archive)).exists()
+    assert temp_paths[archive].is_file()
+    assert temp_paths[checksum_name(archive)].is_file()
+    # The publication lock was released even on failure.
+    assert not (backup_dir / backup._PUBLISH_LOCK_NAME).exists()
+
+
+def test_publish_downloads_release_lock_on_success(
+    backup_dir: Path,
+) -> None:
+    """A successful publication releases the exclusive lock."""
+    archive = files_archive_name(TS)
+    temp_paths = make_temp_set(backup_dir, archive)
+
+    backup.publish_downloads(
+        temp_paths,
+        [archive],
+        backup_dir,
+        digests_for(temp_paths),
+        make_downloaded_fds(temp_paths),
+    )
+
+    assert not (backup_dir / backup._PUBLISH_LOCK_NAME).exists()
+
+
+def test_publish_downloads_lock_blocks_concurrent_publish(
+    backup_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A held publish lock fails the run instead of interleaving."""
+    import re
+    import unittest.mock
+
+    archive = files_archive_name(TS)
+    temp_paths = make_temp_set(backup_dir, archive)
+    lock = backup_dir / backup._PUBLISH_LOCK_NAME
+    lock.write_bytes(b"12345\n")
+    # Avoid the retry sleeps: the lock is held the whole time.
+    monkeypatch.setattr(
+        backup, "time", unittest.mock.Mock(sleep=lambda _: None)
+    )
+
+    with pytest.raises(
+        WPSSHBackupError, match=re.escape("Another backup is publishing")
+    ):
+        backup.publish_downloads(
+            temp_paths,
+            [archive],
+            backup_dir,
+            digests_for(temp_paths),
+            make_downloaded_fds(temp_paths),
+        )
+
+    # A lock we did not create must not be removed.
+    assert lock.exists()
+
+
 def test_publish_by_rename_publishes_verified_inode(
     tmp_path: Path,
 ) -> None:
