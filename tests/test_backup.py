@@ -1036,6 +1036,48 @@ def test_publish_downloads_lock_unparseable_reclaimed_after_grace(
     assert not lock.exists()
 
 
+def test_steal_stale_lock_does_not_steal_new_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stale-lock steal must not remove a lock re-created meanwhile.
+
+    Regression: the steal renamed the lock by PATHNAME after an
+    unprotected liveness check. Two contenders observing the same dead
+    PID could both proceed: one reclaims the old lock and creates a new
+    one, then the other renames that NEW (live) lock to its quarantine
+    path and unlinks it — both then publish concurrently, defeating the
+    lock. The steal is now inode-bound: the lock's inode is captured
+    before the rename, and the renamed entry is unlinked only if it is
+    still that same inode; a different (newer) lock is restored instead.
+    """
+    lock = tmp_path / backup._PUBLISH_LOCK_NAME
+    # A stale lock owned by a dead PID.
+    lock.write_text(f"{2**30}\n")
+    original_rename = os.rename
+
+    def rename_new_lock(src, dst):
+        if src == lock:
+            # Simulate the other contender: it already reclaimed the
+            # stale lock and created a NEW live lock at the name, so
+            # this process's rename moves the NEW lock, not the stale
+            # one it read. The new lock is a genuinely different inode
+            # (unlink + recreate, not an in-place truncate).
+            lock.unlink()
+            lock.write_text(f"{os.getpid()}\n")
+        return original_rename(src, dst)
+
+    monkeypatch.setattr(backup.os, "rename", rename_new_lock)
+
+    # The steal must refuse: the renamed entry is a NEW live lock (a
+    # different inode than the stale one that was read), so it is
+    # restored and the name is NOT freed.
+    assert backup._steal_stale_lock(lock) is False
+    # The new lock is preserved (restored to the name).
+    assert lock.exists()
+    assert lock.read_text().strip() == str(os.getpid())
+
+
 def test_publish_by_rename_publishes_verified_inode(
     tmp_path: Path,
 ) -> None:
@@ -1147,8 +1189,11 @@ def test_publish_by_rename_rejects_swapped_source_before_rename(
         WPSSHBackupError, match="was replaced after verification"
     ):
         backup._publish_by_rename(handle, temp, final)
-    # The unverified replacement must not sit under the final name.
-    assert not final.exists()
+    # The replacement inode was moved into the final name, but it is NOT
+    # this run's verified inode, so the rollback leaves it in place
+    # rather than deleting another process's file. The run fails instead
+    # of publishing unverified bytes under the final name.
+    assert final.read_bytes() == b"attacker-bytes"
 
 
 def test_publish_by_rename_refuses_existing_destination(

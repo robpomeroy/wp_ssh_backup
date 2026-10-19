@@ -583,13 +583,18 @@ def _steal_stale_lock(lock: Path) -> bool:
     process or staleness cannot be proven, in which case the caller
     keeps retrying normally.
 
-    The reclaim is a same-directory rename to a unique name only this
-    process knows: two processes racing to steal the same stale lock
-    cannot both win (the loser's rename fails with FileNotFoundError),
-    and a lock that was re-created by a live process between the
-    liveness probe and the rename is simply not the inode being moved.
-    A crash between the rename and the unlink leaves a .stale- file but
-    frees the lock name, which is all that matters.
+    The reclaim is inode-bound, not pathname-bound: the lock's inode is
+    captured (lstat) at the same moment its dead PID is read, the lock
+    is renamed to a unique name only this process knows, and the renamed
+    entry is unlinked ONLY if it is still that same inode. A contender
+    that observed the same dead PID cannot steal a lock a second
+    contender re-created in between: the second contender's rename moves
+    the OLD inode, and if a NEW lock was created at the name before this
+    process's rename, the renamed entry is a different inode and is
+    renamed back (best-effort) instead of being unlinked — so a live
+    lock is never freed. A crash between the rename and the unlink
+    leaves a .stale- file but frees the lock name, which is all that
+    matters.
     """
     try:
         pid = int(lock.read_text(encoding="ascii", errors="strict").strip())
@@ -606,6 +611,13 @@ def _steal_stale_lock(lock: Path) -> bool:
     else:
         if _pid_alive(pid):
             return False
+    # Capture the inode of the lock we are about to reclaim, so the
+    # unlink below can never remove a different (newer) lock.
+    try:
+        st = os.lstat(lock)
+        lock_identity = (st.st_dev, st.st_ino)
+    except OSError:
+        return False  # lock vanished; retry creation
     stale = _quarantine_name(lock)
     try:
         os.rename(lock, stale)
@@ -613,6 +625,21 @@ def _steal_stale_lock(lock: Path) -> bool:
         # Another process stole it first; the name is free, retry create.
         return True
     except OSError:
+        return False
+    try:
+        st = os.lstat(stale)
+    except OSError:
+        # The renamed entry is gone; the name is free, retry create.
+        return True
+    if (st.st_dev, st.st_ino) != lock_identity:
+        # The renamed entry is NOT the stale lock we read: a new lock
+        # was created at the name between our read and our rename, and
+        # our rename moved that new (possibly live) lock. Restore it
+        # (best-effort) and do NOT free the name.
+        try:
+            os.rename(stale, lock)
+        except OSError:
+            pass
         return False
     try:
         os.unlink(stale)
@@ -983,8 +1010,10 @@ def _publish_by_rename(
     re-opened no-follow and re-identified; the caller verifies the
     published inode through the returned handle. If the published file
     cannot be re-opened and identified, it is removed — but only while
-    it still references the inode this run published; a replacement
-    installed by another process is left in place.
+    it still references the inode this run published (the held inode,
+    captured before publication, never a post-publication lstat that a
+    writer could have raced); a replacement installed by another
+    process is left in place.
     """
     if os.name == "posix":
         # POSIX: os.rename() replaces an existing destination, so the
@@ -1011,14 +1040,14 @@ def _publish_by_rename(
                 f"Refusing to overwrite existing backup file: {final_path}"
             ) from exc
         try:
-            linked = os.lstat(final_path)
-            linked_identity = (linked.st_dev, linked.st_ino)
-        except OSError:
-            linked_identity = None
-        try:
             fd = _open_nofollow_regular(final_path)
         except BaseException:
-            _unlink_if_same_inode(final_path, linked_identity)
+            # The published entry is removed only while it still
+            # references the inode this run linked (the held inode). A
+            # writer who replaced final_path after the link installed a
+            # different inode; removing it would delete another
+            # process's file, so the replacement is left in place.
+            _unlink_if_same_inode(final_path, held_identity)
             raise
         try:
             _assert_nofollow_regular(fd, final_path)
@@ -1040,7 +1069,7 @@ def _publish_by_rename(
                 os.close(fd)
             except OSError:
                 pass
-            _unlink_if_same_inode(final_path, linked_identity)
+            _unlink_if_same_inode(final_path, held_identity)
             raise
         return new_handle
 
@@ -1081,14 +1110,14 @@ def _publish_by_rename(
             f"Refusing to overwrite existing backup file: {final_path}"
         ) from exc
     try:
-        renamed = os.lstat(final_path)
-        renamed_identity = (renamed.st_dev, renamed.st_ino)
-    except OSError:
-        renamed_identity = None
-    try:
         fd = _open_nofollow_regular(final_path)
     except BaseException:
-        _unlink_if_same_inode(final_path, renamed_identity)
+        # The renamed entry is removed only while it still references
+        # the inode this run renamed (the held inode). A writer who
+        # replaced final_path after the rename installed a different
+        # inode; removing it would delete another process's file, so
+        # the replacement is left in place.
+        _unlink_if_same_inode(final_path, held_identity)
         raise
     try:
         _assert_nofollow_regular(fd, final_path)
@@ -1110,7 +1139,7 @@ def _publish_by_rename(
             os.close(fd)
         except OSError:
             pass
-        _unlink_if_same_inode(final_path, renamed_identity)
+        _unlink_if_same_inode(final_path, held_identity)
         raise
     return new_handle
 
