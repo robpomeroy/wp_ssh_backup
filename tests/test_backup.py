@@ -1083,6 +1083,57 @@ def test_steal_stale_lock_does_not_steal_new_lock(
     assert lock.read_text().strip() == str(os.getpid())
 
 
+def test_steal_stale_lock_restore_does_not_clobber_newer_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Restoring a quarantined lock must never replace a newer lock.
+
+    Regression: after the stale inode was quarantined, the restore used
+    os.rename(stale, lock), which REPLACES a lock another contender
+    created at the name in the meantime (POSIX rename overwrites). That
+    contender would believe it still held the lock while this process
+    published. The restore is now a no-replace hard link: when the name
+    is already taken, the quarantined entry is left in place and the
+    newer lock is untouched.
+    """
+    lock = tmp_path / backup._PUBLISH_LOCK_NAME
+    lock.write_text(f"{2**30}\n")  # stale lock, dead PID
+    original_rename = os.rename
+    # Distinct contents so the assertion can tell the two contenders
+    # apart: the FIRST lock is the one this process's rename moves to
+    # the quarantine path; the SECOND is the one that must survive.
+    first_pid = os.getpid()
+    second_pid = os.getpid() + 1
+
+    def rename_moves_new_lock(src, dst):
+        if src == lock:
+            # A contender already reclaimed the stale lock and created a
+            # NEW lock at the name, so this process's rename moves the
+            # NEW lock (a different inode) to the quarantine path.
+            first = tmp_path / "contender-lock-1"
+            first.write_text(f"{first_pid}\n")
+            os.replace(first, lock)
+            result = original_rename(src, dst)
+            # Before the restore runs, ANOTHER contender takes the name.
+            second = tmp_path / "contender-lock-2"
+            second.write_text(f"{second_pid}\n")
+            os.replace(second, lock)
+            return result
+        return original_rename(src, dst)
+
+    monkeypatch.setattr(backup.os, "rename", rename_moves_new_lock)
+
+    # The steal must refuse and must NOT clobber the contender's lock.
+    assert backup._steal_stale_lock(lock) is False
+    assert lock.exists()
+    # The SECOND contender's lock must still be at the name: a
+    # replacing restore would have overwritten it with the first one.
+    assert lock.read_text().strip() == str(second_pid)
+    # The quarantined entry was left in place rather than deleted.
+    assert any(".quarantine-" in p.name for p in tmp_path.iterdir())
+
+
 def test_publish_by_rename_publishes_verified_inode(
     tmp_path: Path,
 ) -> None:

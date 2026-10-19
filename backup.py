@@ -536,28 +536,42 @@ def _pid_alive(pid: int) -> bool:
 
     On POSIX, signal 0 to a process is a pure liveness check (no signal
     is delivered). On Windows, signal 0 is rejected by os.kill, so an
-    OpenProcess handle probe is used instead: it has no side effects and
-    fails only when the PID does not name a process at all.
+    OpenProcess handle probe is used instead. A NULL handle alone does
+    NOT prove the process is gone: OpenProcess also fails with
+    ERROR_ACCESS_DENIED for a live process owned by another account (or
+    one that is protected). Only ERROR_INVALID_PARAMETER — what
+    OpenProcess reports for a PID that names no process — is treated as
+    dead; every other failure is uncertain and treated as alive.
     """
     if os.name == "nt":
         try:
             import ctypes
 
-            open_process = ctypes.windll.kernel32.OpenProcess
+            # use_last_error=True so GetLastError() is captured reliably
+            # (ctypes may otherwise clobber it between calls).
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            open_process = kernel32.OpenProcess
             open_process.restype = ctypes.c_void_p
             open_process.argtypes = [
                 ctypes.c_uint32,  # dwDesiredAccess
                 ctypes.c_int,     # bInheritHandle
                 ctypes.c_uint32,  # dwProcessId
             ]
+            close_handle = kernel32.CloseHandle
+            close_handle.restype = ctypes.c_int
+            # c_void_p: a 64-bit handle must not be truncated to an int.
+            close_handle.argtypes = [ctypes.c_void_p]
             # QUERY_LIMITED_INFORMATION: a no-side-effect probe.
             handle = open_process(0x1000, False, pid)
             if handle:
-                ctypes.windll.kernel32.CloseHandle(handle)
+                close_handle(handle)
                 return True
-            # OpenProcess returned NULL: no such process (or it died
-            # between the check and the handle).
-            return False
+            err = ctypes.get_last_error()
+            # ERROR_INVALID_PARAMETER (87): the PID names no process.
+            # ERROR_ACCESS_DENIED (5) and anything else: the process may
+            # well exist (another account, protected, or a transient
+            # failure), so treat it as alive and never steal its lock.
+            return err != 87
         except (OSError, AttributeError):
             # Probe unavailable: treat as alive rather than stealing.
             return True
@@ -591,7 +605,8 @@ def _steal_stale_lock(lock: Path) -> bool:
     contender re-created in between: the second contender's rename moves
     the OLD inode, and if a NEW lock was created at the name before this
     process's rename, the renamed entry is a different inode and is
-    renamed back (best-effort) instead of being unlinked — so a live
+    restored with a NO-REPLACE hard link (never renaming over a lock
+    another contender created) instead of being unlinked — so a live
     lock is never freed. A crash between the rename and the unlink
     leaves a .stale- file but frees the lock name, which is all that
     matters.
@@ -635,10 +650,23 @@ def _steal_stale_lock(lock: Path) -> bool:
         # The renamed entry is NOT the stale lock we read: a new lock
         # was created at the name between our read and our rename, and
         # our rename moved that new (possibly live) lock. Restore it
-        # (best-effort) and do NOT free the name.
+        # with a NO-REPLACE operation: os.rename would replace a lock
+        # another contender created at the name in the meantime, making
+        # its owner believe it still holds the lock while we publish.
+        # A hard link fails with FileExistsError when the name is taken;
+        # the quarantined entry is then left in place (never deleted)
+        # rather than clobbering the newcomer.
         try:
-            os.rename(stale, lock)
+            os.link(stale, lock)
         except OSError:
+            # The name is taken (or linking is unsupported): leave the
+            # quarantined entry alone and do not free the name.
+            return False
+        try:
+            os.unlink(stale)
+        except OSError:
+            # The lock is restored; the quarantine name is now a second
+            # link to it and removing it is best-effort.
             pass
         return False
     try:
