@@ -1061,10 +1061,15 @@ def test_steal_stale_lock_does_not_steal_new_lock(
             # Simulate the other contender: it already reclaimed the
             # stale lock and created a NEW live lock at the name, so
             # this process's rename moves the NEW lock, not the stale
-            # one it read. The new lock is a genuinely different inode
-            # (unlink + recreate, not an in-place truncate).
-            lock.unlink()
-            lock.write_text(f"{os.getpid()}\n")
+            # one it read. The new lock must be a genuinely different
+            # inode: unlink+recreate can reuse the freed inode number
+            # (ext4/tmpfs), and os.rename cannot replace an existing
+            # destination on Windows, so the new lock is written to a
+            # separate path and moved over the name with os.replace
+            # (a distinct function, unaffected by this monkeypatch).
+            fresh = tmp_path / "fresh-lock"
+            fresh.write_text(f"{os.getpid()}\n")
+            os.replace(fresh, lock)
         return original_rename(src, dst)
 
     monkeypatch.setattr(backup.os, "rename", rename_new_lock)
@@ -1140,8 +1145,11 @@ def test_publish_by_rename_rejects_swapped_regular_source(
         WPSSHBackupError, match="was replaced after verification"
     ):
         backup._publish_by_rename(handle, temp, final)
-    # The unverified replacement must not sit under the final name.
-    assert not final.exists()
+    # The replacement inode was linked into the final name, but it is NOT
+    # this run's verified inode, so the rollback leaves it in place
+    # rather than deleting another process's file. The run fails instead
+    # of publishing unverified bytes under the final name.
+    assert final.read_bytes() == b"attacker-bytes"
 
 
 @pytest.mark.skipif(

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import errno
 import hashlib
+import os
 import posixpath
 from pathlib import Path
 
@@ -969,6 +970,48 @@ def test_run_restore_rejects_local_archive_changed_after_upload(
 
     staging = staging_dir_for(SITE_ROOT, "20261014T1000Z")
     assert staging not in client.directories
+
+
+def test_validate_local_member_types_hashes_trailing_bytes(
+    tmp_path: Path,
+) -> None:
+    """The type-check digest must cover bytes tarfile leaves buffered.
+
+    Regression: the trailing drain read from the raw handle instead of
+    the _HashingReader, so bytes tarfile had buffered past the last
+    member were omitted from the digest. A valid gzip tar with appended
+    trailing bytes could then produce a digest matching the uploaded
+    archive even though the type check never hashed the complete file.
+    The drain now reads through the hashing reader, so the digest covers
+    every byte of the file.
+    """
+    import io
+    import tarfile
+
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as tar:
+        info = tarfile.TarInfo("wp-config.php")
+        data = b"<?php\n"
+        info.size = len(data)
+        tar.addfile(info, io.BytesIO(data))
+    tar_bytes = buffer.getvalue()
+    # A valid gzip tar with a large block of appended trailing bytes.
+    trailing = b"X" * (2 * 1024 * 1024)
+    full = tar_bytes + trailing
+
+    archive = tmp_path / files_archive_name(TS)
+    archive.write_bytes(full)
+    fd = os.open(archive, os.O_RDONLY)
+    handle = os.fdopen(fd, "rb")
+    try:
+        digest = restore._validate_local_member_types(archive, handle)
+    finally:
+        handle.close()
+
+    # The digest must cover the WHOLE file (tar bytes + trailing), not
+    # just the bytes tarfile consumed.
+    assert digest == hashlib.sha256(full).hexdigest()
+    assert digest != hashlib.sha256(tar_bytes).hexdigest()
 
 
 def test_run_restore_rejects_unreadable_local_archive(tmp_path: Path) -> None:

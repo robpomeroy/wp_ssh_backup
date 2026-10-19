@@ -582,7 +582,7 @@ def _validate_local_member_types(
                         "only regular files, directories and links are "
                         "allowed."
                     )
-        while handle.read(1024 * 1024):
+        while reader.read(1024 * 1024):
             pass
     except (tarfile.TarError, EOFError, OSError) as exc:
         raise WPSSHBackupError(
