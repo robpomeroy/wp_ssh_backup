@@ -673,9 +673,17 @@ def _validate_members(
                 f"Refusing to extract {archive}: cannot decode member "
                 f"name from tar listing line {line!r}: {exc}"
             ) from exc
-        # Normalise the member path relative to the site root. GNU tar
-        # strips leading slashes on extraction, so lstrip("/") mirrors
-        # what would land on disk.
+        # Reject an absolute member name outright. GNU tar strips the
+        # leading '/' on extraction, but accepting it would make the
+        # accepted archive format depend on tar's path-stripping
+        # behaviour; the validator's policy is that every member is
+        # relative to the site root.
+        if posixpath.isabs(name):
+            raise WPSSHBackupError(
+                f"Refusing to extract {archive}: member {name!r} is an "
+                "absolute path."
+            )
+        # Normalise the member path relative to the site root.
         normalised = posixpath.normpath(name.lstrip("/"))
         if normalised.startswith("../") or normalised == "..":
             raise WPSSHBackupError(
@@ -1092,6 +1100,14 @@ def _validate_db_members(
             f"({expected!r}), found {len(members)}"
         )
     name, is_link, target, kind = members[0]
+    # Reject an absolute member name before stripping the leading '/':
+    # '/wp-db-<ts>.sql' must not pass the regular-file/name policy as if
+    # it were the relative member the backup tool writes.
+    if posixpath.isabs(name):
+        raise WPSSHBackupError(
+            f"Refusing to extract {archive}: member {name!r} is an "
+            "absolute path."
+        )
     normalised = posixpath.normpath(name.lstrip("/"))
     if (
         is_link

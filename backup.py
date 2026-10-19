@@ -518,12 +518,6 @@ _linkat_cache: ctypes.CDLL | None = None
 _PUBLISH_LOCK_NAME = ".wp-ssh-backup.lock"
 _PUBLISH_LOCK_ATTEMPTS = 40
 _PUBLISH_LOCK_RETRY_DELAY = 0.05
-# A lock whose content cannot be read as a PID is only ever transiently
-# empty: the creator writes its PID immediately after O_EXCL creation.
-# If it stays unparseable for this long, the creator died between
-# os.open and os.write (the exact crash the lock recovery must handle),
-# so the lock is treated as stale.
-_PUBLISH_LOCK_UNPARSEABLE_GRACE = 5.0
 
 
 def _pid_alive(pid: int) -> bool:
@@ -614,18 +608,17 @@ def _steal_stale_lock(lock: Path) -> bool:
     try:
         pid = int(lock.read_text(encoding="ascii", errors="strict").strip())
     except (OSError, ValueError):
-        # Unparseable (the creator died between os.open and os.write, or
-        # the file is garbage). Only reclaim after the grace period: a
-        # transiently-empty live lock is written within microseconds.
-        try:
-            age = time.time() - lock.stat().st_mtime
-        except OSError:
-            return False  # lock vanished; retry creation
-        if age < _PUBLISH_LOCK_UNPARSEABLE_GRACE:
-            return False
-    else:
-        if _pid_alive(pid):
-            return False
+        # Unparseable. Ownership is recorded atomically (the lock is
+        # hard-linked into place only after its PID is written), so a
+        # lock created by this tool is never visible without its owner.
+        # An unparseable lock is therefore corruption or a foreign file,
+        # and it is NEVER reclaimed on age alone: a creator paused
+        # between create and write could still be live, and stealing its
+        # lock would break exclusivity. The administrator recovery path
+        # (delete the lock) covers this case.
+        return False
+    if _pid_alive(pid):
+        return False
     # Capture the inode of the lock we are about to reclaim, so the
     # unlink below can never remove a different (newer) lock.
     try:
@@ -653,15 +646,28 @@ def _steal_stale_lock(lock: Path) -> bool:
         # with a NO-REPLACE operation: os.rename would replace a lock
         # another contender created at the name in the meantime, making
         # its owner believe it still holds the lock while we publish.
-        # A hard link fails with FileExistsError when the name is taken;
-        # the quarantined entry is then left in place (never deleted)
-        # rather than clobbering the newcomer.
         try:
             os.link(stale, lock)
-        except OSError:
-            # The name is taken (or linking is unsupported): leave the
-            # quarantined entry alone and do not free the name.
-            return False
+        except FileExistsError:
+            # The name is taken again: the quarantined lock is left in
+            # place (never deleted) and the name is NOT freed. This is
+            # not a normal retry — the owner of the quarantined lock may
+            # still be publishing, so acquisition must fail loudly.
+            raise WPSSHBackupError(
+                f"Could not restore the publish lock {lock!s}: another "
+                "lock appeared while a newer lock was being quarantined. "
+                f"The quarantined lock is at {stale!s}; verify no backup "
+                "is running, then remove both files and re-run."
+            )
+        except OSError as exc:
+            # Linking is unsupported or failed for another reason: the
+            # quarantined lock cannot be put back, so the name must not
+            # be reused. Fail rather than retrying into a free name.
+            raise WPSSHBackupError(
+                f"Could not restore the publish lock {lock!s}: {exc}. "
+                f"The quarantined lock is at {stale!s}; verify no backup "
+                "is running, then remove both files and re-run."
+            ) from exc
         try:
             os.unlink(stale)
         except OSError:
@@ -694,15 +700,15 @@ def _exclusive_publish_lock(
     Stale locks are reclaimed automatically: the lock records the PID
     of its creator, and when creation fails because a lock already
     exists, the recorded PID is probed. A lock whose creator is
-    verifiably dead (a crash, SIGKILL or host shutdown after os.open
-    succeeded) is atomically renamed aside and removed, so a later run
-    acquires the lock instead of failing. A lock whose PID is alive —
-    including a recycled PID owned by an unrelated live process — is
-    never stolen. If the lock content cannot be read as a PID (the
-    creator died between os.open and writing its PID), it is reclaimed
-    only after a grace period. The final error names the administrator
-    recovery path (delete the lock file) for the rare case where
-    staleness cannot be proven.
+    verifiably dead (a crash, SIGKILL or host shutdown) is atomically
+    renamed aside and removed, so a later run acquires the lock instead
+    of failing. A lock whose PID is alive — including a recycled PID
+    owned by an unrelated live process — is never stolen. Ownership is
+    recorded ATOMICALLY: the PID is written to a private temporary file
+    which is then hard-linked into place, so a lock is never visible
+    without its owner. An unparseable lock is therefore corruption or a
+    foreign file and is never reclaimed on age alone; the final error
+    names the administrator recovery path (delete the lock file).
 
     The lock is released by atomically removing only the inode this
     process created (identity check via _unlink_if_same_inode_atomic):
@@ -715,20 +721,17 @@ def _exclusive_publish_lock(
     a final path without a no-replace operation.
     """
     lock = backup_dir / _PUBLISH_LOCK_NAME
-    fd: int | None = None
+    identity: tuple[int, int] | None = None
     for _ in range(_PUBLISH_LOCK_ATTEMPTS):
-        try:
-            fd = os.open(
-                lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600
-            )
+        identity = _try_create_publish_lock(lock)
+        if identity is not None:
             break
-        except FileExistsError:
-            if _steal_stale_lock(lock):
-                # The stale lock was reclaimed; retry the O_EXCL create
-                # on the next iteration.
-                continue
-            time.sleep(_PUBLISH_LOCK_RETRY_DELAY)
-    if fd is None:
+        if _steal_stale_lock(lock):
+            # The stale lock was reclaimed; retry the create on the
+            # next iteration.
+            continue
+        time.sleep(_PUBLISH_LOCK_RETRY_DELAY)
+    if identity is None:
         raise WPSSHBackupError(
             f"Another backup appears to be publishing to {backup_dir}. "
             "If no backup process is running, the publish lock may be "
@@ -736,18 +739,63 @@ def _exclusive_publish_lock(
             "files) and re-run."
         )
     try:
-        st = os.fstat(fd)
-        identity = (st.st_dev, st.st_ino)
-        os.write(fd, f"{os.getpid()}\n".encode())
         yield
     finally:
-        try:
-            os.close(fd)
-        except OSError:
-            pass
         # Remove only the lock inode this run created; a lock created by
         # a later run after we died must not be unlinked.
         _unlink_if_same_inode_atomic(lock, identity, warn=False)
+
+
+def _try_create_publish_lock(lock: Path) -> tuple[int, int] | None:
+    """Create the publish lock with its owner recorded atomically.
+
+    The PID is written to a private temporary file in the same
+    directory, which is then hard-linked to the lock name. The link is
+    the atomic publication step: the lock name never exists without its
+    owner recorded, so a contender can never observe an empty lock and
+    mistake a live creator for a crashed one. (Writing the PID after an
+    O_EXCL create leaves exactly that window: a creator paused between
+    create and write would look stale.)
+
+    Returns:
+        The (st_dev, st_ino) of the created lock, or None when the lock
+        name is already taken (the caller retries or reclaims).
+    """
+    tmp = _quarantine_name(lock)
+    try:
+        fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except OSError:
+        return None
+    try:
+        try:
+            os.write(fd, f"{os.getpid()}\n".encode())
+            st = os.fstat(fd)
+            identity = (st.st_dev, st.st_ino)
+        finally:
+            os.close(fd)
+        try:
+            # No-replace: fails with FileExistsError if another run
+            # already holds the lock.
+            os.link(tmp, lock)
+        except FileExistsError:
+            return None
+        except OSError:
+            # Hard links unsupported on this filesystem: fall back to a
+            # no-replace rename (Windows refuses to replace; on POSIX
+            # the link above is the normal path).
+            try:
+                os.rename(tmp, lock)
+            except OSError:
+                return None
+            return identity
+        return identity
+    finally:
+        # The temporary name is only a staging name; the lock itself is
+        # a separate link to the same inode.
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
 
 
 def _linkat_libc() -> ctypes.CDLL:

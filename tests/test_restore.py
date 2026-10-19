@@ -584,6 +584,45 @@ def test_import_database_rejects_wrong_name(tmp_path: Path) -> None:
         )
 
 
+def test_import_database_rejects_absolute_member(tmp_path: Path) -> None:
+    """An absolute DB member name must be rejected, not stripped.
+
+    '/wp-db-<ts>.sql' must not pass the regular-file/name policy as if
+    it were the relative member the backup tool writes.
+    """
+    import io
+    import tarfile
+
+    backup_dir = tmp_path / "backups"
+    set_files = make_local_set(backup_dir, TS)
+    client = FakeSSHClient(SITE_ROOT, wp_cli="/usr/bin/wp")
+    config = make_config(tmp_path)
+
+    archive_name = db_archive_name(TS)
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as tar:
+        info = tarfile.TarInfo(f"/wp-db-{TS}.sql")
+        data = b"-- SQL dump\n"
+        info.size = len(data)
+        tar.addfile(info, io.BytesIO(data))
+    archive_path = set_files[archive_name]
+    archive_path.write_bytes(buffer.getvalue())
+    checksum_path = set_files[checksum_name(archive_name)]
+    checksum_path.write_text(
+        f"{hashlib.sha256(buffer.getvalue()).hexdigest()}  {archive_name}\n"
+    )
+
+    with pytest.raises(WPSSHBackupError, match="absolute path"):
+        restore.run_restore(
+            client,
+            config,
+            set_files,
+            False,
+            True,
+            staging_bid="20261014T1000Z",
+        )
+
+
 def test_import_database_rejects_fifo_member(tmp_path: Path) -> None:
     """A FIFO named like the dump must be rejected before extraction.
 
@@ -2066,8 +2105,15 @@ def test_extract_files_rejects_absolute_symlink(tmp_path: Path) -> None:
     assert posixpath.join(SITE_ROOT, "wp-config.php") not in client.remote_fs
 
 
-def test_extract_files_strips_absolute_member(tmp_path: Path) -> None:
-    """An absolute member is extracted inside the root (GNU strips '/')."""
+def test_extract_files_rejects_absolute_member(tmp_path: Path) -> None:
+    """An absolute member name must be rejected, not silently stripped.
+
+    GNU tar strips the leading '/' on extraction, but accepting such a
+    member would make the accepted archive format depend on tar's
+    path-stripping behaviour. The validator's policy is that every
+    member is relative to the site root, so an absolute member is
+    refused before normalisation.
+    """
     import io
     import tarfile
 
@@ -2090,16 +2136,14 @@ def test_extract_files_strips_absolute_member(tmp_path: Path) -> None:
         f"{hashlib.sha256(buffer.getvalue()).hexdigest()}  {archive_name}\n"
     )
 
-    restore.run_restore(
-        client, config, set_files, True, False, staging_bid="20261014T1000Z"
-    )
+    with pytest.raises(WPSSHBackupError, match="absolute path"):
+        restore.run_restore(
+            client, config, set_files, True, False,
+            staging_bid="20261014T1000Z",
+        )
 
-    # GNU tar strips the leading slash, so the member lands inside the
-    # site root as etc/evil.txt — allowed, not an escape.
-    assert (
-        client.remote_fs[posixpath.join(SITE_ROOT, "etc/evil.txt")]
-        == b"evil"
-    )
+    # Nothing was extracted into the site root.
+    assert posixpath.join(SITE_ROOT, "etc/evil.txt") not in client.remote_fs
 
 
 def test_extract_files_allows_hard_link(tmp_path: Path) -> None:

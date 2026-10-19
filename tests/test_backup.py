@@ -992,48 +992,48 @@ def test_publish_downloads_reclaims_stale_lock(
     )
 
 
-def test_publish_downloads_lock_unparseable_reclaimed_after_grace(
+def test_publish_downloads_never_reclaims_unparseable_lock(
     backup_dir: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """An unparseable lock older than the grace period is reclaimed.
+    """An unparseable lock is never reclaimed on age alone.
 
-    A creator killed between os.open and writing its PID leaves an empty
-    (or partial) lock. It is only reclaimed after the grace period: a
-    transiently-empty live lock must never be stolen.
+    Ownership is recorded atomically (the PID is written to a private
+    temp file that is then hard-linked into place), so a lock created by
+    this tool is never visible without its owner. An unparseable lock is
+    therefore corruption or a foreign file, and reclaiming it on age
+    alone could steal a live creator's lock (e.g. one paused between
+    create and write). Acquisition must fail and name the admin path.
     """
+    import re
+    import unittest.mock
+
     archive = files_archive_name(TS)
     temp_paths = make_temp_set(backup_dir, archive)
     lock = backup_dir / backup._PUBLISH_LOCK_NAME
     lock.write_bytes(b"")
+    # Even a very old unparseable lock must not be reclaimed.
+    old = backup.time.time() - 3600
+    import os as _os
 
-    real_time = backup.time
-
-    class _Time:
-        def __init__(self) -> None:
-            self._real = real_time
-
-        def sleep(self, s: float) -> None:
-            self._real.sleep(s)
-
-        def time(self) -> float:
-            # Push "now" past the grace period so the old lock's age
-            # (time() - mtime) exceeds it.
-            past = self._real.time() + backup._PUBLISH_LOCK_UNPARSEABLE_GRACE
-            return past + 1
-
-    monkeypatch.setattr(backup, "time", _Time())
-
-    backup.publish_downloads(
-        temp_paths,
-        [archive],
-        backup_dir,
-        digests_for(temp_paths),
-        make_downloaded_fds(temp_paths),
+    _os.utime(lock, (old, old))
+    monkeypatch.setattr(
+        backup, "time", unittest.mock.Mock(sleep=lambda _: None)
     )
 
-    assert (backup_dir / archive).exists()
-    assert not lock.exists()
+    with pytest.raises(
+        WPSSHBackupError, match=re.escape("Another backup appears")
+    ):
+        backup.publish_downloads(
+            temp_paths,
+            [archive],
+            backup_dir,
+            digests_for(temp_paths),
+            make_downloaded_fds(temp_paths),
+        )
+
+    # The unparseable lock is left in place for the administrator.
+    assert lock.exists()
 
 
 def test_steal_stale_lock_does_not_steal_new_lock(
@@ -1124,13 +1124,17 @@ def test_steal_stale_lock_restore_does_not_clobber_newer_lock(
 
     monkeypatch.setattr(backup.os, "rename", rename_moves_new_lock)
 
-    # The steal must refuse and must NOT clobber the contender's lock.
-    assert backup._steal_stale_lock(lock) is False
+    # Restoring the quarantined lock must fail loudly: the name is taken
+    # by a newer lock whose owner may still be publishing, so a normal
+    # retry (which would create a lock at the now-free name) is unsafe.
+    with pytest.raises(
+        WPSSHBackupError, match="Could not restore the publish lock"
+    ):
+        backup._steal_stale_lock(lock)
+    # The contender's lock is untouched and the quarantined entry is
+    # left in place for the administrator.
     assert lock.exists()
-    # The SECOND contender's lock must still be at the name: a
-    # replacing restore would have overwritten it with the first one.
     assert lock.read_text().strip() == str(second_pid)
-    # The quarantined entry was left in place rather than deleted.
     assert any(".quarantine-" in p.name for p in tmp_path.iterdir())
 
 
