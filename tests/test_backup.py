@@ -992,6 +992,45 @@ def test_publish_downloads_reclaims_stale_lock(
     )
 
 
+def test_try_create_publish_lock_fallback_never_replaces(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without hard links the lock is created with O_EXCL, never renamed.
+
+    Regression: the no-hard-link fallback used os.rename(tmp, lock),
+    which REPLACES an existing destination on POSIX — so a live lock
+    could be overwritten and two publishers could run concurrently. The
+    fallback now uses O_CREAT|O_EXCL on the lock name itself, a true
+    no-replace primitive.
+    """
+    lock = tmp_path / backup._PUBLISH_LOCK_NAME
+
+    def no_link(src, dst):
+        raise OSError(errno.EPERM, "hard links not supported")
+
+    def forbidden_rename(src, dst):
+        raise AssertionError(
+            "os.rename replaces an existing destination on POSIX; "
+            "the lock fallback must use O_CREAT|O_EXCL"
+        )
+
+    monkeypatch.setattr(backup.os, "link", no_link)
+    monkeypatch.setattr(backup.os, "rename", forbidden_rename)
+
+    # First acquisition succeeds and records the owner.
+    identity = backup._try_create_publish_lock(lock)
+    assert identity is not None
+    assert lock.read_text().strip() == str(os.getpid())
+
+    # A second acquisition must fail and must NOT replace the live lock.
+    assert backup._try_create_publish_lock(lock) is None
+    assert lock.read_text().strip() == str(os.getpid())
+    # The recorded identity still describes the lock on disk.
+    st = os.lstat(lock)
+    assert (st.st_dev, st.st_ino) == identity
+
+
 def test_publish_downloads_never_reclaims_unparseable_lock(
     backup_dir: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -757,6 +757,10 @@ def _try_create_publish_lock(lock: Path) -> tuple[int, int] | None:
     O_EXCL create leaves exactly that window: a creator paused between
     create and write would look stale.)
 
+    On filesystems without hard links, the lock name is created with
+    O_CREAT|O_EXCL instead — a true no-replace primitive. os.rename is
+    never used: it would replace a live lock on POSIX.
+
     Returns:
         The (st_dev, st_ino) of the created lock, or None when the lock
         name is already taken (the caller retries or reclaims).
@@ -780,14 +784,15 @@ def _try_create_publish_lock(lock: Path) -> tuple[int, int] | None:
         except FileExistsError:
             return None
         except OSError:
-            # Hard links unsupported on this filesystem: fall back to a
-            # no-replace rename (Windows refuses to replace; on POSIX
-            # the link above is the normal path).
-            try:
-                os.rename(tmp, lock)
-            except OSError:
-                return None
-            return identity
+            # Hard links unsupported on this filesystem. Fall back to an
+            # exclusive create of the lock name itself: O_CREAT|O_EXCL
+            # is a true no-replace primitive, whereas os.rename would
+            # REPLACE a live lock on POSIX and let two publishers run
+            # concurrently. The lock is briefly empty until the PID is
+            # written; an empty lock is never reclaimed (see
+            # _steal_stale_lock), so this fails closed rather than
+            # stealing a live lock.
+            return _create_lock_exclusive(lock)
         return identity
     finally:
         # The temporary name is only a staging name; the lock itself is
@@ -796,6 +801,37 @@ def _try_create_publish_lock(lock: Path) -> tuple[int, int] | None:
             os.unlink(tmp)
         except OSError:
             pass
+
+
+def _create_lock_exclusive(lock: Path) -> tuple[int, int] | None:
+    """Create the lock name with O_CREAT|O_EXCL and record its owner.
+
+    A true no-replace primitive for filesystems without hard links:
+    O_EXCL fails when the name already exists, so a live lock is never
+    replaced. The PID is written immediately after creation; the lock is
+    briefly empty in between, and an empty lock is never reclaimed (it
+    fails closed and names the administrator recovery path).
+
+    Returns:
+        The (st_dev, st_ino) of the created lock, or None when the name
+        is already taken or the owner could not be recorded.
+    """
+    try:
+        fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except OSError:
+        return None
+    st = os.fstat(fd)
+    identity = (st.st_dev, st.st_ino)
+    try:
+        os.write(fd, f"{os.getpid()}\n".encode())
+    except OSError:
+        os.close(fd)
+        # This run created the lock exclusively, so removing it is safe
+        # and keeps a half-written lock from blocking later runs.
+        _unlink_if_same_inode_atomic(lock, identity, warn=False)
+        return None
+    os.close(fd)
+    return identity
 
 
 def _linkat_libc() -> ctypes.CDLL:
