@@ -795,7 +795,12 @@ def _validate_members(
         resolved = posixpath.normpath(posixpath.join(link_dir, target))
         # A chain: the resolved path may itself be a link in the archive
         # (a -> b, b -> ../../outside).
-        if resolved in links and resolved not in seen:
+        if resolved in links:
+            if resolved in seen:
+                raise WPSSHBackupError(
+                    f"Refusing to extract {archive}: symlink cycle involving "
+                    f"{link!r}"
+                )
             seen.add(resolved)
             return _resolve_link(resolved, links[resolved], seen)
         return resolved
