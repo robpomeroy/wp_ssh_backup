@@ -10,7 +10,9 @@ from pathlib import Path
 
 import pytest
 
+import archive_validation
 import restore
+import selection
 import safe_fs
 from common import (
     ChecksumError,
@@ -97,11 +99,11 @@ def test_choose_set_latest_when_no_timestamp(tmp_path: Path) -> None:
     backup_dir = tmp_path / "backups"
     make_local_set(backup_dir, "20261013T0000Z")
     make_local_set(backup_dir, "20261014T0000Z")
-    sets = restore.list_backup_sets(backup_dir)
+    sets = selection.list_backup_sets(backup_dir)
 
-    chosen = restore.choose_set(sets, None, True, True, backup_dir)
+    chosen = selection.choose_set(sets, None, True, True, backup_dir)
 
-    assert restore.ts_of(chosen) == "20261014T0000Z"
+    assert selection.ts_of(chosen) == "20261014T0000Z"
 
 
 def test_choose_set_ignores_newer_checksum_only_group(
@@ -113,11 +115,11 @@ def test_choose_set_ignores_newer_checksum_only_group(
     # A newer checksum-only group: no archives, just orphaned checksums.
     (backup_dir / "wp-db-20261014T0930Z.tar.gz.sha256").write_text("d  f\n")
     (backup_dir / "wp-files-20261014T0930Z.tar.gz.sha256").write_text("d  f\n")
-    sets = restore.list_backup_sets(backup_dir)
+    sets = selection.list_backup_sets(backup_dir)
 
-    chosen = restore.choose_set(sets, None, True, True, backup_dir)
+    chosen = selection.choose_set(sets, None, True, True, backup_dir)
 
-    assert restore.ts_of(chosen) == "20261013T0000Z"
+    assert selection.ts_of(chosen) == "20261013T0000Z"
 
 
 def test_choose_set_ignores_invalid_date_sets(tmp_path: Path) -> None:
@@ -125,46 +127,46 @@ def test_choose_set_ignores_invalid_date_sets(tmp_path: Path) -> None:
     backup_dir = tmp_path / "backups"
     make_local_set(backup_dir, "20261301T0000Z")  # month 13
     make_local_set(backup_dir, "20261013T0000Z")
-    sets = restore.list_backup_sets(backup_dir)
+    sets = selection.list_backup_sets(backup_dir)
 
-    chosen = restore.choose_set(sets, None, True, True, backup_dir)
+    chosen = selection.choose_set(sets, None, True, True, backup_dir)
 
-    assert restore.ts_of(chosen) == "20261013T0000Z"
+    assert selection.ts_of(chosen) == "20261013T0000Z"
 
 
 def test_choose_set_explicit_timestamp(tmp_path: Path) -> None:
     backup_dir = tmp_path / "backups"
     make_local_set(backup_dir, "20261013T0000Z")
     make_local_set(backup_dir, "20261014T0000Z")
-    sets = restore.list_backup_sets(backup_dir)
+    sets = selection.list_backup_sets(backup_dir)
 
-    chosen = restore.choose_set(sets, "20261013T0000Z", True, True, backup_dir)
+    chosen = selection.choose_set(sets, "20261013T0000Z", True, True, backup_dir)
 
-    assert restore.ts_of(chosen) == "20261013T0000Z"
+    assert selection.ts_of(chosen) == "20261013T0000Z"
 
 
 def test_choose_set_unknown_timestamp(tmp_path: Path) -> None:
     backup_dir = tmp_path / "backups"
     make_local_set(backup_dir, "20261014T0000Z")
-    sets = restore.list_backup_sets(backup_dir)
+    sets = selection.list_backup_sets(backup_dir)
 
     with pytest.raises(MissingArtifactError, match="No backup set"):
-        restore.choose_set(sets, "20200101T0000Z", True, True, backup_dir)
+        selection.choose_set(sets, "20200101T0000Z", True, True, backup_dir)
 
 
 def test_choose_set_no_sets(tmp_path: Path) -> None:
     backup_dir = tmp_path / "backups"
     with pytest.raises(MissingArtifactError, match="No backup sets"):
-        restore.choose_set({}, None, True, True, backup_dir)
+        selection.choose_set({}, None, True, True, backup_dir)
 
 
 def test_choose_set_missing_db_artifact(tmp_path: Path) -> None:
     backup_dir = tmp_path / "backups"
     make_local_set(backup_dir, "20261014T0000Z", kinds=("files",))
-    sets = restore.list_backup_sets(backup_dir)
+    sets = selection.list_backup_sets(backup_dir)
 
     with pytest.raises(MissingArtifactError, match="missing required"):
-        restore.choose_set(sets, "20261014T0000Z", False, True, backup_dir)
+        selection.choose_set(sets, "20261014T0000Z", False, True, backup_dir)
 
 
 def test_choose_set_files_skips_newer_db_only_set(tmp_path: Path) -> None:
@@ -174,11 +176,11 @@ def test_choose_set_files_skips_newer_db_only_set(tmp_path: Path) -> None:
     make_local_set(backup_dir, "20261014T0900Z", kinds=("db",))
     # Older set: files only.
     make_local_set(backup_dir, "20261013T0000Z", kinds=("files",))
-    sets = restore.list_backup_sets(backup_dir)
+    sets = selection.list_backup_sets(backup_dir)
 
-    chosen = restore.choose_set(sets, None, True, False, backup_dir)
+    chosen = selection.choose_set(sets, None, True, False, backup_dir)
 
-    assert restore.ts_of(chosen) == "20261013T0000Z"
+    assert selection.ts_of(chosen) == "20261013T0000Z"
 
 
 def test_choose_set_database_skips_newer_files_only_set(
@@ -189,11 +191,11 @@ def test_choose_set_database_skips_newer_files_only_set(
     make_local_set(backup_dir, "20261014T0900Z", kinds=("files",))
     # Older set: database only.
     make_local_set(backup_dir, "20261013T0000Z", kinds=("db",))
-    sets = restore.list_backup_sets(backup_dir)
+    sets = selection.list_backup_sets(backup_dir)
 
-    chosen = restore.choose_set(sets, None, False, True, backup_dir)
+    chosen = selection.choose_set(sets, None, False, True, backup_dir)
 
-    assert restore.ts_of(chosen) == "20261013T0000Z"
+    assert selection.ts_of(chosen) == "20261013T0000Z"
 
 
 def test_choose_set_latest_matching_when_both_kinds_exist(
@@ -203,20 +205,20 @@ def test_choose_set_latest_matching_when_both_kinds_exist(
     make_local_set(backup_dir, "20261012T0000Z")
     make_local_set(backup_dir, "20261013T0000Z", kinds=("files",))
     make_local_set(backup_dir, "20261014T0000Z")  # complete, newest
-    sets = restore.list_backup_sets(backup_dir)
+    sets = selection.list_backup_sets(backup_dir)
 
-    chosen = restore.choose_set(sets, None, True, True, backup_dir)
+    chosen = selection.choose_set(sets, None, True, True, backup_dir)
 
-    assert restore.ts_of(chosen) == "20261014T0000Z"
+    assert selection.ts_of(chosen) == "20261014T0000Z"
 
 
 def test_choose_set_no_matching_candidates(tmp_path: Path) -> None:
     backup_dir = tmp_path / "backups"
     make_local_set(backup_dir, "20261014T0000Z", kinds=("files",))
-    sets = restore.list_backup_sets(backup_dir)
+    sets = selection.list_backup_sets(backup_dir)
 
     with pytest.raises(MissingArtifactError, match="No backup set contains"):
-        restore.choose_set(sets, None, False, True, backup_dir)
+        selection.choose_set(sets, None, False, True, backup_dir)
 
 
 def test_choose_set_explicit_timestamp_stays_strict(tmp_path: Path) -> None:
@@ -224,10 +226,10 @@ def test_choose_set_explicit_timestamp_stays_strict(tmp_path: Path) -> None:
     backup_dir = tmp_path / "backups"
     make_local_set(backup_dir, "20261014T0900Z", kinds=("files",))
     make_local_set(backup_dir, "20261013T0000Z")  # complete, older
-    sets = restore.list_backup_sets(backup_dir)
+    sets = selection.list_backup_sets(backup_dir)
 
     with pytest.raises(MissingArtifactError, match="missing required"):
-        restore.choose_set(sets, "20261014T0900Z", False, True, backup_dir)
+        selection.choose_set(sets, "20261014T0900Z", False, True, backup_dir)
 
 
 # ---------------------------------------------------------------------------
@@ -238,10 +240,10 @@ def test_choose_set_explicit_timestamp_stays_strict(tmp_path: Path) -> None:
 def test_resolve_timestamp_accepts_full_backup_id(tmp_path: Path) -> None:
     backup_dir = tmp_path / "backups"
     make_local_set(backup_dir, "20261014T0930Z-a1b2c3")
-    sets = restore.list_backup_sets(backup_dir)
+    sets = selection.list_backup_sets(backup_dir)
 
     assert (
-        restore.resolve_timestamp(sets, "20261014T0930Z-a1b2c3")
+        selection.resolve_timestamp(sets, "20261014T0930Z-a1b2c3")
         == "20261014T0930Z-a1b2c3"
     )
 
@@ -250,13 +252,13 @@ def test_choose_set_with_full_backup_id(tmp_path: Path) -> None:
     """Regression: the documented bare form must not be the only option."""
     backup_dir = tmp_path / "backups"
     make_local_set(backup_dir, "20261014T0930Z-a1b2c3")
-    sets = restore.list_backup_sets(backup_dir)
+    sets = selection.list_backup_sets(backup_dir)
 
-    chosen = restore.choose_set(
+    chosen = selection.choose_set(
         sets, "20261014T0930Z-a1b2c3", True, True, backup_dir
     )
 
-    assert restore.ts_of(chosen) == "20261014T0930Z-a1b2c3"
+    assert selection.ts_of(chosen) == "20261014T0930Z-a1b2c3"
 
 
 def test_choose_set_with_bare_timestamp(tmp_path: Path) -> None:
@@ -264,22 +266,22 @@ def test_choose_set_with_bare_timestamp(tmp_path: Path) -> None:
     backup_dir = tmp_path / "backups"
     make_local_set(backup_dir, "20261014T0930Z-a1b2c3")
     make_local_set(backup_dir, "20261013T0000Z")
-    sets = restore.list_backup_sets(backup_dir)
+    sets = selection.list_backup_sets(backup_dir)
 
-    chosen = restore.choose_set(sets, "20261014T0930Z", True, True, backup_dir)
+    chosen = selection.choose_set(sets, "20261014T0930Z", True, True, backup_dir)
 
-    assert restore.ts_of(chosen) == "20261014T0930Z-a1b2c3"
+    assert selection.ts_of(chosen) == "20261014T0930Z-a1b2c3"
 
 
 def test_choose_set_with_bare_timestamp_legacy_set(tmp_path: Path) -> None:
     """Bare timestamps also resolve legacy sets without a suffix."""
     backup_dir = tmp_path / "backups"
     make_local_set(backup_dir, "20261014T0930Z")
-    sets = restore.list_backup_sets(backup_dir)
+    sets = selection.list_backup_sets(backup_dir)
 
-    chosen = restore.choose_set(sets, "20261014T0930Z", True, True, backup_dir)
+    chosen = selection.choose_set(sets, "20261014T0930Z", True, True, backup_dir)
 
-    assert restore.ts_of(chosen) == "20261014T0930Z"
+    assert selection.ts_of(chosen) == "20261014T0930Z"
 
 
 def test_resolve_timestamp_legacy_plus_suffixed_is_ambiguous(
@@ -289,10 +291,10 @@ def test_resolve_timestamp_legacy_plus_suffixed_is_ambiguous(
     backup_dir = tmp_path / "backups"
     make_local_set(backup_dir, "20261014T0930Z")  # legacy, no suffix
     make_local_set(backup_dir, "20261014T0930Z-a1b2c3")
-    sets = restore.list_backup_sets(backup_dir)
+    sets = selection.list_backup_sets(backup_dir)
 
     with pytest.raises(MissingArtifactError) as excinfo:
-        restore.choose_set(sets, "20261014T0930Z", True, True, backup_dir)
+        selection.choose_set(sets, "20261014T0930Z", True, True, backup_dir)
 
     message = str(excinfo.value)
     assert "Several backup sets share the timestamp" in message
@@ -307,10 +309,10 @@ def test_resolve_timestamp_ambiguous_minute_lists_ids(
     backup_dir = tmp_path / "backups"
     make_local_set(backup_dir, "20261014T0930Z-a1b2c3")
     make_local_set(backup_dir, "20261014T0930Z-9f8e7d")
-    sets = restore.list_backup_sets(backup_dir)
+    sets = selection.list_backup_sets(backup_dir)
 
     with pytest.raises(MissingArtifactError) as excinfo:
-        restore.choose_set(sets, "20261014T0930Z", True, True, backup_dir)
+        selection.choose_set(sets, "20261014T0930Z", True, True, backup_dir)
 
     message = str(excinfo.value)
     assert "Several backup sets share the timestamp" in message
@@ -321,10 +323,10 @@ def test_resolve_timestamp_ambiguous_minute_lists_ids(
 def test_resolve_timestamp_unknown_value(tmp_path: Path) -> None:
     backup_dir = tmp_path / "backups"
     make_local_set(backup_dir, "20261014T0930Z-a1b2c3")
-    sets = restore.list_backup_sets(backup_dir)
+    sets = selection.list_backup_sets(backup_dir)
 
     with pytest.raises(MissingArtifactError, match="No backup set"):
-        restore.choose_set(sets, "20200101T0000Z", True, True, backup_dir)
+        selection.choose_set(sets, "20200101T0000Z", True, True, backup_dir)
 
 
 # ---------------------------------------------------------------------------
@@ -337,11 +339,11 @@ def test_latest_set_picks_newer_minute(tmp_path: Path) -> None:
     backup_dir = tmp_path / "backups"
     make_local_set(backup_dir, "20261014T0930Z-a1b2c3")
     make_local_set(backup_dir, "20261014T0931Z-b2c3d4")
-    sets = restore.list_backup_sets(backup_dir)
+    sets = selection.list_backup_sets(backup_dir)
 
-    chosen = restore.choose_set(sets, None, True, True, backup_dir)
+    chosen = selection.choose_set(sets, None, True, True, backup_dir)
 
-    assert restore.ts_of(chosen) == "20261014T0931Z-b2c3d4"
+    assert selection.ts_of(chosen) == "20261014T0931Z-b2c3d4"
 
 
 def test_latest_set_rejects_same_minute_ambiguity(tmp_path: Path) -> None:
@@ -349,10 +351,10 @@ def test_latest_set_rejects_same_minute_ambiguity(tmp_path: Path) -> None:
     backup_dir = tmp_path / "backups"
     make_local_set(backup_dir, "20261014T0930Z-ffffff")  # sorts "latest"
     make_local_set(backup_dir, "20261014T0930Z-000000")
-    sets = restore.list_backup_sets(backup_dir)
+    sets = selection.list_backup_sets(backup_dir)
 
     with pytest.raises(MissingArtifactError) as excinfo:
-        restore.choose_set(sets, None, True, True, backup_dir)
+        selection.choose_set(sets, None, True, True, backup_dir)
 
     message = str(excinfo.value)
     assert "share the newest timestamp" in message
@@ -366,11 +368,11 @@ def test_latest_set_ignores_older_incomplete_set(tmp_path: Path) -> None:
     backup_dir = tmp_path / "backups"
     make_local_set(backup_dir, "20261014T0930Z-000000", kinds=("files",))
     make_local_set(backup_dir, "20261014T0930Z-ffffff")
-    sets = restore.list_backup_sets(backup_dir)
+    sets = selection.list_backup_sets(backup_dir)
 
-    chosen = restore.choose_set(sets, None, True, True, backup_dir)
+    chosen = selection.choose_set(sets, None, True, True, backup_dir)
 
-    assert restore.ts_of(chosen) == "20261014T0930Z-ffffff"
+    assert selection.ts_of(chosen) == "20261014T0930Z-ffffff"
 
 
 def test_latest_set_ambiguity_only_among_candidates(
@@ -381,11 +383,11 @@ def test_latest_set_ambiguity_only_among_candidates(
     make_local_set(backup_dir, "20261014T0930Z-000000", kinds=("db",))
     make_local_set(backup_dir, "20261014T0930Z-111111", kinds=("db",))
     make_local_set(backup_dir, "20261014T0929Z-222222")
-    sets = restore.list_backup_sets(backup_dir)
+    sets = selection.list_backup_sets(backup_dir)
 
-    chosen = restore.choose_set(sets, None, True, False, backup_dir)
+    chosen = selection.choose_set(sets, None, True, False, backup_dir)
 
-    assert restore.ts_of(chosen) == "20261014T0929Z-222222"
+    assert selection.ts_of(chosen) == "20261014T0929Z-222222"
 
 
 # ---------------------------------------------------------------------------
@@ -765,7 +767,7 @@ def test_require_gnu_tar_rejects_busybox_tar(
     monkeypatch.setattr(client, "_tar_version", busybox_tar_version)
 
     with pytest.raises(WPSSHBackupError, match="GNU tar is required"):
-        restore._require_gnu_tar(client)
+        archive_validation.require_gnu_tar(client)
 
 
 def test_run_restore_requires_gnu_tar_before_upload(
@@ -1044,7 +1046,7 @@ def test_validate_local_member_types_hashes_trailing_bytes(
     fd = os.open(archive, os.O_RDONLY)
     handle = os.fdopen(fd, "rb")
     try:
-        digest = restore._validate_local_member_types(archive, handle)
+        digest = archive_validation.validate_local_member_types(archive, handle)
     finally:
         handle.close()
 
@@ -1378,7 +1380,7 @@ def test_validate_members_fails_closed_on_undecodable_line(
     client.remote_fs[archive] = buffer.getvalue()
 
     with pytest.raises(WPSSHBackupError, match="cannot decode"):
-        restore._validate_members(archive, client)
+        archive_validation.validate_members(archive, client)
 
 
 def test_validate_members_rejects_duplicate_symlink_member(
@@ -1416,7 +1418,7 @@ def test_validate_members_rejects_duplicate_symlink_member(
     client.remote_fs[archive] = buffer.getvalue()
 
     with pytest.raises(WPSSHBackupError, match="duplicate member"):
-        restore._validate_members(archive, client)
+        archive_validation.validate_members(archive, client)
 
 
 def test_validate_members_rejects_duplicate_regular_member(
@@ -1442,7 +1444,7 @@ def test_validate_members_rejects_duplicate_regular_member(
     client.remote_fs[archive] = buffer.getvalue()
 
     with pytest.raises(WPSSHBackupError, match="duplicate member"):
-        restore._validate_members(archive, client)
+        archive_validation.validate_members(archive, client)
 
 
 def test_run_restore_rejects_remote_archive_swapped_after_checksum(
@@ -2056,7 +2058,7 @@ def test_extract_files_follows_dotted_symlink_chain(
         tar.addfile(second)
     client.remote_fs[archive_name] = buffer.getvalue()
 
-    writes = restore._validate_members(archive_name, client)
+    writes = archive_validation.validate_members(archive_name, client)
 
     # The chain must be followed through the dotted spelling to its
     # terminal; the intermediate (uploads/b) must not be reported as a
