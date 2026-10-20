@@ -420,7 +420,7 @@ python backup.py --version
 ## Licence
 
 The project is licensed under the GNU General Public License 3 (GPLv3). See
-the [LICENSE](LICENSE) file for details.
+the [LICENCE](LICENCE) file for details.
 
 ## Contributing
 
