@@ -124,12 +124,11 @@ def strip_php_comments(source: str) -> tuple[str, list[bool]]:
                 out.append(ch)
                 in_string.append(False)
             i += 1
-        else:  # block comment
-            if ch == "*" and nxt == "/":
-                state = "code"
-                i += 2
-            else:
-                i += 1
+        elif ch == "*" and nxt == "/":
+            state = "code"
+            i += 2
+        else:
+            i += 1
     return "".join(out), in_string
 
 def _unescape_php(value: str, quote: str) -> str:

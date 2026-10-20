@@ -119,6 +119,123 @@ def pid_alive(pid: int) -> bool:
         return True
 
 
+def _read_lock_owner(lock: Path) -> tuple[tuple[int, int], int] | None:
+    """Read a lock's identity and owner PID from a single descriptor.
+
+    The lock is opened ONCE and both the identity and the PID are read
+    from that descriptor. Reading the PID through the pathname and the
+    identity through a separate lstat would leave a window between them:
+    a contender could reclaim the lock and create a new live one in
+    that window, and the identity would then describe the NEW lock
+    while the PID described the old one — the reclaim would free a
+    live lock and let two backups publish concurrently.
+
+    The descriptor is closed before the function returns, because
+    Windows refuses to rename a file this process holds open. That
+    does not reopen the window the descriptor closed: the identity
+    captured from it is compared against the renamed entry, so a lock
+    that was replaced between the read and the rename is still
+    detected and refused.
+
+    Args:
+        lock: The lock file to read.
+
+    Returns:
+        A tuple of ((st_dev, st_ino), pid), or None when the lock
+        cannot be read, is not a regular file, or does not carry a
+        parseable PID.
+    """
+    try:
+        fd = safe_fs.open_nofollow_regular(
+            lock, verb="read the publish lock"
+        )
+    except (OSError, WPSSHBackupError):
+        # The lock cannot be read (gone, unreadable, or a symlink).
+        # Nothing can be proven stale; leave it alone.
+        return None
+    try:
+        try:
+            safe_fs.assert_nofollow_regular(fd, lock)
+            st = os.fstat(fd)
+            lock_identity = (st.st_dev, st.st_ino)
+            data = b""
+            while True:
+                chunk = os.read(fd, 4096)
+                if not chunk:
+                    break
+                data += chunk
+        except OSError:
+            return None
+    finally:
+        # Closed before the rename: Windows refuses to rename a file
+        # this process holds open.
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+    try:
+        pid = int(data.decode("ascii", errors="strict").strip())
+    except (UnicodeDecodeError, ValueError):
+        # Unparseable. Ownership is recorded atomically (the lock is
+        # hard-linked into place only after its PID is written), so a
+        # lock created by this tool is never visible without its owner.
+        # An unparseable lock is therefore corruption or a foreign
+        # file, and it is NEVER reclaimed on age alone: a creator
+        # paused between create and write could still be live, and
+        # stealing its lock would break exclusivity. The administrator
+        # recovery path (delete the lock) covers this case.
+        return None
+    return lock_identity, pid
+
+
+def _restore_quarantined_lock(lock: Path, stale: Path) -> None:
+    """Put a quarantined lock back at the lock name.
+
+    The restore uses a NO-REPLACE hard link, never a rename:
+    os.rename would replace a lock another contender created at the
+    name in the meantime, making its owner believe it still holds the
+    lock while this process publishes.
+
+    Args:
+        lock: The lock name to restore to.
+        stale: The quarantine name holding the entry to restore.
+
+    Raises:
+        WPSSHBackupError: If the entry cannot be put back, so the name
+            must not be reused.
+    """
+    try:
+        os.link(stale, lock)
+    except FileExistsError as exc:
+        # The name is taken again: the quarantined lock is left in
+        # place (never deleted) and the name is NOT freed. This is
+        # not a normal retry — the owner of the quarantined lock may
+        # still be publishing, so acquisition must fail loudly.
+        # The FileExistsError is chained so the original cause is
+        # not lost from the traceback.
+        raise WPSSHBackupError(
+            f"Could not restore the publish lock {lock!s}: another "
+            "lock appeared while a newer lock was being quarantined. "
+            f"The quarantined lock is at {stale!s}; verify no backup "
+            "is running, then remove both files and re-run."
+        ) from exc
+    except OSError as exc:
+        # Linking is unsupported or failed for another reason: the
+        # quarantined lock cannot be put back, so the name must not be
+        # reused. Fail rather than retrying into a free name.
+        raise WPSSHBackupError(
+            f"Could not restore the publish lock {lock!s}: {exc}. "
+            f"The quarantined lock is at {stale!s}; verify no backup "
+            "is running, then remove both files and re-run."
+        ) from exc
+    try:
+        os.unlink(stale)
+    except OSError:
+        # The lock is restored; the quarantine name is now a second
+        # link to it and removing it is best-effort.
+        pass
+
+
 def steal_stale_lock(lock: Path) -> bool:
     """Atomically reclaim a publish lock whose owner is dead.
 
@@ -158,56 +275,12 @@ def steal_stale_lock(lock: Path) -> bool:
         WPSSHBackupError: If a quarantined lock cannot be restored and
             the name must not be reused.
     """
-    # Open the lock ONCE and read both the identity and the PID from
-    # that descriptor. Reading the PID through the pathname and the
-    # identity through a separate lstat would leave a window between
-    # them: a contender could reclaim the lock and create a new live
-    # one in that window, and the identity would then describe the NEW
-    # lock while the PID described the old one — the reclaim would
-    # free a live lock and let two backups publish concurrently.
-    try:
-        fd = safe_fs.open_nofollow_regular(
-            lock, verb="read the publish lock"
-        )
-    except (OSError, WPSSHBackupError):
-        # The lock cannot be read (gone, unreadable, or a symlink).
-        # Nothing can be proven stale; leave it alone.
+    owner = _read_lock_owner(lock)
+    if owner is None:
+        # The lock could not be read, or does not carry a parseable
+        # PID. Nothing can be proven stale; leave it alone.
         return False
-    try:
-        try:
-            safe_fs.assert_nofollow_regular(fd, lock)
-            st = os.fstat(fd)
-            lock_identity = (st.st_dev, st.st_ino)
-            data = b""
-            while True:
-                chunk = os.read(fd, 4096)
-                if not chunk:
-                    break
-                data += chunk
-        except OSError:
-            return False
-    finally:
-        # Closed before the rename: Windows refuses to rename a file
-        # this process holds open. The identity captured above still
-        # describes the entry the PID was read from, and the renamed
-        # entry is compared against it below, so a lock that was
-        # replaced in between is still detected.
-        try:
-            os.close(fd)
-        except OSError:
-            pass
-    try:
-        pid = int(data.decode("ascii", errors="strict").strip())
-    except (UnicodeDecodeError, ValueError):
-        # Unparseable. Ownership is recorded atomically (the lock is
-        # hard-linked into place only after its PID is written), so a
-        # lock created by this tool is never visible without its owner.
-        # An unparseable lock is therefore corruption or a foreign file,
-        # and it is NEVER reclaimed on age alone: a creator paused
-        # between create and write could still be live, and stealing
-        # its lock would break exclusivity. The administrator recovery
-        # path (delete the lock) covers this case.
-        return False
+    lock_identity, pid = owner
     if pid_alive(pid):
         return False
     # The quarantine name is RESERVED before the lock is moved into
@@ -242,40 +315,8 @@ def steal_stale_lock(lock: Path) -> bool:
     if (st.st_dev, st.st_ino) != lock_identity:
         # The renamed entry is NOT the stale lock we read: a new lock
         # was created at the name between our read and our rename, and
-        # our rename moved that new (possibly live) lock. Restore it
-        # with a NO-REPLACE operation: os.rename would replace a lock
-        # another contender created at the name in the meantime, making
-        # its owner believe it still holds the lock while we publish.
-        try:
-            os.link(stale, lock)
-        except FileExistsError as exc:
-            # The name is taken again: the quarantined lock is left in
-            # place (never deleted) and the name is NOT freed. This is
-            # not a normal retry — the owner of the quarantined lock may
-            # still be publishing, so acquisition must fail loudly.
-            # The FileExistsError is chained so the original cause is
-            # not lost from the traceback.
-            raise WPSSHBackupError(
-                f"Could not restore the publish lock {lock!s}: another "
-                "lock appeared while a newer lock was being quarantined. "
-                f"The quarantined lock is at {stale!s}; verify no backup "
-                "is running, then remove both files and re-run."
-            ) from exc
-        except OSError as exc:
-            # Linking is unsupported or failed for another reason: the
-            # quarantined lock cannot be put back, so the name must not
-            # be reused. Fail rather than retrying into a free name.
-            raise WPSSHBackupError(
-                f"Could not restore the publish lock {lock!s}: {exc}. "
-                f"The quarantined lock is at {stale!s}; verify no backup "
-                "is running, then remove both files and re-run."
-            ) from exc
-        try:
-            os.unlink(stale)
-        except OSError:
-            # The lock is restored; the quarantine name is now a second
-            # link to it and removing it is best-effort.
-            pass
+        # our rename moved that new (possibly live) lock. Restore it.
+        _restore_quarantined_lock(lock, stale)
         return False
     try:
         os.unlink(stale)
