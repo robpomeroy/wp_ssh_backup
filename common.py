@@ -29,6 +29,7 @@ from errors import (
     WPSSHBackupError,
 )
 from config import (
+    REQUIRED_KEYS,
     Config,
     load_config,
 )
@@ -49,8 +50,11 @@ from remote_ops import (
     remove_remote_staging,
 )
 from wp_config import (
+    WP_DB_KEYS,
+    WP_DEFINE_RE,
     parse_wp_config,
     read_wp_db_settings,
+    strip_php_comments,
 )
 from db_config import (
     mysql_client_config,
@@ -59,6 +63,12 @@ from db_config import (
     write_mysql_client_config,
 )
 from naming import (
+    BACKUP_FILE_RE,
+    BACKUP_ID_PATTERN,
+    RUN_SUFFIX_RE,
+    STAGING_PREFIX,
+    TS_FORMAT,
+    TS_PATTERN,
     backup_id,
     backup_id_from_archive_name,
     checksum_name,
@@ -70,6 +80,7 @@ from naming import (
     utc_timestamp,
 )
 from checksums import (
+    SHA256SUM_LINE_RE,
     parse_sha256sum_output,
     sha256_file,
     validate_manifest_entries,
@@ -100,6 +111,7 @@ __all__ = [
     "RemoteCommandError",
     "UnknownHostKeyError",
     "WPSSHBackupError",
+    "REQUIRED_KEYS",
     "Config",
     "load_config",
     "connect",
@@ -114,12 +126,21 @@ __all__ = [
     "detect_wp_cli",
     "remove_remote_file",
     "remove_remote_staging",
+    "WP_DB_KEYS",
+    "WP_DEFINE_RE",
     "parse_wp_config",
     "read_wp_db_settings",
+    "strip_php_comments",
     "mysql_client_config",
     "read_db_settings",
     "split_db_host",
     "write_mysql_client_config",
+    "BACKUP_FILE_RE",
+    "BACKUP_ID_PATTERN",
+    "RUN_SUFFIX_RE",
+    "STAGING_PREFIX",
+    "TS_FORMAT",
+    "TS_PATTERN",
     "backup_id",
     "backup_id_from_archive_name",
     "checksum_name",
@@ -129,6 +150,7 @@ __all__ = [
     "parse_timestamp",
     "staging_dir_for",
     "utc_timestamp",
+    "SHA256SUM_LINE_RE",
     "parse_sha256sum_output",
     "sha256_file",
     "validate_manifest_entries",

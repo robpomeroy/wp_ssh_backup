@@ -155,7 +155,11 @@ def run_remote_cmd(
     Returns:
         A tuple containing the exit code, stdout, and stderr as strings.
     """
-    stdin, stdout, stderr = client.exec_command(command, timeout=timeout)
+    # The stdin stream is discarded: this helper never writes to the
+    # remote command's input.
+    _stdin, stdout, stderr = client.exec_command(
+        command, timeout=timeout
+    )
     stderr_chunks: list[bytes] = []
 
     def _drain_stderr() -> None:

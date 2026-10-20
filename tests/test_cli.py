@@ -143,3 +143,65 @@ def test_scope_flags_are_mutually_exclusive() -> None:
     with pytest.raises(SystemExit) as caught:
         parser.parse_args(["--files", "--database"])
     assert caught.value.code == 2
+
+
+def test_common_facade_reexports_every_public_name() -> None:
+    """The facade keeps every public name of the old common.py.
+
+    common.py was split into focused modules, and the module that
+    remains is a re-export facade: the guarantee it makes is that
+    "from common import X" keeps working for every public name the
+    old common.py had. The old module had no __all__, so every
+    module-level name was importable.
+
+    This test pins the guarantee: the names are compared against the
+    module the split was made from, so a name that moves or is dropped
+    cannot pass unnoticed.
+    """
+    import ast
+    import subprocess
+
+    import common
+
+    # The commit before the split is the last state of the old module.
+    revision = "4eb4e32"
+
+    def public_names(source: str) -> set[str]:
+        tree = ast.parse(source)
+        names: set[str] = set()
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                 ast.ClassDef)):
+                names.add(node.name)
+            elif isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        names.add(target.id)
+        # The leading underscore marks a name that was never public
+        # API, and "annotations" is the __future__ import.
+        return {
+            name
+            for name in names
+            if not name.startswith("_") and name != "annotations"
+        }
+
+    old_source = subprocess.run(
+        ["git", "show", f"{revision}:common.py"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=True,
+    ).stdout
+
+    expected = public_names(old_source)
+
+    # Every public name is reachable as an attribute of the facade.
+    missing = {name for name in expected if not hasattr(common, name)}
+    assert not missing, f"common.py no longer exports: {sorted(missing)}"
+
+    # ...and a star import carries the same set, so __all__ must list
+    # every public name too.
+    assert expected <= set(common.__all__), (
+        "common.__all__ is missing: "
+        f"{sorted(expected - set(common.__all__))}"
+    )
