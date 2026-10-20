@@ -12,7 +12,6 @@ import hashlib
 import os
 import posixpath
 import sys
-import time
 from pathlib import Path
 from typing import BinaryIO
 
@@ -28,25 +27,23 @@ from common import (
     backup_id,
     checksum_name,
     connect,
+    create_staging_dir,
     db_archive_name,
     detect_wp_cli,
     files_archive_name,
     human_size,
     load_config,
-    mysql_client_config,
     parse_sha256sum_output,
     prune_local_backups,
-    read_wp_db_settings,
     remove_remote_file,
     remove_remote_staging,
-    run_remote_cmd,
     run_remote_cmd_checked,
     shquote,
     sftp_download,
-    split_db_host,
-    staging_dir_for,
+    timed,
     trap_rm_action,
-    write_remote_file,
+    validate_manifest_entries,
+    write_mysql_client_config,
 )
 
 
@@ -117,35 +114,16 @@ def create_db_dump(
 
     # Fallback: parse wp-config.php and run mysqldump with a temporary
     # defaults-extra-file so the password never appears on a command line.
-    sftp = client.open_sftp()
-    try:
-        settings = read_wp_db_settings(sftp, config.wp_site_root)
-    finally:
-        sftp.close()
-
-    host, port, socket_path = split_db_host(settings["DB_HOST"])
-    cnf_name = f"my-{ts}.cnf"
-    cnf_path = posixpath.join(staging, cnf_name)
-    cnf_body = mysql_client_config(
-        host=host,
-        user=settings["DB_USER"],
-        password=settings["DB_PASSWORD"],
-        port=port,
-        socket=socket_path,
+    cnf_path, db_name = write_mysql_client_config(
+        client, config.wp_site_root, staging, ts
     )
-
-    sftp = client.open_sftp()
-    try:
-        write_remote_file(client, sftp, cnf_path, cnf_body, mode=0o600)
-    finally:
-        sftp.close()
 
     # trap guarantees the credentials file is removed even if mysqldump fails.
     command = (
         f"cd {shquote(staging)} && "
         f"trap {trap_rm_action(cnf_path)} EXIT && "
         f"mysqldump --defaults-extra-file={shquote(cnf_path)} "
-        f"{shquote(settings['DB_NAME'])} > {shquote(dump_path)}"
+        f"{shquote(db_name)} > {shquote(dump_path)}"
     )
     try:
         run_remote_cmd_checked(client, command, timeout=1800)
@@ -437,38 +415,18 @@ def verify_downloads(
             # a manifest with the valid entry plus arbitrary extras would
             # be accepted here and published as a complete backup set,
             # only to be rejected later by restore's remote verifier.
-            # Reject any path component in ANY entry name before anything
-            # else: a manifest may only reference plain filenames, never
-            # paths (no traversal).
-            for entry_name in parsed:
-                if (
-                    "/" in entry_name
-                    or "\\" in entry_name
-                    or posixpath.basename(entry_name) != entry_name
-                    or entry_name in (".", "..")
-                ):
-                    raise ChecksumError(
-                        f"{checksum_file} names a path outside the "
-                        f"staging directory: {entry_name}"
-                    )
-            if len(parsed) != 1:
-                raise ChecksumError(
-                    f"{checksum_file} must contain exactly one entry, "
-                    f"found {len(parsed)}"
-                )
-            if name not in parsed:
-                raise ChecksumError(
-                    f"{checksum_file} contains no digest for {name}"
-                )
+            expected = validate_manifest_entries(
+                parsed, name, checksum_file.name
+            )
             archive_handle = handles[name]
             archive_handle.seek(0)
             actual = _sha256_handle(archive_handle)
-            if actual.lower() != parsed[name].lower():
+            if actual.lower() != expected.lower():
                 raise ChecksumError(
                     f"Checksum mismatch for {local_path}: expected "
-                    f"{parsed[name]}, got {actual}"
+                    f"{expected}, got {actual}"
                 )
-            digests[name] = parsed[name]
+            digests[name] = expected
             manifest_handle.seek(0)
             digests[checksum_name(name)] = _sha256_handle(manifest_handle)
     return digests
@@ -477,49 +435,6 @@ def verify_downloads(
 # ---------------------------------------------------------------------------
 # Orchestration
 # ---------------------------------------------------------------------------
-
-
-def create_staging_dir(
-    client: paramiko.SSHClient, config: Config, bid: str
-) -> str:
-    """
-    Create this run's exclusive remote staging directory.
-
-    Uses a bare mkdir (no -p) so the command fails if the directory already
-    exists: two concurrent runs in the same minute have different backup ids
-    and therefore different directories, and a collision (astronomically
-    unlikely) aborts instead of sharing artifacts.
-
-    The directory is created with -m 700 so a permissive umask (e.g. a
-    shared-group 0002) never leaves it writable by other accounts between
-    creation and the later 0700 chmod.
-
-    The 0700 chmod is issued separately by the caller (inside its cleanup
-    scope): mkdir and chmod chained with && would leave an orphaned
-    directory on the host if mkdir succeeded but chmod failed, before
-    run_backup's cleanup block was entered.
-
-    Args:
-        client: An active SSH client connected to the remote host.
-        config: The backup configuration.
-        bid: This run's backup identifier.
-
-    Returns:
-        The staging directory path.
-
-    Raises:
-        WPSSHBackupError: If the staging directory already exists.
-    """
-    staging = staging_dir_for(config.wp_site_root, bid)
-    code, _, err = run_remote_cmd(
-        client, f"mkdir -m 700 {shquote(staging)}"
-    )
-    if code != 0:
-        raise WPSSHBackupError(
-            f"Could not create staging directory {staging}: "
-            f"{err.strip() or 'already exists?'}"
-        )
-    return staging
 
 
 def run_backup(
@@ -544,7 +459,7 @@ def run_backup(
         A dictionary mapping each archive and its checksum filename to the
         corresponding local Path object.
     """
-    staging = create_staging_dir(client, config, bid)
+    staging = create_staging_dir(client, config.wp_site_root, bid)
     backup_dir = config.backup_dir
     print(f"Remote staging directory: {staging}")
 
@@ -559,18 +474,16 @@ def run_backup(
         )
 
         if include_database:
-            started = time.monotonic()
-            db_archive = create_db_dump(client, config, staging, bid)
+            with timed("Database archive created"):
+                db_archive = create_db_dump(client, config, staging, bid)
             archive_names.append(db_archive)
-            elapsed = time.monotonic() - started
-            print(f"Database archive created ({elapsed:.1f}s)")
 
         if include_files:
-            started = time.monotonic()
-            files_archive = create_files_archive(client, config, staging, bid)
+            with timed("Files archive created"):
+                files_archive = create_files_archive(
+                    client, config, staging, bid
+                )
             archive_names.append(files_archive)
-            elapsed = time.monotonic() - started
-            print(f"Files archive created ({elapsed:.1f}s)")
 
         generate_remote_checksums(client, staging, archive_names)
 

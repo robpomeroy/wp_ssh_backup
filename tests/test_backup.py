@@ -942,7 +942,7 @@ def test_publish_downloads_lock_blocks_concurrent_publish(
     lock.write_text(f"{_os.getpid()}\n")
     # Avoid the retry sleeps: the lock is held the whole time.
     monkeypatch.setattr(
-        backup, "time", unittest.mock.Mock(sleep=lambda _: None)
+        publish_lock, "time", unittest.mock.Mock(sleep=lambda _: None)
     )
 
     with pytest.raises(
@@ -1060,7 +1060,7 @@ def test_publish_downloads_never_reclaims_unparseable_lock(
 
     _os.utime(lock, (old, old))
     monkeypatch.setattr(
-        backup, "time", unittest.mock.Mock(sleep=lambda _: None)
+        publish_lock, "time", unittest.mock.Mock(sleep=lambda _: None)
     )
 
     with pytest.raises(

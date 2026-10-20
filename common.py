@@ -15,9 +15,12 @@ import re
 import secrets
 import sys
 import threading
+import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Iterator
 
 import paramiko
 from dotenv import load_dotenv
@@ -461,25 +464,6 @@ def sftp_download(
     return local
 
 
-def sftp_upload(
-    sftp: paramiko.SFTPClient, local_path: str | Path, remote_path: str
-) -> str:
-    """
-    Upload a file to the remote host via SFTP.
-
-    Args:
-        sftp: An active SFTP client connected to the remote host.
-        local_path: The local path to the file to be uploaded.
-        remote_path: The path on the remote host where the file should be
-            saved.
-
-    Returns:
-        The remote path to the uploaded file as a string.
-    """
-    sftp.put(str(local_path), remote_path)
-    return remote_path
-
-
 def remote_path_exists(sftp: paramiko.SFTPClient, remote_path: str) -> bool:
     """
     Check if a remote path exists on the remote host via SFTP.
@@ -919,6 +903,76 @@ def mysql_client_config(
     lines.append(f'user="{escape(user)}"')
     lines.append(f'password="{escape(password)}"')
     return "\n".join(lines) + "\n"
+
+
+# ---------------------------------------------------------------------------
+# Database credentials on the remote host
+# ---------------------------------------------------------------------------
+
+
+def read_db_settings(
+    client: paramiko.SSHClient,
+    site_root: str,
+) -> dict[str, str]:
+    """Read the database settings from the site's wp-config.php.
+
+    Args:
+        client: An active SSH client connected to the remote host.
+        site_root: The WordPress site root.
+
+    Returns:
+        The DB_HOST, DB_USER, DB_PASSWORD and DB_NAME values.
+    """
+    sftp = client.open_sftp()
+    try:
+        return read_wp_db_settings(sftp, site_root)
+    finally:
+        sftp.close()
+
+
+def write_mysql_client_config(
+    client: paramiko.SSHClient,
+    site_root: str,
+    staging: str,
+    ts: str,
+) -> tuple[str, str]:
+    """Write a temporary MySQL option file into the staging directory.
+
+    The credentials never appear on a remote command line: they are
+    written to an owner-only option file that both mysqldump and mysql
+    read through --defaults-extra-file. The file is created under
+    umask 077, so it is never readable by another host user even
+    briefly.
+
+    The caller is responsible for removing the file (see
+    :func:`remove_remote_file`); the returned path is the one to remove.
+
+    Args:
+        client: An active SSH client connected to the remote host.
+        site_root: The WordPress site root, read for the settings.
+        staging: The remote staging directory to write the file into.
+        ts: The backup identifier the file name is derived from.
+
+    Returns:
+        A tuple of (the option file's path, the database name).
+    """
+    settings = read_db_settings(client, site_root)
+    host, port, socket_path = split_db_host(settings["DB_HOST"])
+    cnf_name = f"my-{ts}.cnf"
+    cnf_path = posixpath.join(staging, cnf_name)
+    cnf_body = mysql_client_config(
+        host=host,
+        user=settings["DB_USER"],
+        password=settings["DB_PASSWORD"],
+        port=port,
+        socket=socket_path,
+    )
+    sftp = client.open_sftp()
+    try:
+        write_remote_file(client, sftp, cnf_path, cnf_body, mode=0o600)
+    finally:
+        sftp.close()
+    return cnf_path, settings["DB_NAME"]
 
 
 # ---------------------------------------------------------------------------
@@ -1378,6 +1432,111 @@ def allocate_remote_dir(
     )
 
 
+def create_staging_dir(
+    client: paramiko.SSHClient,
+    site_root: str,
+    bid: str,
+) -> str:
+    """
+    Create this run's exclusive remote staging directory.
+
+    Uses a bare mkdir (no -p) so the command fails if the directory
+    already exists: two concurrent runs in the same minute have
+    different backup ids and therefore different directories, and a
+    collision (astronomically unlikely) aborts instead of sharing
+    artifacts.
+
+    The directory is created with -m 700 so a permissive umask (e.g. a
+    shared-group 0002) never leaves it writable by other accounts between
+    creation and the later 0700 chmod.
+
+    The 0700 chmod is issued separately by the caller (inside its
+    cleanup scope): mkdir and chmod chained with && would leave an
+    orphaned directory on the host if mkdir succeeded but chmod failed,
+    before the caller's cleanup block was entered.
+
+    Args:
+        client: An active SSH client connected to the remote host.
+        site_root: The WordPress site root the staging directory is a
+            sibling of.
+        bid: This run's backup identifier.
+
+    Returns:
+        The staging directory path.
+
+    Raises:
+        WPSSHBackupError: If the staging directory already exists.
+    """
+    staging = staging_dir_for(site_root, bid)
+    code, _, err = run_remote_cmd(
+        client, f"mkdir -m 700 {shquote(staging)}"
+    )
+    if code != 0:
+        raise WPSSHBackupError(
+            f"Could not create staging directory {staging}: "
+            f"{err.strip() or 'already exists?'}"
+        )
+    return staging
+
+
+# ---------------------------------------------------------------------------
+# Checksum manifests
+# ---------------------------------------------------------------------------
+
+
+def validate_manifest_entries(
+    entries: dict[str, str],
+    archive_name: str,
+    manifest_name: str,
+) -> str:
+    """
+    Check a parsed checksum manifest and return the expected digest.
+
+    A manifest is not trusted blindly: `sha256sum -c` checks whatever
+    filename the manifest names, so a manifest pointing at another file
+    with a matching digest would pass while the requested archive stays
+    corrupt. The manifest must therefore contain exactly one entry, that
+    entry must name exactly the requested archive, and no entry may name
+    a path (no traversal).
+
+    Args:
+        entries: The manifest's parsed entries, keyed by file name.
+        archive_name: The archive the manifest must describe.
+        manifest_name: The manifest's name, used in the error messages.
+
+    Returns:
+        The digest the manifest records for the archive.
+
+    Raises:
+        ChecksumError: If the manifest names a path, holds more or fewer
+            than one entry, or does not name the requested archive.
+    """
+    # Reject any path component in ANY entry name before anything
+    # else: a manifest may only reference plain filenames, never paths.
+    for entry_name in entries:
+        if (
+            "/" in entry_name
+            or "\\" in entry_name
+            or posixpath.basename(entry_name) != entry_name
+            or entry_name in (".", "..")
+        ):
+            raise ChecksumError(
+                f"{manifest_name} names a path outside the "
+                f"staging directory: {entry_name}"
+            )
+    if len(entries) != 1:
+        raise ChecksumError(
+            f"{manifest_name} must contain exactly one entry, "
+            f"found {len(entries)}"
+        )
+    if archive_name not in entries:
+        raise ChecksumError(
+            f"{manifest_name} does not name {archive_name}; the "
+            "manifest cannot be trusted for this archive"
+        )
+    return entries[archive_name]
+
+
 # ---------------------------------------------------------------------------
 # Misc
 # ---------------------------------------------------------------------------
@@ -1415,6 +1574,23 @@ def trap_rm_action(path: str) -> str:
         A fully-quoted trap action, ready for 'trap <action> EXIT'.
     """
     return shquote(f"rm -f {shquote(path)}")
+
+
+@contextmanager
+def timed(label: str) -> Iterator[None]:
+    """Time a block of work and report how long it took.
+
+    Args:
+        label: What the block does, e.g. "Files extracted".
+
+    Yields:
+        None, while the block runs.
+    """
+    started = time.monotonic()
+    try:
+        yield
+    finally:
+        print(f"{label} ({time.monotonic() - started:.1f}s).")
 
 
 def fingerprint(key: paramiko.PKey) -> str:

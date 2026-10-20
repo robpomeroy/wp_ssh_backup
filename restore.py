@@ -10,7 +10,6 @@ from __future__ import annotations
 import argparse
 import posixpath
 import sys
-import time
 from pathlib import Path
 from typing import BinaryIO
 
@@ -34,23 +33,22 @@ from common import (
     backup_id,
     checksum_name,
     connect,
+    create_staging_dir,
     db_archive_name,
     detect_wp_cli,
     files_archive_name,
     load_config,
-    mysql_client_config,
     parse_sha256sum_output,
     read_remote_file,
-    read_wp_db_settings,
     remove_remote_file,
     remove_remote_staging,
     run_remote_cmd,
     run_remote_cmd_checked,
     shquote,
-    split_db_host,
-    staging_dir_for,
+    timed,
     trap_rm_action,
-    write_remote_file,
+    validate_manifest_entries,
+    write_mysql_client_config,
 )
 
 
@@ -123,30 +121,9 @@ def verify_remote_checksums(
                     f"Remote checksum file missing: {checksum_remote}"
                 ) from exc
             entries = parse_sha256sum_output(text)
-            # Reject any path component in ANY entry name before anything
-            # else: a manifest may only reference plain filenames inside
-            # the staging directory, never paths (no traversal).
-            for entry_name in entries:
-                if (
-                    "/" in entry_name
-                    or "\\" in entry_name
-                    or posixpath.basename(entry_name) != entry_name
-                    or entry_name in (".", "..")
-                ):
-                    raise ChecksumError(
-                        f"{checksum_name(name)} names a path outside the "
-                        f"staging directory: {entry_name}"
-                    )
-            if len(entries) != 1:
-                raise ChecksumError(
-                    f"{checksum_name(name)} must contain exactly one "
-                    f"entry, found {len(entries)}"
-                )
-            if name not in entries:
-                raise ChecksumError(
-                    f"{checksum_name(name)} does not name {name}; the "
-                    "manifest cannot be trusted for this archive"
-                )
+            expected = validate_manifest_entries(
+                entries, name, checksum_name(name)
+            )
             # Hash the archive's bytes directly; the manifest only supplies
             # the expected digest.
             command = (
@@ -160,10 +137,10 @@ def verify_remote_checksums(
                     f"{err.strip()}"
                 )
             actual = parse_sha256sum_output(out)
-            if actual.get(name) != entries[name]:
+            if actual.get(name) != expected:
                 raise ChecksumError(
                     f"Remote checksum verification failed for {name}: "
-                    f"expected {entries[name]}, got "
+                    f"expected {expected}, got "
                     f"{actual.get(name, '(none)')}"
                 )
             digests[name] = actual[name]
@@ -260,34 +237,15 @@ def import_database(
         run_remote_cmd_checked(client, command, timeout=3600)
         return
 
-    sftp = client.open_sftp()
-    try:
-        settings = read_wp_db_settings(sftp, config.wp_site_root)
-    finally:
-        sftp.close()
-
-    host, port, socket_path = split_db_host(settings["DB_HOST"])
-    cnf_name = f"my-{ts}.cnf"
-    cnf_path = posixpath.join(staging, cnf_name)
-    cnf_body = mysql_client_config(
-        host=host,
-        user=settings["DB_USER"],
-        password=settings["DB_PASSWORD"],
-        port=port,
-        socket=socket_path,
+    cnf_path, db_name = write_mysql_client_config(
+        client, config.wp_site_root, staging, ts
     )
-
-    sftp = client.open_sftp()
-    try:
-        write_remote_file(client, sftp, cnf_path, cnf_body, mode=0o600)
-    finally:
-        sftp.close()
 
     command = (
         f"cd {shquote(staging)} && "
         f"trap {trap_rm_action(cnf_path)} EXIT && "
         f"mysql --defaults-extra-file={shquote(cnf_path)} "
-        f"{shquote(settings['DB_NAME'])} < {shquote(dump_path)}"
+        f"{shquote(db_name)} < {shquote(dump_path)}"
     )
     try:
         run_remote_cmd_checked(client, command, timeout=3600)
@@ -324,7 +282,6 @@ def run_restore(
     """
     backup_bid = ts_of(set_files)
     staging_ts = staging_bid or backup_id()
-    staging = staging_dir_for(config.wp_site_root, staging_ts)
     archive_names: list[str] = []
     if include_files:
         archive_names.append(files_archive_name(backup_bid))
@@ -338,15 +295,9 @@ def run_restore(
     # The 0700 chmod is issued separately INSIDE the try block below:
     # chained 'mkdir && chmod' would orphan the directory if mkdir
     # succeeded but chmod failed, before the cleanup block was entered.
-    code, _, err = run_remote_cmd(
-        client,
-        f"mkdir -m 700 {shquote(staging)}",
+    staging = create_staging_dir(
+        client, config.wp_site_root, staging_ts
     )
-    if code != 0:
-        raise WPSSHBackupError(
-            f"Could not create staging directory {staging}: "
-            f"{err.strip() or 'already exists?'}"
-        )
     print(f"Remote staging directory: {staging}")
 
     try:
@@ -398,28 +349,26 @@ def run_restore(
                         "type check inspected different bytes than the "
                         "uploaded archive. Refusing to extract."
                     )
-                started = _now()
-                extract_files(
-                    client,
-                    config,
-                    staging,
-                    backup_bid,
-                    expected_digest=remote_digests[files_name],
-                )
-                print(f"Files extracted ({_now() - started:.1f}s).")
+                with timed("Files extracted"):
+                    extract_files(
+                        client,
+                        config,
+                        staging,
+                        backup_bid,
+                        expected_digest=remote_digests[files_name],
+                    )
 
             if include_database:
-                started = _now()
-                import_database(
-                    client,
-                    config,
-                    staging,
-                    backup_bid,
-                    expected_digest=remote_digests[
-                        db_archive_name(backup_bid)
-                    ],
-                )
-                print(f"Database imported ({_now() - started:.1f}s).")
+                with timed("Database imported"):
+                    import_database(
+                        client,
+                        config,
+                        staging,
+                        backup_bid,
+                        expected_digest=remote_digests[
+                            db_archive_name(backup_bid)
+                        ],
+                    )
     except (
         WPSSHBackupError,
         OSError,
@@ -433,10 +382,6 @@ def run_restore(
         raise
 
     remove_remote_staging(client, staging)
-
-
-def _now() -> float:
-    return time.monotonic()
 
 
 def main(argv: list[str] | None = None) -> int:
