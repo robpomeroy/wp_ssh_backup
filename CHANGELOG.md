@@ -7,7 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Nothing yet.
+### Fixed
+
+- A failed operation is no longer reported as having completed. The timing
+  helper printed its completion message from a `finally` block, so an
+  exception inside the measured block still produced messages such as
+  `Files extracted (12.3s).` The message now follows the yield and is
+  printed only when the block exits normally.
+- The stale publish lock is no longer reclaimed by mistake. The dead PID
+  was read through the lock's pathname and the lock's identity was
+  captured through a separate `lstat`, leaving a window between them. A
+  contender that replaced the lock in that window could have its new,
+  live lock renamed aside and unlinked — freeing a live publication lock
+  and letting two backups publish concurrently. The PID and the identity
+  are now read from a single descriptor, so the identity provably
+  describes the entry the PID came from.
+- Cleanup no longer replaces an unrelated file. When an owned file could
+  not be unlinked, the quarantined entry was restored with
+  `os.rename(quarantine, path)`, which replaces the destination on POSIX:
+  a file another process created at the original pathname while the entry
+  sat under the quarantine name was silently deleted. The restore now uses
+  a no-replace hard link, so a newcomer is preserved and the quarantined
+  entry is left in place.
 
 ## [0.1.0] - 2026-10-20
 

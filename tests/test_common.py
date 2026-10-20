@@ -864,3 +864,55 @@ def test_remove_remote_file_swallows_command_failure(
     err = capsys.readouterr().err
     assert "WARNING: could not remove remote file" in err
     assert "permission denied" in err
+
+
+# ---------------------------------------------------------------------------
+# Timing helper
+# ---------------------------------------------------------------------------
+
+
+def test_timed_reports_the_elapsed_time_on_success(
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """A successful block is reported with its duration."""
+    from common import timed
+
+    with timed("Files extracted"):
+        pass
+
+    out = capsys.readouterr().out
+    assert out.startswith("Files extracted (")
+    assert out.rstrip().endswith("s).")
+
+
+def test_timed_does_not_claim_success_when_the_block_fails(
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """A failed block must not print a completion message.
+
+    Regression: the message was printed from a `finally` block, so an
+    exception inside the block still produced "Files extracted (12.3s)."
+    — a failed operation was reported as having completed. The message
+    now follows the yield, so it is only printed when the block exits
+    normally.
+    """
+    from common import timed
+
+    with pytest.raises(ValueError, match="boom"):
+        with timed("Files extracted"):
+            raise ValueError("boom")
+
+    assert capsys.readouterr().out == ""
+
+
+def test_timed_does_not_claim_success_on_base_exception(
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """Even a BaseException must not produce a completion message."""
+    from common import timed
+
+    with pytest.raises(KeyboardInterrupt):
+        with timed("Database imported"):
+            raise KeyboardInterrupt
+
+    assert capsys.readouterr().out == ""

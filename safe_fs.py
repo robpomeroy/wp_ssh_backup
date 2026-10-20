@@ -232,6 +232,13 @@ def unlink_if_same_inode_atomic(
     newcomer. If path was already gone, the rename fails with
     FileNotFoundError and nothing is done.
 
+    Every restore of the quarantined entry uses a no-replace hard
+    link, never os.rename: the original pathname is free while the
+    entry sits under the quarantine name, and another process may
+    create a file there. os.rename would replace that newcomer on
+    POSIX and delete another process's file, so the quarantined entry
+    is instead left in place whenever the pathname has reappeared.
+
     Args:
         path: The pathname to remove while it still references identity.
         identity: The (st_dev, st_ino) of the inode this run created;
@@ -278,10 +285,35 @@ def unlink_if_same_inode_atomic(
             # error or a platform that refuses to unlink an open file).
             # Restore it to the original pathname so the file is not
             # stranded under the quarantine name, then warn.
+            #
+            # The restore must NOT replace anything: while the owned
+            # inode sat under the quarantine name, the original
+            # pathname was free, and another process may have created
+            # a file there. os.rename would replace that newcomer
+            # (POSIX) and delete another process's file, so the
+            # restore uses the same no-replace hard link as the
+            # replaced-inode branch below. If the pathname has
+            # reappeared, the quarantined entry is left in place
+            # rather than clobbering the newcomer.
             try:
-                os.rename(quarantine, path)
-            except OSError:
+                os.link(quarantine, path)
+            except FileExistsError:
+                # The pathname was taken while the entry was
+                # quarantined: leave the quarantined entry in place
+                # (it is never deleted) and do not touch the newcomer.
                 pass
+            except OSError:
+                # Linking is unsupported on this filesystem: the entry
+                # stays under the quarantine name rather than risking
+                # a replacement of the original pathname.
+                pass
+            else:
+                # The entry is back at path; the quarantine name is now
+                # a second link to it and removing it is best-effort.
+                try:
+                    os.unlink(quarantine)
+                except OSError:
+                    pass
             if warn:
                 print(
                     "WARNING: "

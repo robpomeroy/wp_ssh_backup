@@ -2216,7 +2216,16 @@ def test_run_backup_cleanup_failure_preserves_original_exception(
             checksum_name(files_archive_name(TS)) + ".part" in p.name
             for p in attempted
         )
-    assert list(backup_dir.iterdir()) == [archive]
+    # The archive's temporary file is still there, restored under its
+    # original name: the cleanup could not unlink it, so it is put back
+    # rather than stranded under the quarantine name. The quarantine
+    # link may linger as well, because removing it is the very
+    # operation that failed.
+    assert archive.exists()
+    leftovers = [
+        p for p in backup_dir.iterdir() if ".quarantine-" in p.name
+    ]
+    assert set(backup_dir.iterdir()) - set(leftovers) == {archive}
     warning = capsys.readouterr().err
     assert "WARNING:" in warning
     assert str(archive) in warning
@@ -2429,3 +2438,122 @@ def test_main_handles_local_post_processing(
         assert "Backup directory unavailable" in output.err
         assert "Backup complete:" not in output.out
         assert "Traceback" not in output.err
+
+
+@pytest.mark.skipif(
+    os.name != "posix",
+    reason="replacing an open lock file is a POSIX-only scenario",
+)
+def test_steal_stale_lock_binds_the_pid_to_the_lock_inode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The dead PID and the lock's identity must come from one entry.
+
+    Regression: the PID was read through the pathname and the identity
+    through a SEPARATE lstat, leaving a window between the two. A
+    contender that observed the same dead PID could reclaim the lock
+    and create a new live one in that window; the reclaim would then
+    capture the NEW lock's inode, rename the new live lock aside and
+    unlink it because it matched the freshly captured identity —
+    freeing a live publication lock and letting two backups publish at
+    once.
+
+    The PID and the identity are now read from one descriptor, so the
+    identity provably describes the entry the PID came from, and a
+    lock replaced in between is detected.
+    """
+    lock = tmp_path / publish_lock.PUBLISH_LOCK_NAME
+    # A stale lock owned by a dead PID.
+    lock.write_text(f"{2**30}\n")
+    original_open = os.open
+    stale_inode = os.lstat(lock).st_ino
+
+    def open_then_swap(path, flags, *args, **kwargs):
+        """Replace the lock with a live one just after it is opened."""
+        fd = original_open(path, flags, *args, **kwargs)
+        if Path(path) == lock:
+            # The other contender reclaimed the stale lock and created
+            # a NEW live lock at the name while we were reading the
+            # old one. The old entry is removed and a new one written
+            # in its place, so the name now refers to a different
+            # inode.
+            os.unlink(path)
+            new_fd = original_open(
+                path, os.O_CREAT | os.O_WRONLY, 0o600
+            )
+            os.write(new_fd, f"{os.getpid()}\n".encode())
+            os.close(new_fd)
+        return fd
+
+    monkeypatch.setattr(safe_fs.os, "open", open_then_swap)
+
+    # The reclaim must refuse: the lock it read is not the lock now at
+    # the name, so nothing can be proven stale.
+    assert publish_lock.steal_stale_lock(lock) is False
+    # The live lock is preserved and the name was not freed.
+    assert lock.exists()
+    assert lock.read_text().strip() == str(os.getpid())
+    # The name really does refer to a different inode now.
+    assert os.lstat(lock).st_ino != stale_inode
+
+
+def test_unlink_if_same_inode_atomic_restore_never_replaces_a_newcomer(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed cleanup must not replace a file that appeared meanwhile.
+
+    Regression: when the owned inode could not be unlinked, the
+    quarantine entry was restored with os.rename(quarantine, path).
+    On POSIX rename REPLACES the destination, so a file another process
+    created at the original pathname while the entry sat under the
+    quarantine name was silently deleted — the opposite of the
+    identity-bound cleanup guarantee. The restore now uses the same
+    no-replace hard link as the replaced-inode branch, so a newcomer is
+    preserved and the quarantine entry is left in place.
+    """
+    path = tmp_path / "wp-files-x.tar.gz.part"
+    path.write_bytes(b"this-run-bytes")
+    identity = (os.stat(path).st_dev, os.stat(path).st_ino)
+
+    original_unlink = os.unlink
+    original_rename = os.rename
+
+    def unlink(target, *args, **kwargs):
+        # Simulate a cleanup failure: the owned inode cannot be
+        # removed, so the restore path is taken.
+        if ".quarantine-" in Path(target).name:
+            raise PermissionError("cleanup denied")
+        return original_unlink(target, *args, **kwargs)
+
+    def rename(src, dst):
+        result = original_rename(src, dst)
+        if Path(src) == path and ".quarantine-" in Path(dst).name:
+            # While the owned entry sits under the quarantine name, the
+            # original pathname is free and another process takes it.
+            newcomer = tmp_path / "newcomer.part"
+            newcomer.write_bytes(b"newcomer-bytes")
+            os.replace(newcomer, path)
+        return result
+
+    monkeypatch.setattr(os, "unlink", unlink)
+    monkeypatch.setattr(os, "rename", rename)
+
+    safe_fs.unlink_if_same_inode_atomic(path, identity)
+
+    # The newcomer is preserved, not clobbered by the restore.
+    assert path.exists()
+    assert path.read_bytes() == b"newcomer-bytes"
+    # The owned entry was left under the quarantine name rather than
+    # overwriting the newcomer.
+    quarantined = [
+        p for p in tmp_path.iterdir() if ".quarantine-" in p.name
+    ]
+    assert len(quarantined) == 1
+    assert quarantined[0].read_bytes() == b"this-run-bytes"
+    # The failure is still reported.
+    warning = capsys.readouterr().err
+    assert "WARNING:" in warning
+    assert "cleanup denied" in warning

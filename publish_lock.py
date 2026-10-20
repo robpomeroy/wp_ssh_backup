@@ -128,7 +128,8 @@ def steal_stale_lock(lock: Path) -> bool:
     keeps retrying normally.
 
     The reclaim is inode-bound, not pathname-bound: the lock's inode is
-    captured (lstat) at the same moment its dead PID is read, the lock
+    captured FROM THE SAME DESCRIPTOR the PID is read from, so the
+    identity provably describes the entry the PID came from. The lock
     is renamed to a unique name only this process knows, and the renamed
     entry is unlinked ONLY if it is still that same inode. A contender
     that observed the same dead PID cannot steal a lock a second
@@ -141,6 +142,12 @@ def steal_stale_lock(lock: Path) -> bool:
     leaves a .stale- file but frees the lock name, which is all that
     matters.
 
+    The descriptor is closed before the rename, because Windows refuses
+    to rename a file this process holds open. That does not reopen the
+    window the descriptor closed: the identity captured from it is
+    compared against the renamed entry, so a lock that was replaced
+    between the read and the rename is still detected and refused.
+
     Args:
         lock: The lock file to reclaim.
 
@@ -151,32 +158,64 @@ def steal_stale_lock(lock: Path) -> bool:
         WPSSHBackupError: If a quarantined lock cannot be restored and
             the name must not be reused.
     """
+    # Open the lock ONCE and read both the identity and the PID from
+    # that descriptor. Reading the PID through the pathname and the
+    # identity through a separate lstat would leave a window between
+    # them: a contender could reclaim the lock and create a new live
+    # one in that window, and the identity would then describe the NEW
+    # lock while the PID described the old one — the reclaim would
+    # free a live lock and let two backups publish concurrently.
     try:
-        pid = int(lock.read_text(encoding="ascii", errors="strict").strip())
-    except (OSError, ValueError):
+        fd = safe_fs.open_nofollow_regular(
+            lock, verb="read the publish lock"
+        )
+    except (OSError, WPSSHBackupError):
+        # The lock cannot be read (gone, unreadable, or a symlink).
+        # Nothing can be proven stale; leave it alone.
+        return False
+    try:
+        try:
+            safe_fs.assert_nofollow_regular(fd, lock)
+            st = os.fstat(fd)
+            lock_identity = (st.st_dev, st.st_ino)
+            data = b""
+            while True:
+                chunk = os.read(fd, 4096)
+                if not chunk:
+                    break
+                data += chunk
+        except OSError:
+            return False
+    finally:
+        # Closed before the rename: Windows refuses to rename a file
+        # this process holds open. The identity captured above still
+        # describes the entry the PID was read from, and the renamed
+        # entry is compared against it below, so a lock that was
+        # replaced in between is still detected.
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+    try:
+        pid = int(data.decode("ascii", errors="strict").strip())
+    except (UnicodeDecodeError, ValueError):
         # Unparseable. Ownership is recorded atomically (the lock is
         # hard-linked into place only after its PID is written), so a
         # lock created by this tool is never visible without its owner.
         # An unparseable lock is therefore corruption or a foreign file,
         # and it is NEVER reclaimed on age alone: a creator paused
-        # between create and write could still be live, and stealing its
-        # lock would break exclusivity. The administrator recovery path
-        # (delete the lock) covers this case.
+        # between create and write could still be live, and stealing
+        # its lock would break exclusivity. The administrator recovery
+        # path (delete the lock) covers this case.
         return False
     if pid_alive(pid):
         return False
-    # Capture the inode of the lock we are about to reclaim, so the
-    # unlink below can never remove a different (newer) lock.
-    try:
-        st = os.lstat(lock)
-        lock_identity = (st.st_dev, st.st_ino)
-    except OSError:
-        return False  # lock vanished; retry creation
     stale = safe_fs.quarantine_name(lock)
     try:
         os.rename(lock, stale)
     except FileNotFoundError:
-        # Another process stole it first; the name is free, retry create.
+        # Another process stole it first; the name is free, retry
+        # create.
         return True
     except OSError:
         return False

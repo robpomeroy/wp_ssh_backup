@@ -1580,6 +1580,12 @@ def trap_rm_action(path: str) -> str:
 def timed(label: str) -> Iterator[None]:
     """Time a block of work and report how long it took.
 
+    The message is printed only when the block completed successfully.
+    The print sits after the yield, so it runs when the `with` block
+    exits normally; if the block raises, the exception is thrown in at
+    the yield point and the completion message is never printed. A
+    failed operation is therefore never reported as having finished.
+
     Args:
         label: What the block does, e.g. "Files extracted".
 
@@ -1587,10 +1593,8 @@ def timed(label: str) -> Iterator[None]:
         None, while the block runs.
     """
     started = time.monotonic()
-    try:
-        yield
-    finally:
-        print(f"{label} ({time.monotonic() - started:.1f}s).")
+    yield
+    print(f"{label} ({time.monotonic() - started:.1f}s).")
 
 
 def fingerprint(key: paramiko.PKey) -> str:
