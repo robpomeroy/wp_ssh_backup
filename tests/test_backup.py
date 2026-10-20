@@ -133,11 +133,11 @@ def test_create_db_dump_mysqldump_fallback_uses_cnf(
 
     # Provide wp-config.php with DB credentials via SFTP.
     client.remote_fs[posixpath.join(SITE_ROOT, "wp-config.php")] = (
-        "define( 'DB_NAME', 'wpdb' );\n"
-        "define( 'DB_USER', 'dbuser' );\n"
-        "define( 'DB_PASSWORD', 'dbpass' );\n"
-        "define( 'DB_HOST', 'localhost' );\n"
-    ).encode()
+        b"define( 'DB_NAME', 'wpdb' );\n"
+        b"define( 'DB_USER', 'dbuser' );\n"
+        b"define( 'DB_PASSWORD', 'dbpass' );\n"
+        b"define( 'DB_HOST', 'localhost' );\n"
+    )
 
     archive = backup.create_db_dump(client, config, staging, TS)
 
@@ -161,11 +161,11 @@ def test_create_db_dump_mysqldump_failure_removes_cnf(
     config = make_config(tmp_path)
     staging = staging_dir_for(SITE_ROOT, TS)
     client.remote_fs[posixpath.join(SITE_ROOT, "wp-config.php")] = (
-        "define( 'DB_NAME', 'wpdb' );\n"
-        "define( 'DB_USER', 'u' );\n"
-        "define( 'DB_PASSWORD', 'p' );\n"
-        "define( 'DB_HOST', 'localhost' );\n"
-    ).encode()
+        b"define( 'DB_NAME', 'wpdb' );\n"
+        b"define( 'DB_USER', 'u' );\n"
+        b"define( 'DB_PASSWORD', 'p' );\n"
+        b"define( 'DB_HOST', 'localhost' );\n"
+    )
 
     with pytest.raises(RemoteCommandError):
         backup.create_db_dump(client, config, staging, TS)
@@ -183,11 +183,11 @@ def test_create_db_dump_site_path_with_spaces(
     config = make_config(tmp_path, wp_site_root=spaced_root)
     staging = staging_dir_for(spaced_root, TS)
     client.remote_fs[posixpath.join(spaced_root, "wp-config.php")] = (
-        "define( 'DB_NAME', 'wpdb' );\n"
-        "define( 'DB_USER', 'u' );\n"
-        "define( 'DB_PASSWORD', 'p' );\n"
-        "define( 'DB_HOST', 'localhost' );\n"
-    ).encode()
+        b"define( 'DB_NAME', 'wpdb' );\n"
+        b"define( 'DB_USER', 'u' );\n"
+        b"define( 'DB_PASSWORD', 'p' );\n"
+        b"define( 'DB_HOST', 'localhost' );\n"
+    )
 
     archive = backup.create_db_dump(client, config, staging, TS)
 
@@ -2599,7 +2599,7 @@ def test_run_backup_chmod_failure_removes_staging(
     config = make_config(tmp_path)
     staging = staging_dir_for(SITE_ROOT, TS)
 
-    with pytest.raises(Exception):
+    with pytest.raises(RemoteCommandError):
         backup.run_backup(
             client, config, include_files=True, include_database=False, bid=TS
         )

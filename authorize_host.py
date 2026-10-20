@@ -239,10 +239,9 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 1
         print(f"Fingerprint matches: {fp}")
-    else:
-        if not confirm_interactive(fp, config.ssh_host, config.ssh_port):
-            print("Aborted; nothing was saved.")
-            return 1
+    elif not confirm_interactive(fp, config.ssh_host, config.ssh_port):
+        print("Aborted; nothing was saved.")
+        return 1
 
     try:
         trusted = is_host_trusted(

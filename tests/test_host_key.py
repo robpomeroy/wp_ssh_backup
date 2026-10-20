@@ -10,7 +10,7 @@ import paramiko
 import pytest
 
 import authorize_host
-import common
+import remote
 from common import (
     Config,
     UnknownHostKeyError,
@@ -94,11 +94,11 @@ def test_connect_rejects_unknown_host_key(
     def fake_connect(self: object, **kwargs: object) -> None:
         FakeSSHClient.connect(fake, **kwargs)
 
-    monkeypatch.setattr(common.paramiko.SSHClient, "connect", fake_connect)
+    monkeypatch.setattr(remote.paramiko.SSHClient, "connect", fake_connect)
 
     config = make_config(tmp_path)
     with pytest.raises(UnknownHostKeyError, match="not trusted"):
-        common.connect(config)
+        remote.connect(config)
 
 
 def test_connect_accepts_trusted_host_key(
@@ -123,17 +123,17 @@ def test_connect_accepts_trusted_host_key(
         seen["policy"] = self._policy
         FakeSSHClient.connect(fake, **kwargs)
 
-    monkeypatch.setattr(common.paramiko.SSHClient, "connect", fake_connect)
+    monkeypatch.setattr(remote.paramiko.SSHClient, "connect", fake_connect)
     monkeypatch.setattr(
-        common.paramiko.SSHClient,
+        remote.paramiko.SSHClient,
         "get_host_keys",
         lambda self: self._host_keys,
     )
 
-    connected = common.connect(config)
+    connected = remote.connect(config)
 
     assert connected is not None
-    assert isinstance(connected, common.paramiko.SSHClient)
+    assert isinstance(connected, remote.paramiko.SSHClient)
     # The trusted key was loaded for the configured host.
     loaded = seen["host_keys"]
     assert len(loaded) == 1
@@ -150,12 +150,12 @@ def test_connect_uses_reject_policy(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(
-        common.paramiko.SSHClient,
+        remote.paramiko.SSHClient,
         "connect",
         lambda self, **kwargs: None,
     )
     config = make_config(tmp_path)
-    client = common.connect(config)
+    client = remote.connect(config)
     import paramiko
 
     assert isinstance(client._policy, paramiko.RejectPolicy)
@@ -168,7 +168,7 @@ def test_connect_missing_known_hosts_file_fails_fast(tmp_path: Path) -> None:
     with pytest.raises(
         WPSSHBackupError, match="SSH_KNOWN_HOSTS file not found"
     ):
-        common.connect(config)
+        remote.connect(config)
 
 
 def test_connect_with_existing_known_hosts_file(
@@ -178,11 +178,11 @@ def test_connect_with_existing_known_hosts_file(
     known_hosts.write_text("")
     config = make_config(tmp_path, ssh_known_hosts=str(known_hosts))
     monkeypatch.setattr(
-        common.paramiko.SSHClient,
+        remote.paramiko.SSHClient,
         "connect",
         lambda self, **kwargs: None,
     )
-    connected = common.connect(config)
+    connected = remote.connect(config)
     assert connected is not None
 
 
@@ -197,14 +197,14 @@ def test_connect_unreadable_known_hosts_raises_wpssh_error(
         raise PermissionError(13, "Permission denied")
 
     monkeypatch.setattr(
-        common.paramiko.SSHClient, "load_host_keys", failing_load
+        remote.paramiko.SSHClient, "load_host_keys", failing_load
     )
     config = make_config(tmp_path, ssh_known_hosts=str(known_hosts))
 
     with pytest.raises(
         WPSSHBackupError, match="Could not load SSH_KNOWN_HOSTS"
     ):
-        common.connect(config)
+        remote.connect(config)
 
 
 def test_connect_malformed_known_hosts_raises_wpssh_error(
@@ -218,14 +218,14 @@ def test_connect_malformed_known_hosts_raises_wpssh_error(
         raise paramiko.SSHException("Invalid known_hosts entry")
 
     monkeypatch.setattr(
-        common.paramiko.SSHClient, "load_host_keys", failing_load
+        remote.paramiko.SSHClient, "load_host_keys", failing_load
     )
     config = make_config(tmp_path, ssh_known_hosts=str(known_hosts))
 
     with pytest.raises(
         WPSSHBackupError, match="Could not load SSH_KNOWN_HOSTS"
     ):
-        common.connect(config)
+        remote.connect(config)
 
 
 def test_connect_undecodable_known_hosts_raises_wpssh_error(
@@ -241,14 +241,14 @@ def test_connect_undecodable_known_hosts_raises_wpssh_error(
         )
 
     monkeypatch.setattr(
-        common.paramiko.SSHClient, "load_host_keys", failing_load
+        remote.paramiko.SSHClient, "load_host_keys", failing_load
     )
     config = make_config(tmp_path, ssh_known_hosts=str(known_hosts))
 
     with pytest.raises(
         WPSSHBackupError, match="Could not load SSH_KNOWN_HOSTS"
     ):
-        common.connect(config)
+        remote.connect(config)
 
 
 def test_connect_malformed_system_host_keys_raises_wpssh_error(
@@ -262,7 +262,7 @@ def test_connect_malformed_system_host_keys_raises_wpssh_error(
         )
 
     monkeypatch.setattr(
-        common.paramiko.SSHClient, "load_system_host_keys",
+        remote.paramiko.SSHClient, "load_system_host_keys",
         failing_system_load,
     )
     config = make_config(tmp_path)
@@ -270,7 +270,7 @@ def test_connect_malformed_system_host_keys_raises_wpssh_error(
     with pytest.raises(
         WPSSHBackupError, match="Could not load the system known_hosts"
     ):
-        common.connect(config)
+        remote.connect(config)
 
 
 def test_main_reports_unreadable_known_hosts_as_error(
@@ -288,7 +288,7 @@ def test_main_reports_unreadable_known_hosts_as_error(
         raise PermissionError(13, "Permission denied")
 
     monkeypatch.setattr(
-        common.paramiko.SSHClient, "load_host_keys", failing_load
+        remote.paramiko.SSHClient, "load_host_keys", failing_load
     )
     config = make_config(tmp_path, ssh_known_hosts=str(known_hosts))
     monkeypatch.setattr(backup, "load_config", lambda: config)

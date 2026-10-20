@@ -84,7 +84,7 @@ def test_allocate_gives_up_after_attempts(
     )
     client.directories.add(fixed_path)
     monkeypatch.setattr(
-        "common.backup_id", lambda now=None: fixed_bid
+        "remote_ops.backup_id", lambda now=None: fixed_bid
     )
 
     with pytest.raises(WPSSHBackupError, match="exclusive remote directory"):

@@ -8,33 +8,31 @@ from pathlib import Path
 
 import pytest
 
+from cli import human_size
 from common import (
     ChecksumError,
     ConfigError,
     RemoteCommandError,
-    _unescape_php,
     backup_id,
     backup_id_from_archive_name,
     checksum_name,
     find_backup_sets,
-    human_size,
     load_config,
-    mysql_client_config,
     parse_backup_id,
     parse_sha256sum_output,
     parse_timestamp,
-    parse_wp_config,
     prune_local_backups,
+    remove_remote_file,
+    remove_remote_staging,
     sha256_file,
     shquote,
     split_db_host,
     staging_dir_for,
-    strip_php_comments,
     trap_rm_action,
     utc_timestamp,
-    remove_remote_file,
-    remove_remote_staging,
 )
+from db_config import mysql_client_config
+from wp_config import _unescape_php, parse_wp_config, strip_php_comments
 
 
 # ---------------------------------------------------------------------------
@@ -745,21 +743,21 @@ def test_remove_remote_staging_swallows_command_failure(
     capsys: pytest.CaptureFixture,
 ) -> None:
     """A failing rm command is reported as a warning, not raised."""
-    import common as _common
+    import remote_ops as _remote_ops
 
-    original = _common.run_remote_cmd_checked
+    original = _remote_ops.run_remote_cmd_checked
 
     def failing_checked(
         cl: object, command: str, timeout: object = None
     ) -> str:
         raise RemoteCommandError(command, 1, "permission denied")
 
-    _common.run_remote_cmd_checked = failing_checked  # type: ignore
+    _remote_ops.run_remote_cmd_checked = failing_checked  # type: ignore
     try:
         client = _RaisingClient(RuntimeError("unused"))
         remove_remote_staging(client, "/tmp/s")  # type: ignore[arg-type]
     finally:
-        _common.run_remote_cmd_checked = original  # type: ignore
+        _remote_ops.run_remote_cmd_checked = original  # type: ignore
     err = capsys.readouterr().err
     assert "WARNING: could not remove remote staging" in err
     assert "permission denied" in err
@@ -845,22 +843,22 @@ def test_remove_remote_file_swallows_command_failure(
     capsys: pytest.CaptureFixture,
 ) -> None:
     """A failing rm command is reported as a warning, not raised."""
-    import common as _common
+    import remote_ops as _remote_ops
 
-    original = _common.run_remote_cmd_checked
+    original = _remote_ops.run_remote_cmd_checked
 
     def failing_checked(
         cl: object, command: str, timeout: object = None
     ) -> str:
         raise RemoteCommandError(command, 1, "permission denied")
 
-    _common.run_remote_cmd_checked = failing_checked  # type: ignore
+    _remote_ops.run_remote_cmd_checked = failing_checked  # type: ignore
     try:
         client = _RaisingClient(RuntimeError("unused"))
         # type: ignore[arg-type]
         remove_remote_file(client, "/tmp/staging/my.cnf")
     finally:
-        _common.run_remote_cmd_checked = original  # type: ignore
+        _remote_ops.run_remote_cmd_checked = original  # type: ignore
     err = capsys.readouterr().err
     assert "WARNING: could not remove remote file" in err
     assert "permission denied" in err

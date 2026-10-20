@@ -32,7 +32,8 @@ import stat
 import sys
 from contextlib import contextmanager
 from pathlib import Path
-from typing import BinaryIO, Generator, Iterator
+from typing import BinaryIO
+from collections.abc import Generator
 
 from common import MissingArtifactError, WPSSHBackupError
 
@@ -291,6 +292,48 @@ def remove_quarantine_reservation(quarantine: Path) -> None:
         pass
 
 
+def _restore_quarantined_entry(
+    quarantine: Path, path: Path
+) -> tuple[bool, OSError | None]:
+    """Put a quarantined entry back at its original pathname.
+
+    The restore uses a NO-REPLACE hard link, never a rename: while the
+    entry sat under the quarantine name the original pathname was free,
+    and another process may have created a file there. os.rename would
+    replace that newcomer (POSIX) and delete another process's file.
+
+    If the pathname has reappeared, the link fails with
+    FileExistsError and the quarantined entry is left in place -- it is
+    never deleted -- rather than clobbering the newcomer. The quarantine
+    name is then a second link to the entry, and removing it is
+    best-effort.
+
+    Args:
+        quarantine: The quarantine name holding the entry.
+        path: The original pathname to restore to.
+
+    Returns:
+        A tuple of (the entry was linked to path, the failure that
+        stopped it, if any). The failure is the link failure, or the
+        failure to remove the now-redundant quarantine name.
+    """
+    try:
+        os.link(quarantine, path)
+    except OSError as exc:
+        # The pathname was taken while the entry was quarantined, or
+        # linking is unsupported on this filesystem. Either way the
+        # entry stays under the quarantine name rather than risking a
+        # replacement of the original pathname.
+        return False, exc
+    try:
+        os.unlink(quarantine)
+    except OSError as exc:
+        # The entry is back at path; the quarantine name is now a
+        # second link to it and removing it is best-effort.
+        return True, exc
+    return True, None
+
+
 def unlink_if_same_inode_atomic(
     path: Path,
     identity: tuple[int, int] | None,
@@ -414,25 +457,10 @@ def unlink_if_same_inode_atomic(
             # replaced-inode branch below. If the pathname has
             # reappeared, the quarantined entry is left in place
             # rather than clobbering the newcomer.
-            try:
-                os.link(quarantine, path)
-            except FileExistsError:
-                # The pathname was taken while the entry was
-                # quarantined: leave the quarantined entry in place
-                # (it is never deleted) and do not touch the newcomer.
-                pass
-            except OSError:
-                # Linking is unsupported on this filesystem: the entry
-                # stays under the quarantine name rather than risking
-                # a replacement of the original pathname.
-                pass
-            else:
-                # The entry is back at path; the quarantine name is now
-                # a second link to it and removing it is best-effort.
-                try:
-                    os.unlink(quarantine)
-                except OSError:
-                    pass
+            # The restore is best-effort and silent: the failure is
+            # reported by the warning about the unlink below, which is
+            # the actual problem this branch is about.
+            _restore_quarantined_entry(quarantine, path)
             if warn:
                 print(
                     "WARNING: "
@@ -450,22 +478,8 @@ def unlink_if_same_inode_atomic(
     # restoration is a no-replace hard link. If the destination
     # reappeared, the quarantined entry is left in place (it is never
     # deleted) instead of overwriting the newcomer.
-    try:
-        os.link(quarantine, path)
-    except OSError as exc:
-        if warn:
-            print(
-                f"WARNING: could not restore replaced {what} {path}: {exc}",
-                file=sys.stderr,
-            )
-        return
-    try:
-        os.unlink(quarantine)
-    except OSError as exc:
-        # The replacement is back at path; the quarantine name is now a
-        # second link to it and removing it is best-effort. On failure
-        # the entry lingers under the hidden name rather than deleting
-        # a file this run does not own.
+    _restored, exc = _restore_quarantined_entry(quarantine, path)
+    if exc is not None:
         if warn:
             print(
                 f"WARNING: could not restore replaced {what} {path}: {exc}",
@@ -509,7 +523,7 @@ def unlink_if_same_inode(
 @contextmanager
 def held_local_files(
     paths: list[Path],
-) -> Iterator[dict[Path, BinaryIO]]:
+) -> Generator[dict[Path, BinaryIO], None, None]:
     """
     Open each path once through a no-follow descriptor and hold it open
     for the whole context.
@@ -556,7 +570,7 @@ def held_temp_downloads(
     downloaded_fds: dict[Path, int],
     *,
     close_on_exit: bool = True,
-) -> Generator[dict[str, BinaryIO]]:
+) -> Generator[dict[str, BinaryIO], None, None]:
     """
     Wrap the descriptors handed over by the download as held file handles.
 

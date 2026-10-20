@@ -1,0 +1,18 @@
+[tool.ruff]
+# The project is a flat set of top-level scripts, not a package, so
+# ruff's default src layout does not apply.
+target-version = "py310"
+line-length = 79
+extend-exclude = ["venv", "build", "dist", ".pytest_cache"]
+
+[tool.ruff.lint]
+# E4/E7/E9/F are ruff's defaults. UP catches deprecated typing
+# constructs (typing.Iterator under @contextmanager) and B catches
+# real bug patterns (e.g. a raise inside an except without "from").
+select = ["E4", "E7", "E9", "F", "UP", "B"]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests import inside test functions on purpose: several of them
+# patch module attributes, and a local import keeps the patch target
+# unambiguous.
+"tests/*" = ["PLC0415"]

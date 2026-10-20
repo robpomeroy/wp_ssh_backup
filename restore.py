@@ -33,6 +33,7 @@ from cli import add_scope_arguments, add_version_argument, resolve_scope
 import safe_fs
 from selection import choose_set, list_backup_sets, ts_of
 from common import (
+    REMOTE_FAILURES,
     ChecksumError,
     Config,
     WPSSHBackupError,
@@ -375,11 +376,7 @@ def run_restore(
                             db_archive_name(backup_bid)
                         ],
                     )
-    except (
-        WPSSHBackupError,
-        OSError,
-        paramiko.SSHException,
-    ):
+    except REMOTE_FAILURES:
         # Covers every WPSSHBackupError subclass — including base-class
         # errors such as an invalid WP_CLI_PATH — plus transport failures.
         # Restore always cleans staging: a failed verification means the

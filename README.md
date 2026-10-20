@@ -334,31 +334,63 @@ opt-in:
 WP_SSH_BACKUP_LIVE_TEST=1 pytest tests/test_live.py
 ```
 
+### Linting
+
+Two linters are configured, and CI runs both:
+
+```bash
+ruff check .     # style and correctness rules (see pyproject.toml)
+pyflakes .       # undefined names, unused imports
+```
+
+`ruff` is the stricter of the two and covers pyflakes' `F` rules, so it is
+the one to run while working; `pyflakes` is a quick, zero-configuration check.
+
 ### Continuous integration
 
-A GitHub Actions workflow (`.github/workflows/tests.yml`) runs the offline test
-suite on every push and pull request, against Python 3.10 (the minimum
-supported version) and 3.14 on Ubuntu. Live tests are excluded from CI, as no
-host or credentials are available there.
+A GitHub Actions workflow (`.github/workflows/tests.yml`) lints and runs the
+offline test suite on every push and pull request, against Python 3.10 (the
+minimum supported version) and 3.14 on Ubuntu. Live tests are excluded from
+CI, as no host or credentials are available there.
 
 ### Project layout
 
 The three entry points are thin: they parse arguments and orchestrate. The
 work lives in focused modules.
 
+### Entry points
+
 | File | Responsibility |
 | --- | --- |
 | `backup.py` | Backup orchestration: create the remote artifacts, download, verify and publish them. |
 | `restore.py` | Restore orchestration: select a set, upload it, verify it and extract it. |
 | `authorize_host.py` | Fetch and record a host key. |
-| `common.py` | Shared low-level layer: configuration, SSH/SFTP, naming, checksums, manifests. |
 | `cli.py` | Shared command-line helpers (`--version`, the scope flags). |
 | `version.py` | The single source of truth for the version number. |
+
+### Low-level layer
+
+| File | Responsibility |
+| --- | --- |
+| `errors.py` | The exception types, and the set of failures that mean "the run could not complete". |
+| `config.py` | Loading and validating the configuration. |
+| `remote.py` | The SSH and SFTP transport. |
+| `remote_ops.py` | Remote operations both flows share: staging directories, the wp CLI, remote cleanup. |
+| `wp_config.py` | Parsing `wp-config.php` on the remote host. |
+| `db_config.py` | The MySQL option file that carries the database credentials. |
+| `naming.py` | Timestamps, backup identifiers and artifact file names. |
+| `checksums.py` | SHA-256 checksums of local files and of remote manifests. |
+| `retention.py` | The backup sets held locally, and the retention policy. |
+| `shell.py` | Quoting for remote shell commands. |
+| `host_keys.py` | Host key fingerprints and `known_hosts` entries. |
 | `safe_fs.py` | Local-filesystem primitives: no-follow opens, inode identity, atomic identity-bound removal, held descriptors. |
 | `publish.py` | Publishing verified downloads under their final names, without replacing anything. |
 | `publish_lock.py` | The cooperative publication lock and its stale-owner recovery. |
 | `archive_validation.py` | Archive member validation, the destination-tree audit and verified extraction. |
 | `selection.py` | Choosing which local backup set to restore. |
+
+`common.py` re-exports the low-level layer, so `from common import ...` keeps
+working; new code should import from the module that owns the name.
 
 Every module can be imported and tested on its own; the test suite mirrors
 this layout.
@@ -388,7 +420,7 @@ python backup.py --version
 ## Licence
 
 The project is licensed under the GNU General Public License 3 (GPLv3). See
-the [LICENSE](LICENSE) file for details.
+the [LICENCE](LICENCE) file for details.
 
 ## Contributing
 

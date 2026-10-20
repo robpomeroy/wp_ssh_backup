@@ -24,7 +24,7 @@ class FakeSFTPClient:
         self.remote_fs = remote_fs
         self.modes: dict[str, int] = {}
 
-    def __enter__(self) -> "FakeSFTPClient":
+    def __enter__(self) -> FakeSFTPClient:
         return self
 
     def __exit__(self, *exc: object) -> None:
@@ -80,7 +80,7 @@ class _FakeReadFile:
     def __init__(self, data: bytes | None) -> None:
         self._data = data
 
-    def __enter__(self) -> "_FakeReadFile":
+    def __enter__(self) -> _FakeReadFile:
         return self
 
     def __exit__(self, *exc: object) -> None:
@@ -96,7 +96,7 @@ class _FakeWriteFile:
         self._path = path
         self._buffer = io.BytesIO()
 
-    def __enter__(self) -> "_FakeWriteFile":
+    def __enter__(self) -> _FakeWriteFile:
         return self
 
     def __exit__(self, *exc: object) -> None:
@@ -372,10 +372,10 @@ class FakeSSHClient:
         for match in exclude_matches:
             if match.start() > member_pos:
                 stderr.write(
-                    "tar: The following options were used after non-option "
-                    "arguments. These options are positional and affect "
-                    "only arguments that follow them. Please, rearrange "
-                    "them properly.\n".encode()
+                    b"tar: The following options were used after non-option "
+                    b"arguments. These options are positional and affect "
+                    b"only arguments that follow them. Please, rearrange "
+                    b"them properly.\n"
                 )
                 stderr.write(
                     f"tar: --exclude {match.group(1)} has no effect\n".encode()
@@ -699,11 +699,11 @@ class FakeSSHClient:
             stderr.write(f"unparsable mysqldump: {command}\n".encode())
             return 2
         if cnf.group(1) not in self.remote_fs:
-            stderr.write("mysqldump: defaults-extra-file missing\n".encode())
+            stderr.write(b"mysqldump: defaults-extra-file missing\n")
             return 1
         body = self.remote_fs[cnf.group(1)].decode()
         if "password=" not in body:
-            stderr.write("mysqldump: cnf missing password\n".encode())
+            stderr.write(b"mysqldump: cnf missing password\n")
             return 1
         self.remote_fs[dump.group(1)] = (
             f"-- WordPress database dump\n-- db: {db.group(1)}\n"
@@ -718,10 +718,10 @@ class FakeSSHClient:
             stderr.write(f"unparsable mysql: {command}\n".encode())
             return 2
         if cnf.group(1) not in self.remote_fs:
-            stderr.write("mysql: defaults-extra-file missing\n".encode())
+            stderr.write(b"mysql: defaults-extra-file missing\n")
             return 1
         if source.group(1) not in self.remote_fs:
-            stderr.write("mysql: dump file missing\n".encode())
+            stderr.write(b"mysql: dump file missing\n")
             return 1
         return 0
 

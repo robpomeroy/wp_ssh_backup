@@ -143,3 +143,96 @@ def test_scope_flags_are_mutually_exclusive() -> None:
     with pytest.raises(SystemExit) as caught:
         parser.parse_args(["--files", "--database"])
     assert caught.value.code == 2
+
+
+def test_common_facade_reexports_every_public_name() -> None:
+    """The facade re-exports the public surface of the modules it wraps.
+
+    common.py was split into focused modules, and the module that
+    remains is a re-export facade: the guarantee it makes is that
+    "from common import X" keeps working for the names the old
+    common.py had.
+
+    The expected surface is derived from the modules themselves, so the
+    test needs no git history (CI checks out a shallow clone) and is
+    stricter than comparing against a stored snapshot: it also catches
+    a name the facade re-exports but the owning module no longer
+    defines, and a public name a module defines but the facade omits.
+    """
+    import ast
+
+    import common
+
+    # The modules the facade is built from. Each one is checked for the
+    # names it publishes.
+    SOURCES = [
+        "errors",
+        "config",
+        "remote",
+        "remote_ops",
+        "wp_config",
+        "db_config",
+        "naming",
+        "checksums",
+        "retention",
+        "shell",
+        "host_keys",
+        "cli",
+    ]
+
+    def public_names(source: str) -> set[str]:
+        """The public names a module defines at the top level."""
+        tree = ast.parse(source)
+        names: set[str] = set()
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                 ast.ClassDef)):
+                names.add(node.name)
+            elif isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        names.add(target.id)
+        # The leading underscore marks a name that was never public
+        # API, and "annotations" is the __future__ import.
+        return {
+            name
+            for name in names
+            if not name.startswith("_") and name != "annotations"
+        }
+
+    # cli.py holds names that were never part of the common.py
+    # surface: human_size and timed came from the old common.py and
+    # are re-exported, while the argument-parser helpers have always
+    # lived in cli.py alone.
+    CLI_ONLY = {
+        "add_scope_arguments",
+        "add_version_argument",
+        "resolve_scope",
+        "version_string",
+    }
+
+    expected: set[str] = set()
+    for module_name in SOURCES:
+        expected |= public_names(
+            (PROJECT_ROOT / f"{module_name}.py").read_text(encoding="utf-8")
+        )
+    expected -= CLI_ONLY
+
+    # Every public name is reachable as an attribute of the facade.
+    missing = {name for name in expected if not hasattr(common, name)}
+    assert not missing, f"common.py no longer exports: {sorted(missing)}"
+
+    # ...and a star import carries the same set, so __all__ must list
+    # every public name too.
+    assert expected <= set(common.__all__), (
+        "common.__all__ is missing: "
+        f"{sorted(expected - set(common.__all__))}"
+    )
+
+    # The facade must not publish a name that no module defines.
+    undefined = {
+        name
+        for name in common.__all__
+        if not hasattr(common, name)
+    }
+    assert not undefined, f"common.__all__ lists unknown names: {sorted(undefined)}"

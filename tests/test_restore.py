@@ -2455,11 +2455,11 @@ def test_run_restore_mysqldump_fallback_uses_cnf(tmp_path: Path) -> None:
     client = FakeSSHClient(SITE_ROOT, wp_cli=None)
     config = make_config(tmp_path)
     client.remote_fs[posixpath.join(SITE_ROOT, "wp-config.php")] = (
-        "define( 'DB_NAME', 'wpdb' );\n"
-        "define( 'DB_USER', 'u' );\n"
-        "define( 'DB_PASSWORD', 'p' );\n"
-        "define( 'DB_HOST', 'localhost' );\n"
-    ).encode()
+        b"define( 'DB_NAME', 'wpdb' );\n"
+        b"define( 'DB_USER', 'u' );\n"
+        b"define( 'DB_PASSWORD', 'p' );\n"
+        b"define( 'DB_HOST', 'localhost' );\n"
+    )
 
     restore.run_restore(
         client, config, set_files, False, True, staging_bid="20261014T1000Z"
@@ -2507,7 +2507,7 @@ def test_run_restore_chmod_failure_removes_staging(tmp_path: Path) -> None:
     client.fail_on["chmod"] = 1
     config = make_config(tmp_path)
 
-    with pytest.raises(Exception):
+    with pytest.raises(RemoteCommandError):
         restore.run_restore(
             client,
             config,
@@ -2757,11 +2757,11 @@ def test_import_database_site_path_with_spaces(tmp_path: Path) -> None:
     client = FakeSSHClient(spaced_root, wp_cli=None)
     config = make_config(tmp_path, wp_site_root=spaced_root)
     client.remote_fs[posixpath.join(spaced_root, "wp-config.php")] = (
-        "define( 'DB_NAME', 'wpdb' );\n"
-        "define( 'DB_USER', 'u' );\n"
-        "define( 'DB_PASSWORD', 'p' );\n"
-        "define( 'DB_HOST', 'localhost' );\n"
-    ).encode()
+        b"define( 'DB_NAME', 'wpdb' );\n"
+        b"define( 'DB_USER', 'u' );\n"
+        b"define( 'DB_PASSWORD', 'p' );\n"
+        b"define( 'DB_HOST', 'localhost' );\n"
+    )
 
     restore.run_restore(
         client,
