@@ -146,27 +146,42 @@ def test_scope_flags_are_mutually_exclusive() -> None:
 
 
 def test_common_facade_reexports_every_public_name() -> None:
-    """The facade keeps every public name of the old common.py.
+    """The facade re-exports the public surface of the modules it wraps.
 
     common.py was split into focused modules, and the module that
     remains is a re-export facade: the guarantee it makes is that
-    "from common import X" keeps working for every public name the
-    old common.py had. The old module had no __all__, so every
-    module-level name was importable.
+    "from common import X" keeps working for the names the old
+    common.py had.
 
-    This test pins the guarantee: the names are compared against the
-    module the split was made from, so a name that moves or is dropped
-    cannot pass unnoticed.
+    The expected surface is derived from the modules themselves, so the
+    test needs no git history (CI checks out a shallow clone) and is
+    stricter than comparing against a stored snapshot: it also catches
+    a name the facade re-exports but the owning module no longer
+    defines, and a public name a module defines but the facade omits.
     """
     import ast
-    import subprocess
 
     import common
 
-    # The commit before the split is the last state of the old module.
-    revision = "4eb4e32"
+    # The modules the facade is built from. Each one is checked for the
+    # names it publishes.
+    SOURCES = [
+        "errors",
+        "config",
+        "remote",
+        "remote_ops",
+        "wp_config",
+        "db_config",
+        "naming",
+        "checksums",
+        "retention",
+        "shell",
+        "host_keys",
+        "cli",
+    ]
 
     def public_names(source: str) -> set[str]:
+        """The public names a module defines at the top level."""
         tree = ast.parse(source)
         names: set[str] = set()
         for node in tree.body:
@@ -185,15 +200,23 @@ def test_common_facade_reexports_every_public_name() -> None:
             if not name.startswith("_") and name != "annotations"
         }
 
-    old_source = subprocess.run(
-        ["git", "show", f"{revision}:common.py"],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        check=True,
-    ).stdout
+    # cli.py holds names that were never part of the common.py
+    # surface: human_size and timed came from the old common.py and
+    # are re-exported, while the argument-parser helpers have always
+    # lived in cli.py alone.
+    CLI_ONLY = {
+        "add_scope_arguments",
+        "add_version_argument",
+        "resolve_scope",
+        "version_string",
+    }
 
-    expected = public_names(old_source)
+    expected: set[str] = set()
+    for module_name in SOURCES:
+        expected |= public_names(
+            (PROJECT_ROOT / f"{module_name}.py").read_text(encoding="utf-8")
+        )
+    expected -= CLI_ONLY
 
     # Every public name is reachable as an attribute of the facade.
     missing = {name for name in expected if not hasattr(common, name)}
@@ -205,3 +228,11 @@ def test_common_facade_reexports_every_public_name() -> None:
         "common.__all__ is missing: "
         f"{sorted(expected - set(common.__all__))}"
     )
+
+    # The facade must not publish a name that no module defines.
+    undefined = {
+        name
+        for name in common.__all__
+        if not hasattr(common, name)
+    }
+    assert not undefined, f"common.__all__ lists unknown names: {sorted(undefined)}"
