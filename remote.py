@@ -134,6 +134,7 @@ def connect(config: Config) -> paramiko.SSHClient:
         ) from exc
     return client
 
+
 def run_remote_cmd(
 
 
@@ -178,7 +179,6 @@ def run_remote_cmd(
     )
 
 
-
 def run_remote_cmd_checked(
     client: paramiko.SSHClient,
     command: str,
@@ -206,9 +206,6 @@ def run_remote_cmd_checked(
 # ---------------------------------------------------------------------------
 # SFTP
 # ---------------------------------------------------------------------------
-
-
-
 
 
 def sftp_download(
@@ -290,11 +287,11 @@ def sftp_download(
         raise
     if downloaded_fds is not None:
 
-
         downloaded_fds[local] = fd
     else:
         os.close(fd)
     return local
+
 
 def remote_path_exists(sftp: paramiko.SFTPClient, remote_path: str) -> bool:
     """
@@ -314,6 +311,7 @@ def remote_path_exists(sftp: paramiko.SFTPClient, remote_path: str) -> bool:
         return True
     except OSError:
         return False
+
 
 def write_remote_file(
     client: paramiko.SSHClient,
@@ -355,7 +353,6 @@ def write_remote_file(
     # of creation. Neither a creation mode nor a client-side umask can
     # reach the server through paramiko's SFTP open.
 
-
     run_remote_cmd_checked(
         client,
         f"rm -f {shquote(remote_path)} && umask 077"
@@ -364,6 +361,7 @@ def write_remote_file(
     with sftp.open(remote_path, "wb") as handle:
         handle.write(data)
     sftp.chmod(remote_path, mode)
+
 
 def read_remote_file(sftp: paramiko.SFTPClient, remote_path: str) -> str:
     """
