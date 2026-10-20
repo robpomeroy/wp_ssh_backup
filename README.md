@@ -1,5 +1,7 @@
 # WP SSH Backup
 
+![Banner](images/banner.png)
+
 WP SSH Backup is a tool for taking backups of WordPress websites over SSH. This
 is most suitable for users who have SSH access to their WordPress hosting
 server.
