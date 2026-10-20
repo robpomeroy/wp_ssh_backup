@@ -1071,6 +1071,40 @@ def test_publish_downloads_never_reclaims_unparseable_lock(
     assert lock.exists()
 
 
+
+def intercept_quarantine_move(
+    monkeypatch: pytest.MonkeyPatch,
+    module,
+    on_move,
+) -> None:
+    """Patch the function that performs the quarantine move.
+
+    The quarantine move is performed with ``os.replace``: it has to
+    overwrite the process's own empty reservation, and ``os.rename``
+    refuses to replace on Windows. A test that needs to observe the
+    move must therefore patch ``os.replace`` -- patching ``os.rename``
+    silently does nothing, so the simulated race never happens and the
+    test goes vacuous while still passing.
+
+    The callback is given the ORIGINAL move function, so it decides
+    whether the race happens before or after the move, and can make its
+    own moves without recursing into this patch.
+
+    Args:
+        monkeypatch: The pytest monkeypatch fixture.
+        module: The module whose ``os`` attribute is patched.
+        on_move: Called as ``on_move(src, dst, original)``. It must
+            return the result of the move, and must call
+            ``original(src, dst)`` to perform it.
+    """
+    original = module.os.replace
+
+    def intercepting(src, dst):
+        return on_move(src, dst, original)
+
+    monkeypatch.setattr(module.os, "replace", intercepting)
+
+
 def test_steal_stale_lock_does_not_steal_new_lock(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1089,25 +1123,22 @@ def test_steal_stale_lock_does_not_steal_new_lock(
     lock = tmp_path / publish_lock.PUBLISH_LOCK_NAME
     # A stale lock owned by a dead PID.
     lock.write_text(f"{2**30}\n")
-    original_rename = os.rename
-
-    def rename_new_lock(src, dst):
+    def replace_new_lock(src, dst, original):
         if src == lock:
             # Simulate the other contender: it already reclaimed the
             # stale lock and created a NEW live lock at the name, so
-            # this process's rename moves the NEW lock, not the stale
-            # one it read. The new lock must be a genuinely different
-            # inode: unlink+recreate can reuse the freed inode number
-            # (ext4/tmpfs), and os.rename cannot replace an existing
-            # destination on Windows, so the new lock is written to a
-            # separate path and moved over the name with os.replace
-            # (a distinct function, unaffected by this monkeypatch).
+            # this process's quarantine move takes the NEW lock, not
+            # the stale one it read. The new lock must be a genuinely
+            # different inode: unlink+recreate can reuse the freed
+            # inode number (ext4/tmpfs), so the new lock is written to
+            # a separate path and moved over the name with the
+            # ORIGINAL move, which this patch does not intercept.
             fresh = tmp_path / "fresh-lock"
             fresh.write_text(f"{os.getpid()}\n")
-            os.replace(fresh, lock)
-        return original_rename(src, dst)
+            original(fresh, lock)
+        return original(src, dst)
 
-    monkeypatch.setattr(publish_lock.os, "rename", rename_new_lock)
+    intercept_quarantine_move(monkeypatch, publish_lock, replace_new_lock)
 
     # The steal must refuse: the renamed entry is a NEW live lock (a
     # different inode than the stale one that was read), so it is
@@ -1134,30 +1165,33 @@ def test_steal_stale_lock_restore_does_not_clobber_newer_lock(
     """
     lock = tmp_path / publish_lock.PUBLISH_LOCK_NAME
     lock.write_text(f"{2**30}\n")  # stale lock, dead PID
-    original_rename = os.rename
     # Distinct contents so the assertion can tell the two contenders
-    # apart: the FIRST lock is the one this process's rename moves to
-    # the quarantine path; the SECOND is the one that must survive.
+    # apart: the FIRST lock is the one this process's quarantine move
+    # takes to the quarantine path; the SECOND is the one that must
+    # survive.
     first_pid = os.getpid()
     second_pid = os.getpid() + 1
 
-    def rename_moves_new_lock(src, dst):
+    def replace_moves_new_lock(src, dst, original):
         if src == lock:
             # A contender already reclaimed the stale lock and created a
-            # NEW lock at the name, so this process's rename moves the
-            # NEW lock (a different inode) to the quarantine path.
+            # NEW lock at the name, so this process's quarantine move
+            # takes the NEW lock (a different inode) to the quarantine
+            # path.
             first = tmp_path / "contender-lock-1"
             first.write_text(f"{first_pid}\n")
-            os.replace(first, lock)
-            result = original_rename(src, dst)
+            original(first, lock)
+            result = original(src, dst)
             # Before the restore runs, ANOTHER contender takes the name.
             second = tmp_path / "contender-lock-2"
             second.write_text(f"{second_pid}\n")
-            os.replace(second, lock)
+            original(second, lock)
             return result
-        return original_rename(src, dst)
+        return original(src, dst)
 
-    monkeypatch.setattr(publish_lock.os, "rename", rename_moves_new_lock)
+    intercept_quarantine_move(
+        monkeypatch, publish_lock, replace_moves_new_lock
+    )
 
     # Restoring the quarantined lock must fail loudly: the name is taken
     # by a newer lock whose owner may still be publishing, so a normal
@@ -1171,6 +1205,286 @@ def test_steal_stale_lock_restore_does_not_clobber_newer_lock(
     assert lock.exists()
     assert lock.read_text().strip() == str(second_pid)
     assert any(".quarantine-" in p.name for p in tmp_path.iterdir())
+
+
+def test_quarantine_never_replaces_a_pre_existing_entry(
+    tmp_path: Path,
+) -> None:
+    """A pre-existing quarantine entry must survive the cleanup.
+
+    Regression: the quarantine move used os.rename, which REPLACES the
+    destination on POSIX. The quarantine name was derived from the
+    process's PID and a counter, both predictable, so an entry left
+    behind by an earlier run that reused the same PID and counter (or
+    one a concurrent writer pre-created) would be silently deleted —
+    its directory link discarded before the inode check ever ran.
+
+    The name is now unguessable and RESERVED with O_CREAT|O_EXCL before
+    the source is moved into it, so a pre-existing entry at that name
+    can never be replaced.
+    """
+    import unittest.mock
+
+    path = tmp_path / "wp-files-x.tar.gz.part"
+    path.write_bytes(b"this-run-bytes")
+    identity = (os.stat(path).st_dev, os.stat(path).st_ino)
+
+    # A leftover entry from an earlier run, at the exact name this run
+    # would use. It must not be replaced.
+    leftover = tmp_path / ".wp-files-x.tar.gz.part.quarantine-1-2-3"
+    leftover.write_bytes(b"someone-elses-bytes")
+    leftover_identity = (os.stat(leftover).st_dev, os.stat(leftover).st_ino)
+
+    # Force the cleanup to try that exact name first. The reservation
+    # must then refuse it and pick another one, rather than replacing
+    # the leftover.
+    calls: list[Path] = []
+    real_name = safe_fs.quarantine_name
+
+    def fixed_name(target: Path) -> Path:
+        calls.append(target)
+        if len(calls) == 1:
+            return leftover
+        return real_name(target)
+
+    with unittest.mock.patch.object(
+        safe_fs, "quarantine_name", fixed_name
+    ):
+        safe_fs.unlink_if_same_inode_atomic(path, identity)
+
+    # The leftover entry is untouched: it still refers to the same
+    # inode and still holds the same bytes.
+    assert leftover.exists()
+    assert leftover.read_bytes() == b"someone-elses-bytes"
+    assert (
+        os.stat(leftover).st_dev,
+        os.stat(leftover).st_ino,
+    ) == leftover_identity
+    # The owned file was still cleaned up.
+    assert not path.exists()
+
+
+def test_reserve_quarantine_name_is_unguessable_and_exclusive(
+    tmp_path: Path,
+) -> None:
+    """Reserved names are random and never collide with an existing file."""
+    first = safe_fs.reserve_quarantine_name(tmp_path / "a.part")
+    second = safe_fs.reserve_quarantine_name(tmp_path / "a.part")
+
+    # Two reservations never share a name.
+    assert first != second
+    # The names carry a random component, so they are not derivable
+    # from the PID and a counter alone.
+    assert first.name != second.name
+    # Both were created exclusively: they exist, and are empty.
+    assert first.exists()
+    assert second.exists()
+    assert first.read_bytes() == b""
+    # A name that is already taken is never handed out.
+    taken = safe_fs.reserve_quarantine_name(tmp_path / "b.part")
+    with pytest.raises(FileExistsError):
+        os.open(taken, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+
+
+def test_failed_quarantine_reservation_leaves_the_file_in_place(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed reservation warns instead of raising.
+
+    unlink_if_same_inode_atomic is called from cleanup paths (finally
+    and except blocks) that must not mask the error they are handling,
+    so a failure to reserve a quarantine name is reported and the file
+    is left in place rather than raised.
+    """
+    import unittest.mock
+
+    path = tmp_path / "wp-files-x.tar.gz.part"
+    path.write_bytes(b"owned-bytes")
+    identity = safe_fs.inode_identity(
+        os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+    )
+
+    def refuse(path: Path) -> Path:
+        raise WPSSHBackupError("no name could be reserved")
+
+    with unittest.mock.patch.object(
+        safe_fs, "reserve_quarantine_name", refuse
+    ):
+        safe_fs.unlink_if_same_inode_atomic(path, identity)
+
+    # The file is left in place: without a quarantine name the claim
+    # cannot be made, so the check-then-unlink is not atomic.
+    assert path.exists()
+    assert path.read_bytes() == b"owned-bytes"
+    warning = capsys.readouterr().err
+    assert "WARNING:" in warning
+    assert "could not check" in warning
+
+
+def test_failed_quarantine_reservation_does_not_raise_in_a_cleanup_path(
+    tmp_path: Path,
+) -> None:
+    """The cleanup helper never raises, so a finally block is safe."""
+    import unittest.mock
+
+    path = tmp_path / "wp-files-x.tar.gz.part"
+    path.write_bytes(b"owned-bytes")
+    identity = safe_fs.inode_identity(
+        os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+    )
+
+    def refuse(path: Path) -> Path:
+        raise WPSSHBackupError("no name could be reserved")
+
+    with unittest.mock.patch.object(
+        safe_fs, "reserve_quarantine_name", refuse
+    ):
+        # No exception must escape.
+        safe_fs.unlink_if_same_inode_atomic(path, identity, warn=False)
+        safe_fs.unlink_if_same_inode(path, identity)
+
+
+def test_steal_stale_lock_reports_failure_when_no_name_can_be_reserved(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A lock that cannot be quarantined is left in place."""
+    import unittest.mock
+
+    lock = tmp_path / publish_lock.PUBLISH_LOCK_NAME
+    lock.write_text("999999\n")
+
+    def refuse(path: Path) -> Path:
+        raise WPSSHBackupError("no name could be reserved")
+
+    with unittest.mock.patch.object(
+        safe_fs, "reserve_quarantine_name", refuse
+    ):
+        assert publish_lock.steal_stale_lock(lock) is False
+
+    # The lock is untouched.
+    assert lock.exists()
+    assert lock.read_text() == "999999\n"
+
+
+@pytest.mark.skipif(
+    os.name != "posix",
+    reason="replacing an open lock file is a POSIX-only scenario",
+)
+def test_steal_stale_lock_binds_the_pid_to_the_lock_inode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The dead PID and the lock's identity must come from one entry.
+
+    Regression: the PID was read through the pathname and the identity
+    through a SEPARATE lstat, leaving a window between the two. A
+    contender that observed the same dead PID could reclaim the lock
+    and create a new live one in that window; the reclaim would then
+    capture the NEW lock's inode, rename the new live lock aside and
+    unlink it because it matched the freshly captured identity —
+    freeing a live publication lock and letting two backups publish at
+    once.
+
+    The PID and the identity are now read from one descriptor, so the
+    identity provably describes the entry the PID came from, and a
+    lock replaced in between is detected.
+    """
+    lock = tmp_path / publish_lock.PUBLISH_LOCK_NAME
+    # A stale lock owned by a dead PID.
+    lock.write_text(f"{2**30}\n")
+    original_open = os.open
+    stale_inode = os.lstat(lock).st_ino
+
+    def open_then_swap(path, flags, *args, **kwargs):
+        """Replace the lock with a live one just after it is opened."""
+        fd = original_open(path, flags, *args, **kwargs)
+        if Path(path) == lock:
+            # The other contender reclaimed the stale lock and created
+            # a NEW live lock at the name while we were reading the
+            # old one. The old entry is removed and a new one written
+            # in its place, so the name now refers to a different
+            # inode.
+            os.unlink(path)
+            new_fd = original_open(
+                path, os.O_CREAT | os.O_WRONLY, 0o600
+            )
+            os.write(new_fd, f"{os.getpid()}\n".encode())
+            os.close(new_fd)
+        return fd
+
+    monkeypatch.setattr(safe_fs.os, "open", open_then_swap)
+
+    # The reclaim must refuse: the lock it read is not the lock now at
+    # the name, so nothing can be proven stale.
+    assert publish_lock.steal_stale_lock(lock) is False
+    # The live lock is preserved and the name was not freed.
+    assert lock.exists()
+    assert lock.read_text().strip() == str(os.getpid())
+    # The name really does refer to a different inode now.
+    assert os.lstat(lock).st_ino != stale_inode
+
+
+def test_unlink_if_same_inode_atomic_restore_never_replaces_a_newcomer(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed cleanup must not replace a file that appeared meanwhile.
+
+    Regression: when the owned inode could not be unlinked, the
+    quarantine entry was restored with os.rename(quarantine, path).
+    On POSIX rename REPLACES the destination, so a file another process
+    created at the original pathname while the entry sat under the
+    quarantine name was silently deleted — the opposite of the
+    identity-bound cleanup guarantee. The restore now uses the same
+    no-replace hard link as the replaced-inode branch, so a newcomer is
+    preserved and the quarantine entry is left in place.
+    """
+    path = tmp_path / "wp-files-x.tar.gz.part"
+    path.write_bytes(b"this-run-bytes")
+    identity = (os.stat(path).st_dev, os.stat(path).st_ino)
+
+    original_unlink = os.unlink
+
+    def unlink(target, *args, **kwargs):
+        # Simulate a cleanup failure: the owned inode cannot be
+        # removed, so the restore path is taken.
+        if ".quarantine-" in Path(target).name:
+            raise PermissionError("cleanup denied")
+        return original_unlink(target, *args, **kwargs)
+
+    def on_move(src, dst, original):
+        result = original(src, dst)
+        if Path(src) == path and ".quarantine-" in Path(dst).name:
+            # While the owned entry sits under the quarantine name, the
+            # original pathname is free and another process takes it.
+            newcomer = tmp_path / "newcomer.part"
+            newcomer.write_bytes(b"newcomer-bytes")
+            original(newcomer, path)
+        return result
+
+    monkeypatch.setattr(os, "unlink", unlink)
+    intercept_quarantine_move(monkeypatch, safe_fs, on_move)
+
+    safe_fs.unlink_if_same_inode_atomic(path, identity)
+
+    # The newcomer is preserved, not clobbered by the restore.
+    assert path.exists()
+    assert path.read_bytes() == b"newcomer-bytes"
+    # The owned entry was left under the quarantine name rather than
+    # overwriting the newcomer.
+    quarantined = [
+        p for p in tmp_path.iterdir() if ".quarantine-" in p.name
+    ]
+    assert len(quarantined) == 1
+    assert quarantined[0].read_bytes() == b"this-run-bytes"
+    # The failure is still reported.
+    warning = capsys.readouterr().err
+    assert "WARNING:" in warning
+    assert "cleanup denied" in warning
 
 
 def test_publish_by_rename_publishes_verified_inode(
@@ -2059,18 +2373,17 @@ def test_unlink_if_same_inode_atomic_restore_preserves_new_file(
     replacement.write_bytes(b"other-run-bytes")
     os.replace(replacement, path)
 
-    original_rename = os.rename
-
-    def renaming(src, dst):
-        original_rename(src, dst)
+    def on_move(src, dst, original):
+        result = original(src, dst)
         if Path(src) == path and ".quarantine-" in Path(dst).name:
             # After the path is claimed for quarantine, another process
             # creates a fresh file at the original pathname.
             newcomer = tmp_path / "newcomer.part"
             newcomer.write_bytes(b"newcomer-bytes")
-            os.replace(newcomer, path)
+            original(newcomer, path)
+        return result
 
-    monkeypatch.setattr(os, "rename", renaming)
+    intercept_quarantine_move(monkeypatch, safe_fs, on_move)
     safe_fs.unlink_if_same_inode_atomic(path, identity)
 
     # The newcomer created after the claim is preserved, not clobbered

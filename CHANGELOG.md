@@ -41,6 +41,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   collision, so the only entry the move can replace is this process's own
   empty reservation. A failed reservation is reported and the file is
   left in place rather than removed unsafely.
+- The tests that exercise the quarantine move are no longer vacuous. They
+  intercepted the move by patching `os.rename`, but the move is performed
+  with `os.replace` (it has to overwrite the process's own empty
+  reservation, and `os.rename` refuses to replace on Windows), so the
+  simulated race never happened. The tests now patch the function the
+  production code actually calls, through one shared helper, and the
+  regression tests for the quarantine reservation are restored.
 
 ## [0.1.0] - 2026-10-20
 
