@@ -32,7 +32,8 @@ import stat
 import sys
 from contextlib import contextmanager
 from pathlib import Path
-from typing import BinaryIO, Generator, Iterator
+from typing import BinaryIO
+from collections.abc import Generator
 
 from common import MissingArtifactError, WPSSHBackupError
 
@@ -509,7 +510,7 @@ def unlink_if_same_inode(
 @contextmanager
 def held_local_files(
     paths: list[Path],
-) -> Iterator[dict[Path, BinaryIO]]:
+) -> Generator[dict[Path, BinaryIO], None, None]:
     """
     Open each path once through a no-follow descriptor and hold it open
     for the whole context.
@@ -556,7 +557,7 @@ def held_temp_downloads(
     downloaded_fds: dict[Path, int],
     *,
     close_on_exit: bool = True,
-) -> Generator[dict[str, BinaryIO]]:
+) -> Generator[dict[str, BinaryIO], None, None]:
     """
     Wrap the descriptors handed over by the download as held file handles.
 

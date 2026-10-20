@@ -20,7 +20,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Iterator
+from collections.abc import Generator
 
 import paramiko
 from dotenv import load_dotenv
@@ -1577,7 +1577,7 @@ def trap_rm_action(path: str) -> str:
 
 
 @contextmanager
-def timed(label: str) -> Iterator[None]:
+def timed(label: str) -> Generator[None, None, None]:
     """Time a block of work and report how long it took.
 
     The message is printed only when the block completed successfully.

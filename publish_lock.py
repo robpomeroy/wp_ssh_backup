@@ -248,17 +248,19 @@ def steal_stale_lock(lock: Path) -> bool:
         # its owner believe it still holds the lock while we publish.
         try:
             os.link(stale, lock)
-        except FileExistsError:
+        except FileExistsError as exc:
             # The name is taken again: the quarantined lock is left in
             # place (never deleted) and the name is NOT freed. This is
             # not a normal retry — the owner of the quarantined lock may
             # still be publishing, so acquisition must fail loudly.
+            # The FileExistsError is chained so the original cause is
+            # not lost from the traceback.
             raise WPSSHBackupError(
                 f"Could not restore the publish lock {lock!s}: another "
                 "lock appeared while a newer lock was being quarantined. "
                 f"The quarantined lock is at {stale!s}; verify no backup "
                 "is running, then remove both files and re-run."
-            )
+            ) from exc
         except OSError as exc:
             # Linking is unsupported or failed for another reason: the
             # quarantined lock cannot be put back, so the name must not
