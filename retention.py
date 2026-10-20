@@ -64,6 +64,7 @@ def find_backup_sets(backup_dir: Path) -> dict[str, list[Path]]:
         result[bid] = files
     return result
 
+
 def prune_local_backups(
     backup_dir: Path,
     retention_days: int,

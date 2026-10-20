@@ -20,7 +20,6 @@ from errors import ChecksumError
 # ---------------------------------------------------------------------------
 
 
-
 def sha256_file(path: str | Path, chunk_size: int = 1024 * 1024) -> str:
     """
     Compute the SHA-256 checksum of a file.
@@ -39,6 +38,8 @@ def sha256_file(path: str | Path, chunk_size: int = 1024 * 1024) -> str:
     return digest.hexdigest()
 
 def verify_local_checksum(path: str | Path, expected_sha256: str) -> None:
+
+
     """
     Verify the SHA-256 checksum of a local file against an expected value.
 
@@ -59,6 +60,8 @@ def verify_local_checksum(path: str | Path, expected_sha256: str) -> None:
 
 
 SHA256SUM_LINE_RE = re.compile(r"^([0-9a-fA-F]{64})\s+[ *](.+)$", re.MULTILINE)
+
+
 
 def parse_sha256sum_output(text: str) -> dict[str, str]:
     """
@@ -104,6 +107,8 @@ def parse_sha256sum_output(text: str) -> dict[str, str]:
 # ---------------------------------------------------------------------------
 # Checksum manifests
 # ---------------------------------------------------------------------------
+
+
 
 
 

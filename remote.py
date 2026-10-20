@@ -26,7 +26,6 @@ from shell import shquote
 # ---------------------------------------------------------------------------
 
 
-
 def connect(config: Config) -> paramiko.SSHClient:
     """
     Open an SSH connection using the configured credentials.
@@ -136,6 +135,8 @@ def connect(config: Config) -> paramiko.SSHClient:
     return client
 
 def run_remote_cmd(
+
+
     client: paramiko.SSHClient,
     command: str,
     timeout: float | None = None,
@@ -172,6 +173,8 @@ def run_remote_cmd(
         err.decode("utf-8", "replace"),
     )
 
+
+
 def run_remote_cmd_checked(
     client: paramiko.SSHClient,
     command: str,
@@ -199,6 +202,8 @@ def run_remote_cmd_checked(
 # ---------------------------------------------------------------------------
 # SFTP
 # ---------------------------------------------------------------------------
+
+
 
 
 
@@ -280,6 +285,8 @@ def sftp_download(
             pass
         raise
     if downloaded_fds is not None:
+
+
         downloaded_fds[local] = fd
     else:
         os.close(fd)
@@ -295,6 +302,8 @@ def remote_path_exists(sftp: paramiko.SFTPClient, remote_path: str) -> bool:
 
     Returns:
         True if the remote path exists, False otherwise.
+
+
     """
     try:
         sftp.stat(remote_path)
@@ -341,6 +350,8 @@ def write_remote_file(
     # redirection then creates a fresh regular file 0600 at the instant
     # of creation. Neither a creation mode nor a client-side umask can
     # reach the server through paramiko's SFTP open.
+
+
     run_remote_cmd_checked(
         client,
         f"rm -f {shquote(remote_path)} && umask 077"

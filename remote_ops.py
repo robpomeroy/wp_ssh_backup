@@ -23,7 +23,6 @@ from shell import shquote
 # ---------------------------------------------------------------------------
 
 
-
 def detect_wp_cli(client: paramiko.SSHClient, config: Config) -> str | None:
     """
     Detect the path to the wp CLI binary on the remote host.
@@ -52,6 +51,37 @@ def detect_wp_cli(client: paramiko.SSHClient, config: Config) -> str | None:
             return lines[0]
     return None
 
+def _best_effort_rm(
+
+
+    client: paramiko.SSHClient,
+    path: str,
+    command: str,
+    description: str,
+) -> None:
+    """Remove a remote path, reporting a failure as a warning.
+
+    Transport failures (a dropped SSH connection raises OSError or
+    paramiko.SSHException) are caught as well as command failures, so a
+    cleanup problem can never replace the original error that triggered
+    the cleanup; it is reported as a warning instead.
+
+    Args:
+        client: An active Paramiko SSHClient connected to the remote host.
+        path: The path being removed.
+        command: The shell command that performs the removal.
+        description: How the path is described in the warning message.
+    """
+    try:
+        run_remote_cmd_checked(client, command)
+    except (WPSSHBackupError, OSError, paramiko.SSHException) as exc:
+        print(
+            f"WARNING: could not remove remote {description} {path}: {exc}",
+            file=sys.stderr,
+        )
+
+
+
 def remove_remote_staging(client: paramiko.SSHClient, staging: str) -> None:
     """
     Best-effort removal of the remote staging directory.
@@ -65,14 +95,12 @@ def remove_remote_staging(client: paramiko.SSHClient, staging: str) -> None:
         client: An active Paramiko SSHClient connected to the remote host.
         staging: The path to the remote staging directory.
     """
-    try:
-        run_remote_cmd_checked(client, f"rm -rf {shquote(staging)}")
-    except (WPSSHBackupError, OSError, paramiko.SSHException) as exc:
-        print(
-            "WARNING: could not remove remote staging directory "
-            f"{staging}: {exc}",
-            file=sys.stderr,
-        )
+    _best_effort_rm(
+        client, staging, f"rm -rf {shquote(staging)}", "staging directory"
+    )
+
+
+
 
 def remove_remote_file(client: paramiko.SSHClient, path: str) -> None:
     """
@@ -87,14 +115,11 @@ def remove_remote_file(client: paramiko.SSHClient, path: str) -> None:
     Args:
         client: An active Paramiko SSHClient connected to the remote host.
         path: The path to the remote file.
+
+
     """
-    try:
-        run_remote_cmd_checked(client, f"rm -f {shquote(path)}")
-    except (WPSSHBackupError, OSError, paramiko.SSHException) as exc:
-        print(
-            f"WARNING: could not remove remote file {path}: {exc}",
-            file=sys.stderr,
-        )
+    _best_effort_rm(client, path, f"rm -f {shquote(path)}", "file")
+
 
 def allocate_remote_dir(
     client: paramiko.SSHClient,
@@ -141,6 +166,8 @@ def allocate_remote_dir(
         )
         if code == 0:
             return candidate
+
+
         last_error = err.strip()
     raise WPSSHBackupError(
         f"Could not allocate an exclusive remote directory under {parent} "

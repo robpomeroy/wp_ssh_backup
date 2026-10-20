@@ -12,6 +12,7 @@ import hashlib
 
 import paramiko
 
+
 def fingerprint(key: paramiko.PKey) -> str:
     """
     Return the OpenSSH-style SHA-256 fingerprint of a host key.
@@ -25,6 +26,8 @@ def fingerprint(key: paramiko.PKey) -> str:
     """
     digest = hashlib.sha256(key.asbytes()).digest()
     return "SHA256:" + base64.b64encode(digest).decode().rstrip("=")
+
+
 
 def known_hosts_entry(hostname: str, port: int, key: paramiko.PKey) -> str:
     """

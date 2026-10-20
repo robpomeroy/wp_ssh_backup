@@ -21,6 +21,7 @@ def shquote(path: str) -> str:
     """
     return "'" + path.replace("'", "'\\''") + "'"
 
+
 def trap_rm_action(path: str) -> str:
     """
     Build a trap action that removes a file, quoted as one shell argument.

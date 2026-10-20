@@ -27,7 +27,6 @@ BACKUP_FILE_RE = re.compile(
 )
 
 
-
 def utc_timestamp(now: datetime | None = None) -> str:
     """
     Return a UTC timestamp string such as 20261014T0930Z.
@@ -41,6 +40,8 @@ def utc_timestamp(now: datetime | None = None) -> str:
     return (now or datetime.now(timezone.utc)).strftime(TS_FORMAT)
 
 def backup_id(now: datetime | None = None) -> str:
+
+
     """
     Return a unique backup identifier: UTC timestamp plus a random suffix.
 
@@ -56,6 +57,8 @@ def backup_id(now: datetime | None = None) -> str:
     """
     return f"{utc_timestamp(now)}-{secrets.token_hex(3)}"
 
+
+
 def parse_timestamp(ts: str) -> datetime:
     """
     Parse a timestamp string produced by utc_timestamp().
@@ -65,6 +68,8 @@ def parse_timestamp(ts: str) -> datetime:
 
     Returns:
         A datetime object representing the parsed UTC timestamp.
+
+
     """
     return datetime.strptime(ts, TS_FORMAT).replace(tzinfo=timezone.utc)
 
@@ -80,6 +85,8 @@ def parse_backup_id(bid: str) -> datetime:
         bid: The backup identifier to parse.
 
     Returns:
+
+
         A datetime object representing the parsed UTC timestamp.
     """
     ts_part = bid.split("-", 1)[0]
@@ -98,6 +105,8 @@ def staging_dir_for(site_root: str, bid: str) -> str:
         site_root: The root directory of the WordPress site.
         bid: The backup identifier to include in the directory name.
 
+
+
     Returns:
         The path to the staging directory.
     """
@@ -108,6 +117,8 @@ def db_archive_name(ts: str) -> str:
     """
     Return the filename for a database backup archive with the given timestamp.
 
+
+
     Args:
         ts: The timestamp string to include in the archive filename.
 
@@ -117,6 +128,8 @@ def db_archive_name(ts: str) -> str:
     return f"wp-db-{ts}.tar.gz"
 
 def files_archive_name(ts: str) -> str:
+
+
     """
     Return the filename for a files backup archive with the given timestamp.
 
@@ -127,6 +140,7 @@ def files_archive_name(ts: str) -> str:
         The filename for the files backup archive.
     """
     return f"wp-files-{ts}.tar.gz"
+
 
 def checksum_name(archive_name: str) -> str:
     """

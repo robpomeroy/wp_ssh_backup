@@ -45,7 +45,6 @@ WP_DEFINE_RE = re.compile(
 )
 
 
-
 def strip_php_comments(source: str) -> tuple[str, list[bool]]:
     """
     Remove PHP comments from source while preserving string literals.
@@ -134,6 +133,8 @@ def strip_php_comments(source: str) -> tuple[str, list[bool]]:
     return "".join(out), in_string
 
 def _unescape_php(value: str, quote: str) -> str:
+
+
     r"""
     Decode PHP escape sequences in the raw text of a string literal.
 
@@ -198,6 +199,8 @@ def _unescape_php(value: str, quote: str) -> str:
         i += 2
     return "".join(out)
 
+
+
 def parse_wp_config(text: str) -> dict[str, str]:
     """
     Extract WordPress DB connection settings from wp-config.php source.
@@ -232,6 +235,8 @@ def parse_wp_config(text: str) -> dict[str, str]:
         if name in WP_DB_KEYS and name not in found:
             found[name] = _unescape_php(
                 match.group("value"), match.group("q")
+
+
             )
     return found
 

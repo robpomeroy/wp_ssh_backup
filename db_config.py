@@ -20,7 +20,6 @@ from wp_config import read_wp_db_settings
 # ---------------------------------------------------------------------------
 
 
-
 def split_db_host(db_host: str) -> tuple[str, str | None, str | None]:
     """
     Split a wp-config DB_HOST value into (host, port, socket path).
@@ -63,6 +62,8 @@ def split_db_host(db_host: str) -> tuple[str, str | None, str | None]:
     return host or "localhost", None, rest
 
 def mysql_client_config(
+
+
     host: str,
     user: str,
     password: str,
@@ -145,6 +146,8 @@ def read_db_settings(
         return read_wp_db_settings(sftp, site_root)
     finally:
         sftp.close()
+
+
 
 def write_mysql_client_config(
     client: paramiko.SSHClient,

@@ -20,6 +20,7 @@ This module re-exports them, so existing imports keep working.
 from __future__ import annotations
 
 from errors import (
+    REMOTE_FAILURES,
     ChecksumError,
     ConfigError,
     MissingArtifactError,
@@ -92,6 +93,7 @@ from cli import (
 )
 
 __all__ = [
+    "REMOTE_FAILURES",
     "ChecksumError",
     "ConfigError",
     "MissingArtifactError",

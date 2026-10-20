@@ -25,6 +25,7 @@ from cli import add_scope_arguments, add_version_argument, resolve_scope
 import safe_fs
 from publish import publish_downloads
 from common import (
+    REMOTE_FAILURES,
     ChecksumError,
     Config,
     WPSSHBackupError,
@@ -539,11 +540,7 @@ def run_backup(
             file=sys.stderr,
         )
         raise
-    except (
-        WPSSHBackupError,
-        OSError,
-        paramiko.SSHException,
-    ):
+    except REMOTE_FAILURES:
         # Any other failure — including base WPSSHBackupError raised by, for
         # example, an invalid WP_CLI_PATH — must not leave staging behind.
         # ChecksumError is handled above and keeps staging for retry.

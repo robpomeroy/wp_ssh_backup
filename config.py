@@ -36,6 +36,7 @@ class Config:
     backup_dir: Path
     retention_days: int
 
+
 def _get_int(name: str, default: int, minimum: int = 1) -> int:
     """
     Retrieve an integer environment variable with validation.
@@ -65,9 +66,13 @@ def _get_int(name: str, default: int, minimum: int = 1) -> int:
         raise ConfigError(f"{name} must be >= {minimum}, got {value}")
     return value
 
+
+
 def _find_env_file() -> Path:
     cwd_env = Path.cwd() / ".env"
     if cwd_env.is_file():
+
+
         return cwd_env
     return Path(__file__).resolve().parent / ".env"
 

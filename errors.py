@@ -7,17 +7,21 @@ still distinguish the individual failure modes when it needs to.
 
 from __future__ import annotations
 
+import paramiko
+
 # ---------------------------------------------------------------------------
 # Errors
 # ---------------------------------------------------------------------------
-
 
 
 class WPSSHBackupError(Exception):
     """Base class for all WP SSH Backup errors."""
 
 class ConfigError(WPSSHBackupError):
+
+
     """Raised when .env configuration is missing or invalid."""
+
 
 class UnknownHostKeyError(WPSSHBackupError):
     """Raised when the server presents a host key that is not trusted."""
@@ -32,10 +36,26 @@ class RemoteCommandError(WPSSHBackupError):
         super().__init__(
             f"Remote command failed (exit {exit_code}): {command}\n"
             f"stderr: {stderr.strip() or '(empty)'}"
+
+
         )
+
+
 
 class ChecksumError(WPSSHBackupError):
     """Raised when an artifact fails SHA-256 verification."""
 
 class MissingArtifactError(WPSSHBackupError):
     """Raised when an expected file (local or remote) cannot be found."""
+
+
+# The failures that mean "the run could not complete": a tool error
+# of any kind, a local or remote I/O error, or a transport failure.
+# The backup and restore flows both clean up their remote staging
+# directory for exactly these, and naming the set once stops the two
+# from drifting apart.
+REMOTE_FAILURES = (
+    WPSSHBackupError,
+    OSError,
+    paramiko.SSHException,
+)
