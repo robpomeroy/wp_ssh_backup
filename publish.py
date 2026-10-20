@@ -585,37 +585,10 @@ def publish_downloads(
     # re-check and the temp cleanup all run while this run exclusively
     # owns the directory for cooperative writers.
     with exclusive_publish_lock(backup_dir):
-        # Pre-check: refuse to overwrite anything that already exists
-        # under a final name (e.g. a file from another run) BEFORE
-        # publishing the first file, so the common conflict case fails
-        # fast with a friendly error and no half-done publication. This
-        # check alone is not the guarantee — the no-replace publication
-        # below is: it fails if a path appears here between the check
-        # and the publication. Symlinks are rejected too, including
-        # dangling ones: Path.exists() is False for a broken link, but
-        # publication would silently replace it, breaking the
-        # preservation promise.
-        for final in finals:
-            final_path = backup_dir / final
-            if final_path.exists() or final_path.is_symlink():
-                raise FileExistsError(
-                    f"Refusing to overwrite existing backup file: "
-                    f"{final_path}"
-                )
-
-        # Record the inode each temporary download was created with, so
-        # the success-path cleanup below removes a temp only while it
-        # still references that inode. A writer who replaced a .part
-        # pathname after the download planted a different inode;
-        # removing it would delete another run's file, so the
-        # replacement is left in place with a warning.
-        temp_identities: dict[Path, tuple[int, int]] = {}
-        for final in finals:
-            temp_path = temp_paths[final]
-            fd = downloaded_fds[temp_path]
-            fd_stat = os.fstat(fd)
-            temp_identities[temp_path] = (fd_stat.st_dev, fd_stat.st_ino)
-
+        _precheck_finals(finals, backup_dir)
+        temp_identities = _record_temp_identities(
+            finals, temp_paths, downloaded_fds
+        )
         published: list[tuple[Path, tuple[int, int]]] = []
         # Handles publish_no_replace() returned for a renamed
         # publication (the fallback used when inode-link publication is
@@ -668,22 +641,7 @@ def publish_downloads(
             # unlinked, so the caller's _discard_temp_downloads()
             # cleanup — which must never touch final paths it did not
             # create — discards them.
-            for final_path, identity in reversed(published):
-                safe_fs.unlink_if_same_inode_atomic(
-                    final_path,
-                    identity,
-                    what="published backup file",
-                    check_error_message=(
-                        "could not roll back {what} {path}: {exc}"
-                    ),
-                    remove_error_message=(
-                        "could not roll back {what} {path}: {exc}"
-                    ),
-                    replaced_message=(
-                        "{what} {path} was replaced during publication; "
-                        "leaving the replacement in place"
-                    ),
-                )
+            _rollback_published(published)
             raise
         finally:
             # Close the replacement handles the rename fallback
@@ -702,15 +660,124 @@ def publish_downloads(
         # references the inode this run created (recorded above); a
         # path replaced by another process is left in place with a
         # warning rather than deleted.
-        for final in finals:
-            temp_path = temp_paths[final]
-            identity = temp_identities[temp_path]
-            safe_fs.unlink_if_same_inode_atomic(
-                temp_path,
-                identity,
-                replaced_message=(
-                    "{what} {path} was replaced during publication; "
-                    "leaving the replacement in place"
-                ),
-            )
+        _remove_temp_downloads(finals, temp_paths, temp_identities)
     return {final: backup_dir / final for final in finals}
+
+
+def _precheck_finals(finals: list[str], backup_dir: Path) -> None:
+    """Refuse to publish over anything that already exists.
+
+    The pre-check makes the common conflict case fail fast with a
+    friendly error and no half-done publication. It alone is not the
+    guarantee — the no-replace publication is: it fails if a path
+    appears between the check and the publication. Symlinks are
+    rejected too, including dangling ones: Path.exists() is False for a
+    broken link, but publication would silently replace it, breaking the
+    preservation promise.
+
+    Args:
+        finals: The final names to publish.
+        backup_dir: The directory the finals live in.
+
+    Raises:
+        FileExistsError: If a final name is already taken.
+    """
+    for final in finals:
+        final_path = backup_dir / final
+        if final_path.exists() or final_path.is_symlink():
+            raise FileExistsError(
+                f"Refusing to overwrite existing backup file: {final_path}"
+            )
+
+
+def _record_temp_identities(
+    finals: list[str],
+    temp_paths: dict[str, Path],
+    downloaded_fds: dict[Path, int],
+) -> dict[Path, tuple[int, int]]:
+    """Record the inode each temporary download was created with.
+
+    The success-path cleanup removes a temp only while it still
+    references that inode. A writer who replaced a .part pathname after
+    the download planted a different inode; removing it would delete
+    another run's file, so the replacement is left in place with a
+    warning.
+
+    Args:
+        finals: The final names being published.
+        temp_paths: The temporary path of each final name.
+        downloaded_fds: The open descriptors of the .part files.
+
+    Returns:
+        A mapping of each temporary path to its (st_dev, st_ino).
+    """
+    identities: dict[Path, tuple[int, int]] = {}
+    for final in finals:
+        temp_path = temp_paths[final]
+        fd = downloaded_fds[temp_path]
+        fd_stat = os.fstat(fd)
+        identities[temp_path] = (fd_stat.st_dev, fd_stat.st_ino)
+    return identities
+
+
+def _rollback_published(
+    published: list[tuple[Path, tuple[int, int]]],
+) -> None:
+    """Remove the final paths this run created.
+
+    The paths were made by this run's no-replace publications, so
+    unlinking them can never remove a pre-existing file. A path that
+    was unlinked and replaced after publication no longer references
+    this run's inode; the replacement is left in place with a warning
+    rather than unlinking a file this run did not create.
+
+    Args:
+        published: The published paths and their held identities.
+    """
+    for final_path, identity in reversed(published):
+        safe_fs.unlink_if_same_inode_atomic(
+            final_path,
+            identity,
+            what="published backup file",
+            check_error_message=(
+                "could not roll back {what} {path}: {exc}"
+            ),
+            remove_error_message=(
+                "could not roll back {what} {path}: {exc}"
+            ),
+            replaced_message=(
+                "{what} {path} was replaced during publication; "
+                "leaving the replacement in place"
+            ),
+        )
+
+
+def _remove_temp_downloads(
+    finals: list[str],
+    temp_paths: dict[str, Path],
+    temp_identities: dict[Path, tuple[int, int]],
+) -> None:
+    """Remove the temporary downloads now the finals are published.
+
+    A leftover temp is only a warning — the finals are complete and
+    verified, so publication is not undone over a cleanup failure. A
+    temp path is removed only while it still references the inode this
+    run created; a path replaced by another process is left in place
+    with a warning rather than deleted.
+
+    Args:
+        finals: The final names that were published.
+        temp_paths: The temporary path of each final name.
+        temp_identities: Each temporary path's (st_dev, st_ino).
+    """
+    for final in finals:
+        temp_path = temp_paths[final]
+        identity = temp_identities[temp_path]
+        safe_fs.unlink_if_same_inode_atomic(
+            temp_path,
+            identity,
+            replaced_message=(
+                "{what} {path} was replaced during publication; "
+                "leaving the replacement in place"
+            ),
+        )

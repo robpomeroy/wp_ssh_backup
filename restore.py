@@ -3,6 +3,12 @@
 Uploads a chosen backup set to the remote host, verifies SHA-256 checksums
 remotely, extracts the files tarball into the site root and imports the
 database dump.
+
+This module is the orchestration layer: it uploads the set and drives the
+verification and extraction. The mechanics live in archive_validation.py
+(archive member validation, the destination-tree audit and verified
+extraction), selection.py (choosing which set to restore) and common.py (the
+shared low-level layer).
 """
 
 from __future__ import annotations

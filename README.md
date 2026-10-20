@@ -239,6 +239,7 @@ python restore.py [--timestamp <ts>] [--files] [--database] [--all]
   the run fails and lists the full ids so you can pick one.
 - An explicit `--timestamp` is strict: the set must exist and contain the
   requested artifacts; there is no fallback to older sets.
+- `-v` / `--version` prints the version and exits.
 
 If the local backup directory cannot be listed, restore reports an `ERROR:`
 message and exits with status 2 before opening an SSH connection.
@@ -340,6 +341,28 @@ suite on every push and pull request, against Python 3.10 (the minimum
 supported version) and 3.14 on Ubuntu. Live tests are excluded from CI, as no
 host or credentials are available there.
 
+### Project layout
+
+The three entry points are thin: they parse arguments and orchestrate. The
+work lives in focused modules.
+
+| File | Responsibility |
+| --- | --- |
+| `backup.py` | Backup orchestration: create the remote artifacts, download, verify and publish them. |
+| `restore.py` | Restore orchestration: select a set, upload it, verify it and extract it. |
+| `authorize_host.py` | Fetch and record a host key. |
+| `common.py` | Shared low-level layer: configuration, SSH/SFTP, naming, checksums, manifests. |
+| `cli.py` | Shared command-line helpers (`--version`, the scope flags). |
+| `version.py` | The single source of truth for the version number. |
+| `safe_fs.py` | Local-filesystem primitives: no-follow opens, inode identity, atomic identity-bound removal, held descriptors. |
+| `publish.py` | Publishing verified downloads under their final names, without replacing anything. |
+| `publish_lock.py` | The cooperative publication lock and its stale-owner recovery. |
+| `archive_validation.py` | Archive member validation, the destination-tree audit and verified extraction. |
+| `selection.py` | Choosing which local backup set to restore. |
+
+Every module can be imported and tested on its own; the test suite mirrors
+this layout.
+
 ## Security notes
 
 - Prefer SSH key authentication over passwords.
@@ -350,6 +373,17 @@ host or credentials are available there.
   use. The option file is created owner-only (0600) on the server before any
   credentials are written to it.
 - The `.env` file contains secrets — keep it out of version control.
+
+## Changelog
+
+All notable changes are recorded in [CHANGELOG.md](CHANGELOG.md), which follows
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
+[Semantic Versioning](https://semver.org/spec/v2.0.0.html). The current version
+is reported by every program:
+
+```bash
+python backup.py --version
+```
 
 ## Licence
 

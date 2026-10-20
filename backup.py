@@ -3,7 +3,11 @@
 Creates gzip tarballs of the WordPress database and/or site root on the remote
 host, downloads them via SFTP, verifies SHA-256 checksums locally, removes the
 remote staging directory and prunes old local backups.
-"""
+This module is the orchestration layer: it creates the remote artifacts and
+drives the download, verification and publication. The mechanics live in
+publish.py (publishing verified downloads), publish_lock.py (the publication
+lock), safe_fs.py (local-filesystem primitives) and common.py (the shared
+low-level layer)."""
 
 from __future__ import annotations
 
