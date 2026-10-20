@@ -67,14 +67,13 @@ def _get_int(name: str, default: int, minimum: int = 1) -> int:
     return value
 
 
-
 def _find_env_file() -> Path:
     cwd_env = Path.cwd() / ".env"
     if cwd_env.is_file():
 
-
         return cwd_env
     return Path(__file__).resolve().parent / ".env"
+
 
 def load_config(env_file: str | os.PathLike | None = None) -> Config:
     """
