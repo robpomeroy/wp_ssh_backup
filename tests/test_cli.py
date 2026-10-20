@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import os
 import re
+import sys
 from pathlib import Path
 
 import pytest
@@ -13,6 +15,7 @@ import restore
 from cli import (
     add_scope_arguments,
     add_version_argument,
+    program_name,
     resolve_scope,
     version_string,
 )
@@ -78,6 +81,28 @@ def test_entry_point_accepts_short_version_flag(
 def test_version_string_uses_the_prog_name() -> None:
     """version_string() composes the program name and the version."""
     assert version_string("backup.py") == f"backup.py {__version__}"
+
+
+def test_program_name_is_the_script_name_when_not_frozen() -> None:
+    """Run from a checkout, the program is named after its script."""
+    assert program_name("backup.py") == "backup.py"
+
+
+def test_program_name_is_the_executable_name_when_frozen(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Run as a bundled executable, the program is named after the binary.
+
+    The user downloaded "wp-ssh-backup"; telling them they are running
+    "backup.py" would be confusing, and the script name does not even
+    exist in a one-file bundle.
+    """
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    # The path is built from parts so the test reads the same on
+    # Windows, Linux and macOS.
+    executable = os.path.join("tools", "wp-ssh-backup.exe")
+    monkeypatch.setattr(sys, "executable", executable)
+    assert program_name("backup.py") == "wp-ssh-backup.exe"
 
 
 def test_add_version_argument_uses_the_parser_prog() -> None:
@@ -207,6 +232,7 @@ def test_common_facade_reexports_every_public_name() -> None:
     CLI_ONLY = {
         "add_scope_arguments",
         "add_version_argument",
+        "program_name",
         "resolve_scope",
         "version_string",
     }

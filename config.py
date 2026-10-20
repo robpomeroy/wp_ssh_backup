@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import posixpath
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -68,10 +69,37 @@ def _get_int(name: str, default: int, minimum: int = 1) -> int:
 
 
 def _find_env_file() -> Path:
+    """Locate the .env file to read.
+
+    The current directory is searched first, so running the tool from
+    the directory holding the configuration always works.
+
+    A frozen build (PyInstaller) is different: the bundle unpacks into
+    a temporary directory, so the module's own __file__ points into
+    that temporary directory and never at the user's files. The
+    directory holding the executable is searched instead, so a copy of
+    the program placed next to its .env finds it.
+
+    Args:
+        None.
+
+    Returns:
+        The path of the .env file to read. The path is not guaranteed
+        to exist; the caller reports the error.
+    """
     cwd_env = Path.cwd() / ".env"
     if cwd_env.is_file():
-
         return cwd_env
+    if getattr(sys, "frozen", False):
+        # sys.frozen is set by PyInstaller. sys.executable is the
+        # executable the user ran, so its directory is where the
+        # program was placed.
+        exe_env = Path(sys.executable).resolve().parent / ".env"
+        if exe_env.is_file():
+            return exe_env
+        # Nothing found: report the path next to the executable, since
+        # that is where the user would put it.
+        return exe_env
     return Path(__file__).resolve().parent / ".env"
 
 
@@ -84,8 +112,9 @@ def load_config(env_file: str | os.PathLike | None = None) -> Config:
 
     Args:
         env_file: Path to the .env file. If None, the function will attempt to
-            locate a .env file in the current working directory or the script's
-            directory.
+            locate an .env file in the current working directory, then next to
+            the program (the script's directory when run from source, the
+            executable's directory when run as a frozen binary).
 
     Returns:
         A Config object populated with the validated configuration.

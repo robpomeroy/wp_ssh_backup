@@ -914,3 +914,91 @@ def test_timed_does_not_claim_success_on_base_exception(
             raise KeyboardInterrupt
 
     assert capsys.readouterr().out == ""
+
+
+def test_find_env_file_prefers_the_current_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A .env in the working directory wins over one beside the program."""
+    import config
+
+    work = tmp_path / "work"
+    work.mkdir()
+    (work / ".env").write_text("SSH_HOST=from-cwd\n")
+    beside = tmp_path / "program"
+    beside.mkdir()
+    (beside / ".env").write_text("SSH_HOST=beside\n")
+
+    monkeypatch.chdir(work)
+    monkeypatch.setattr(config.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(config.sys, "executable", str(beside / "app.exe"))
+
+    assert config._find_env_file() == work / ".env"
+
+
+def test_find_env_file_uses_the_executable_directory_when_frozen(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A frozen binary finds the .env next to the executable.
+
+    A PyInstaller onefile bundle unpacks into a temporary directory,
+    so the module's own __file__ points into that temporary directory
+    and never at the user's files. The executable's own directory is
+    the only place a .env can be found from a frozen binary.
+    """
+    import config
+
+    work = tmp_path / "work"
+    work.mkdir()
+    beside = tmp_path / "program"
+    beside.mkdir()
+    (beside / ".env").write_text("SSH_HOST=beside\n")
+
+    monkeypatch.chdir(work)
+    monkeypatch.setattr(config.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(config.sys, "executable", str(beside / "app.exe"))
+
+    assert config._find_env_file() == beside / ".env"
+
+
+def test_find_env_file_reports_the_executable_directory_when_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With no .env anywhere, the frozen path names the executable's dir.
+
+    The error the user sees must point at the directory where they
+    would put the file, not at the temporary directory the bundle
+    unpacked into.
+    """
+    import config
+
+    work = tmp_path / "work"
+    work.mkdir()
+    beside = tmp_path / "program"
+    beside.mkdir()
+
+    monkeypatch.chdir(work)
+    monkeypatch.setattr(config.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(config.sys, "executable", str(beside / "app.exe"))
+
+    assert config._find_env_file() == beside / ".env"
+
+
+def test_find_env_file_uses_the_module_directory_when_not_frozen(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Run from source, the .env beside the script is found.
+
+    A script is not frozen, so the module's own directory is the right
+    place to look -- this is the behaviour the tool had before it
+    gained a frozen build.
+    """
+    import config
+
+    work = tmp_path / "work"
+    work.mkdir()
+    monkeypatch.chdir(work)
+    monkeypatch.delattr(config.sys, "frozen", raising=False)
+
+    expected = Path(config.__file__).resolve().parent / ".env"
+    assert config._find_env_file() == expected
