@@ -7,7 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `common.py` is no longer a single 1651-line module. It was split into
+  focused modules, each with one responsibility: `errors.py` (the
+  exception types), `config.py` (configuration), `remote.py` (the SSH
+  and SFTP transport), `remote_ops.py` (remote operations both flows
+  share), `wp_config.py` (parsing `wp-config.php`), `db_config.py`
+  (the MySQL option file), `naming.py` (timestamps, identifiers and
+  file names), `checksums.py` (checksums and manifests), `retention.py`
+  (local backup sets and retention), `shell.py` (shell quoting) and
+  `host_keys.py` (fingerprints and `known_hosts` entries). `common.py`
+  remains as a re-export facade, so `from common import ...` keeps
+  working; new code should import from the module that owns the name.
+- The backup and restore flows no longer name the set of failures that
+  mean "the run could not complete" twice. The set now lives in
+  `errors.py` as `REMOTE_FAILURES`, so the two flows cannot drift into
+  cleaning up different failures.
+- The stale-lock reclaim and the quarantined-entry restore are split
+  into named helpers, so each has one job. The control flow and the
+  warnings are unchanged.
+
+### Added
+
+- `ruff` and `pyflakes` are development dependencies, and CI runs both
+  as a lint step. `ruff` is configured in `pyproject.toml` with the
+  `E4`, `E7`, `E9`, `F`, `UP` and `B` rule sets.
+
 ### Fixed
+
+- The `@contextmanager` helpers are annotated as `Generator` rather
+  than `Iterator`. Annotating a context manager's return type as
+  `Iterator` is deprecated; the decorator itself is not.
 
 - A failed operation is no longer reported as having completed. The timing
   helper printed its completion message from a `finally` block, so an
