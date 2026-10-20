@@ -20,6 +20,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `host_keys.py` (fingerprints and `known_hosts` entries). `common.py`
   remains as a re-export facade, so `from common import ...` keeps
   working; new code should import from the module that owns the name.
+- The `common.py` facade re-exports every public name the old module
+  had, including `strip_php_comments` and the ten public constants
+  (`REQUIRED_KEYS`, `TS_FORMAT`, `TS_PATTERN`, `RUN_SUFFIX_RE`,
+  `BACKUP_ID_PATTERN`, `BACKUP_FILE_RE`, `STAGING_PREFIX`,
+  `SHA256SUM_LINE_RE`, `WP_DB_KEYS` and `WP_DEFINE_RE`). The old
+  module had no `__all__`, so every module-level name was importable;
+  the facade now carries the same public surface, and a test pins it.
 - The backup and restore flows no longer name the set of failures that
   mean "the run could not complete" twice. The set now lives in
   `errors.py` as `REMOTE_FAILURES`, so the two flows cannot drift into
