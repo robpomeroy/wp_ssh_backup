@@ -29,5 +29,10 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements-dev.txt
 
+      - name: Lint
+        run: |
+          ruff check .
+          pyflakes *.py tests/*.py
+
       - name: Run offline tests
         run: pytest -m "not live"

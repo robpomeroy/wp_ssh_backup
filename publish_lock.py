@@ -26,7 +26,7 @@ import os
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Generator
+from collections.abc import Generator
 
 import safe_fs
 from common import WPSSHBackupError
