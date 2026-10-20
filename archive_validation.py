@@ -380,7 +380,8 @@ def _resolve_link_chain(
                 f"{link!r}"
             )
         seen.add(resolved)
-        return _resolve_link_chain(archive, links, resolved, links[resolved], seen)
+        return _resolve_link_chain(archive, links, resolved, links[resolved],
+                                   seen)
     return resolved
 
 
