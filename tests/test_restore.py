@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 
 import restore
+import safe_fs
 from common import (
     ChecksumError,
     Config,
@@ -1091,7 +1092,7 @@ def test_run_restore_rejects_symlinked_archive_leaf(tmp_path: Path) -> None:
         raise OSError(errno.ELOOP, "Too many levels of symbolic links")
 
     monkeypatch_open = pytest.MonkeyPatch()
-    monkeypatch_open.setattr(restore.os, "open", open_rejects_symlink)
+    monkeypatch_open.setattr(safe_fs.os, "open", open_rejects_symlink)
     try:
         with pytest.raises(WPSSHBackupError, match="through symlink"):
             restore.run_restore(
@@ -1142,7 +1143,7 @@ def test_run_restore_uploads_bytes_from_held_descriptor(
     archive_name = files_archive_name(TS)
     original_bytes = set_files[archive_name].read_bytes()
 
-    real_open = restore.os.open
+    real_open = safe_fs.os.open
     opened: list[str] = []
 
     def counting_open(path: object, flags: int) -> int:
@@ -1150,7 +1151,7 @@ def test_run_restore_uploads_bytes_from_held_descriptor(
         opened.append(str(path))
         return fd
 
-    monkeypatch.setattr(restore.os, "open", counting_open)
+    monkeypatch.setattr(safe_fs.os, "open", counting_open)
 
     uploaded: dict[str, bytes] = {}
     original_putfo = client.sftp.putfo

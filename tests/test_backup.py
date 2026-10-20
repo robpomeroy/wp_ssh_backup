@@ -12,6 +12,9 @@ from typing import BinaryIO
 import pytest
 
 import backup
+import publish
+import publish_lock
+import safe_fs
 from common import (
     ChecksumError,
     Config,
@@ -650,7 +653,7 @@ def test_publish_downloads_publishes_verified_files(
     archive = files_archive_name(TS)
     temp_paths = make_temp_set(backup_dir, archive)
 
-    local_paths = backup.publish_downloads(
+    local_paths = publish.publish_downloads(
         temp_paths,
         [archive],
         backup_dir,
@@ -702,7 +705,7 @@ def test_publish_downloads_success_cleanup_leaves_replaced_temp(
     replacement.write_bytes(b"other")
     os.replace(replacement, temp_paths[archive])
 
-    local_paths = backup.publish_downloads(
+    local_paths = publish.publish_downloads(
         temp_paths,
         [archive],
         backup_dir,
@@ -747,7 +750,7 @@ def test_publish_downloads_falls_back_when_linkat_unsupported(
     temp_paths = make_temp_set(backup_dir, archive)
     digests = digests_for(temp_paths)
 
-    original_link = backup._link_inode_no_replace
+    original_link = publish.link_inode_no_replace
 
     def unsupported_link(link_fd: int, final_path: Path) -> None:
         raise OSError(
@@ -757,9 +760,9 @@ def test_publish_downloads_falls_back_when_linkat_unsupported(
         )
 
     with unittest.mock.patch.object(
-        backup, "_link_inode_no_replace", unsupported_link
+        publish, "link_inode_no_replace", unsupported_link
     ):
-        local_paths = backup.publish_downloads(
+        local_paths = publish.publish_downloads(
             temp_paths,
             [archive],
             backup_dir,
@@ -776,7 +779,7 @@ def test_publish_downloads_falls_back_when_linkat_unsupported(
     assert not temp_paths[checksum_name(archive)].exists()
     # The fallback must not have been reached through the Windows
     # os.link path: _link_inode_no_replace was the only thing patched.
-    assert original_link is backup._link_inode_no_replace
+    assert original_link is publish.link_inode_no_replace
 
 
 def test_publish_downloads_fallback_closes_replacement_handles(
@@ -810,7 +813,7 @@ the old code they were left to the refcount.
             errno.EINVAL, os.strerror(errno.EINVAL), str(final_path)
         )
 
-    original_verify = backup._verify_published_inode
+    original_verify = publish.verify_published_inode
 
     def capturing_verify(
         handle: BinaryIO, final_path: Path, expected_sha256: str
@@ -819,11 +822,11 @@ the old code they were left to the refcount.
         original_verify(handle, final_path, expected_sha256)
 
     with unittest.mock.patch.object(
-        backup, "_link_inode_no_replace", unsupported_link
+        publish, "link_inode_no_replace", unsupported_link
     ), unittest.mock.patch.object(
-        backup, "_verify_published_inode", capturing_verify
+        publish, "verify_published_inode", capturing_verify
     ):
-        backup.publish_downloads(
+        publish.publish_downloads(
             temp_paths,
             [archive],
             backup_dir,
@@ -868,7 +871,7 @@ def test_publish_downloads_recheck_rejects_replaced_final(
     temp_paths = make_temp_set(backup_dir, archive)
     digests = digests_for(temp_paths)
 
-    original_verify = backup._verify_published_inode
+    original_verify = publish.verify_published_inode
 
     def replacing_verify(
         handle: BinaryIO, final_path: Path, expected_sha256: str
@@ -881,12 +884,12 @@ def test_publish_downloads_recheck_rejects_replaced_final(
             (backup_dir / archive).write_bytes(b"attacker-bytes")
 
     with unittest.mock.patch.object(
-        backup, "_verify_published_inode", replacing_verify
+        publish, "verify_published_inode", replacing_verify
     ):
         with pytest.raises(
             WPSSHBackupError, match="Refusing to report success"
         ):
-            backup.publish_downloads(
+            publish.publish_downloads(
                 temp_paths,
                 [archive],
                 backup_dir,
@@ -902,7 +905,7 @@ def test_publish_downloads_recheck_rejects_replaced_final(
     assert temp_paths[archive].is_file()
     assert temp_paths[checksum_name(archive)].is_file()
     # The publication lock was released even on failure.
-    assert not (backup_dir / backup._PUBLISH_LOCK_NAME).exists()
+    assert not (backup_dir / publish_lock.PUBLISH_LOCK_NAME).exists()
 
 
 def test_publish_downloads_release_lock_on_success(
@@ -912,7 +915,7 @@ def test_publish_downloads_release_lock_on_success(
     archive = files_archive_name(TS)
     temp_paths = make_temp_set(backup_dir, archive)
 
-    backup.publish_downloads(
+    publish.publish_downloads(
         temp_paths,
         [archive],
         backup_dir,
@@ -920,7 +923,7 @@ def test_publish_downloads_release_lock_on_success(
         make_downloaded_fds(temp_paths),
     )
 
-    assert not (backup_dir / backup._PUBLISH_LOCK_NAME).exists()
+    assert not (backup_dir / publish_lock.PUBLISH_LOCK_NAME).exists()
 
 
 def test_publish_downloads_lock_blocks_concurrent_publish(
@@ -934,7 +937,7 @@ def test_publish_downloads_lock_blocks_concurrent_publish(
 
     archive = files_archive_name(TS)
     temp_paths = make_temp_set(backup_dir, archive)
-    lock = backup_dir / backup._PUBLISH_LOCK_NAME
+    lock = backup_dir / publish_lock.PUBLISH_LOCK_NAME
     # A lock written by a LIVE process (our own PID) must not be stolen.
     lock.write_text(f"{_os.getpid()}\n")
     # Avoid the retry sleeps: the lock is held the whole time.
@@ -945,7 +948,7 @@ def test_publish_downloads_lock_blocks_concurrent_publish(
     with pytest.raises(
         WPSSHBackupError, match=re.escape("Another backup appears")
     ):
-        backup.publish_downloads(
+        publish.publish_downloads(
             temp_paths,
             [archive],
             backup_dir,
@@ -971,11 +974,11 @@ def test_publish_downloads_reclaims_stale_lock(
     """
     archive = files_archive_name(TS)
     temp_paths = make_temp_set(backup_dir, archive)
-    lock = backup_dir / backup._PUBLISH_LOCK_NAME
+    lock = backup_dir / publish_lock.PUBLISH_LOCK_NAME
     # A PID far beyond any valid process range: verifiably dead.
     lock.write_text(f"{2**30}\n")
 
-    backup.publish_downloads(
+    publish.publish_downloads(
         temp_paths,
         [archive],
         backup_dir,
@@ -1004,7 +1007,7 @@ def test_try_create_publish_lock_fallback_never_replaces(
     fallback now uses O_CREAT|O_EXCL on the lock name itself, a true
     no-replace primitive.
     """
-    lock = tmp_path / backup._PUBLISH_LOCK_NAME
+    lock = tmp_path / publish_lock.PUBLISH_LOCK_NAME
 
     def no_link(src, dst):
         raise OSError(errno.EPERM, "hard links not supported")
@@ -1015,16 +1018,16 @@ def test_try_create_publish_lock_fallback_never_replaces(
             "the lock fallback must use O_CREAT|O_EXCL"
         )
 
-    monkeypatch.setattr(backup.os, "link", no_link)
-    monkeypatch.setattr(backup.os, "rename", forbidden_rename)
+    monkeypatch.setattr(publish_lock.os, "link", no_link)
+    monkeypatch.setattr(publish_lock.os, "rename", forbidden_rename)
 
     # First acquisition succeeds and records the owner.
-    identity = backup._try_create_publish_lock(lock)
+    identity = publish_lock.try_create_publish_lock(lock)
     assert identity is not None
     assert lock.read_text().strip() == str(os.getpid())
 
     # A second acquisition must fail and must NOT replace the live lock.
-    assert backup._try_create_publish_lock(lock) is None
+    assert publish_lock.try_create_publish_lock(lock) is None
     assert lock.read_text().strip() == str(os.getpid())
     # The recorded identity still describes the lock on disk.
     st = os.lstat(lock)
@@ -1049,10 +1052,10 @@ def test_publish_downloads_never_reclaims_unparseable_lock(
 
     archive = files_archive_name(TS)
     temp_paths = make_temp_set(backup_dir, archive)
-    lock = backup_dir / backup._PUBLISH_LOCK_NAME
+    lock = backup_dir / publish_lock.PUBLISH_LOCK_NAME
     lock.write_bytes(b"")
     # Even a very old unparseable lock must not be reclaimed.
-    old = backup.time.time() - 3600
+    old = publish_lock.time.time() - 3600
     import os as _os
 
     _os.utime(lock, (old, old))
@@ -1063,7 +1066,7 @@ def test_publish_downloads_never_reclaims_unparseable_lock(
     with pytest.raises(
         WPSSHBackupError, match=re.escape("Another backup appears")
     ):
-        backup.publish_downloads(
+        publish.publish_downloads(
             temp_paths,
             [archive],
             backup_dir,
@@ -1090,7 +1093,7 @@ def test_steal_stale_lock_does_not_steal_new_lock(
     before the rename, and the renamed entry is unlinked only if it is
     still that same inode; a different (newer) lock is restored instead.
     """
-    lock = tmp_path / backup._PUBLISH_LOCK_NAME
+    lock = tmp_path / publish_lock.PUBLISH_LOCK_NAME
     # A stale lock owned by a dead PID.
     lock.write_text(f"{2**30}\n")
     original_rename = os.rename
@@ -1111,12 +1114,12 @@ def test_steal_stale_lock_does_not_steal_new_lock(
             os.replace(fresh, lock)
         return original_rename(src, dst)
 
-    monkeypatch.setattr(backup.os, "rename", rename_new_lock)
+    monkeypatch.setattr(publish_lock.os, "rename", rename_new_lock)
 
     # The steal must refuse: the renamed entry is a NEW live lock (a
     # different inode than the stale one that was read), so it is
     # restored and the name is NOT freed.
-    assert backup._steal_stale_lock(lock) is False
+    assert publish_lock.steal_stale_lock(lock) is False
     # The new lock is preserved (restored to the name).
     assert lock.exists()
     assert lock.read_text().strip() == str(os.getpid())
@@ -1136,7 +1139,7 @@ def test_steal_stale_lock_restore_does_not_clobber_newer_lock(
     is already taken, the quarantined entry is left in place and the
     newer lock is untouched.
     """
-    lock = tmp_path / backup._PUBLISH_LOCK_NAME
+    lock = tmp_path / publish_lock.PUBLISH_LOCK_NAME
     lock.write_text(f"{2**30}\n")  # stale lock, dead PID
     original_rename = os.rename
     # Distinct contents so the assertion can tell the two contenders
@@ -1161,7 +1164,7 @@ def test_steal_stale_lock_restore_does_not_clobber_newer_lock(
             return result
         return original_rename(src, dst)
 
-    monkeypatch.setattr(backup.os, "rename", rename_moves_new_lock)
+    monkeypatch.setattr(publish_lock.os, "rename", rename_moves_new_lock)
 
     # Restoring the quarantined lock must fail loudly: the name is taken
     # by a newer lock whose owner may still be publishing, so a normal
@@ -1169,7 +1172,7 @@ def test_steal_stale_lock_restore_does_not_clobber_newer_lock(
     with pytest.raises(
         WPSSHBackupError, match="Could not restore the publish lock"
     ):
-        backup._steal_stale_lock(lock)
+        publish_lock.steal_stale_lock(lock)
     # The contender's lock is untouched and the quarantined entry is
     # left in place for the administrator.
     assert lock.exists()
@@ -1199,7 +1202,7 @@ def test_publish_by_rename_publishes_verified_inode(
     # test does not close it here: on Windows the descriptor number is
     # reused by the re-opened final file, so closing it would close the
     # returned handle's descriptor.
-    new_handle = backup._publish_by_rename(handle, temp, final)
+    new_handle = publish.publish_by_rename(handle, temp, final)
     try:
         assert final.read_bytes() == b"payload"
         assert new_handle.read() == b"payload"
@@ -1238,7 +1241,7 @@ def test_publish_by_rename_rejects_swapped_regular_source(
     with pytest.raises(
         WPSSHBackupError, match="was replaced after verification"
     ):
-        backup._publish_by_rename(handle, temp, final)
+        publish.publish_by_rename(handle, temp, final)
     # The replacement inode was linked into the final name, but it is NOT
     # this run's verified inode, so the rollback leaves it in place
     # rather than deleting another process's file. The run fails instead
@@ -1285,12 +1288,12 @@ def test_publish_by_rename_rejects_swapped_source_before_rename(
             os.replace(replacement, temp)
         return original_rename(src, dst)
 
-    monkeypatch.setattr(backup.os, "rename", swap_then_rename)
+    monkeypatch.setattr(publish.os, "rename", swap_then_rename)
 
     with pytest.raises(
         WPSSHBackupError, match="was replaced after verification"
     ):
-        backup._publish_by_rename(handle, temp, final)
+        publish.publish_by_rename(handle, temp, final)
     # The replacement inode was moved into the final name, but it is NOT
     # this run's verified inode, so the rollback leaves it in place
     # rather than deleting another process's file. The run fails instead
@@ -1317,7 +1320,7 @@ def test_publish_by_rename_refuses_existing_destination(
     fd = os.open(temp, os.O_RDWR)
     handle = os.fdopen(fd, "rb", closefd=False)
     with pytest.raises(FileExistsError):
-        backup._publish_by_rename(handle, temp, final)
+        publish.publish_by_rename(handle, temp, final)
     # The pre-existing destination is untouched and the temp is intact.
     assert final.read_bytes() == b"existing"
     assert temp.read_bytes() == b"payload"
@@ -1338,12 +1341,12 @@ def test_publish_by_rename_reopen_failure_removes_owned_final(
     fd = os.open(temp, os.O_RDWR)
     handle = os.fdopen(fd, "rb", closefd=False)
 
-    def boom(path: Path) -> int:
+    def boom(path: Path, **kwargs: object) -> int:
         raise WPSSHBackupError("cannot reopen")
 
-    monkeypatch.setattr(backup, "_open_nofollow_regular", boom)
+    monkeypatch.setattr(safe_fs, "open_nofollow_regular", boom)
     with pytest.raises(WPSSHBackupError, match="cannot reopen"):
-        backup._publish_by_rename(handle, temp, final)
+        publish.publish_by_rename(handle, temp, final)
     assert not final.exists()
 
 
@@ -1363,7 +1366,7 @@ def test_publish_by_rename_reopen_failure_leaves_replacement(
     fd = os.open(temp, os.O_RDWR)
     handle = os.fdopen(fd, "rb", closefd=False)
 
-    def boom(path: Path) -> int:
+    def boom(path: Path, **kwargs: object) -> int:
         # Simulate a writer replacing the published entry with a
         # different inode before the re-open fails.
         replacement = tmp_path / "replacement"
@@ -1371,9 +1374,9 @@ def test_publish_by_rename_reopen_failure_leaves_replacement(
         os.replace(replacement, final)
         raise WPSSHBackupError("cannot reopen")
 
-    monkeypatch.setattr(backup, "_open_nofollow_regular", boom)
+    monkeypatch.setattr(safe_fs, "open_nofollow_regular", boom)
     with pytest.raises(WPSSHBackupError, match="cannot reopen"):
-        backup._publish_by_rename(handle, temp, final)
+        publish.publish_by_rename(handle, temp, final)
     # The replacement is left in place, not deleted.
     assert final.read_bytes() == b"other"
 
@@ -1388,7 +1391,7 @@ def test_publish_downloads_refuses_overwrite_of_existing(
     temp_paths = make_temp_set(backup_dir, archive)
 
     with pytest.raises(FileExistsError, match="Refusing to overwrite"):
-        backup.publish_downloads(
+        publish.publish_downloads(
             temp_paths,
             [archive],
             backup_dir,
@@ -1429,7 +1432,7 @@ def test_publish_downloads_refuses_existing_symlink(
     temp_paths = make_temp_set(backup_dir, archive)
 
     with pytest.raises(FileExistsError, match="Refusing to overwrite"):
-        backup.publish_downloads(
+        publish.publish_downloads(
             temp_paths,
             [archive],
             backup_dir,
@@ -1469,7 +1472,7 @@ def test_publish_downloads_rolls_back_partial_publication(
 
     import unittest.mock
 
-    original_publish = backup._publish_no_replace
+    original_publish = publish.publish_no_replace
 
     calls = {"n": 0}
 
@@ -1485,10 +1488,10 @@ def test_publish_downloads_rolls_back_partial_publication(
         return original_publish(handle, temp_path, final_path)
 
     with unittest.mock.patch.object(
-        backup, "_publish_no_replace", exploding_publish
+        publish, "publish_no_replace", exploding_publish
     ):
         with pytest.raises(OSError, match="simulated mid-publication"):
-            backup.publish_downloads(
+            publish.publish_downloads(
                 temp_paths,
                 [archive1, archive2],
                 backup_dir,
@@ -1531,7 +1534,7 @@ def test_publish_downloads_no_replace_survives_post_check_race(
     archive2 = files_archive_name(bid2)
     temp_paths = make_temp_set(backup_dir, archive1, archive2)
 
-    original_publish = backup._publish_no_replace
+    original_publish = publish.publish_no_replace
 
     def racing_publish(
         handle: BinaryIO, temp_path: Path, final_path: Path
@@ -1543,10 +1546,10 @@ def test_publish_downloads_no_replace_survives_post_check_race(
         return original_publish(handle, temp_path, final_path)
 
     with unittest.mock.patch.object(
-        backup, "_publish_no_replace", racing_publish
+        publish, "publish_no_replace", racing_publish
     ):
         with pytest.raises(FileExistsError, match="Refusing to overwrite"):
-            backup.publish_downloads(
+            publish.publish_downloads(
                 temp_paths,
                 [archive1, archive2],
                 backup_dir,
@@ -1596,7 +1599,7 @@ def test_publish_downloads_ignores_symlinked_temp(
     temp_paths[archive].symlink_to(victim)
 
     try:
-        local_paths = backup.publish_downloads(
+        local_paths = publish.publish_downloads(
             temp_paths,
             [archive],
             backup_dir,
@@ -1653,7 +1656,7 @@ def test_publish_downloads_rejects_temp_replaced_before_publication(
         pass
 
     try:
-        local_paths = backup.publish_downloads(
+        local_paths = publish.publish_downloads(
             temp_paths,
             [archive],
             backup_dir,
@@ -1720,7 +1723,7 @@ def test_publish_downloads_publishes_held_inode_not_pathname(
     digests = digests_for(temp_paths)
     downloaded_fds = make_downloaded_fds(temp_paths)
 
-    original_publish = backup._publish_no_replace
+    original_publish = publish.publish_no_replace
 
     def replacing_publish(
         handle: BinaryIO, temp_path: Path, final_path: Path
@@ -1735,7 +1738,7 @@ def test_publish_downloads_publishes_held_inode_not_pathname(
         return original_publish(handle, temp_path, final_path)
 
     with unittest.mock.patch.object(
-        backup, "_publish_no_replace", replacing_publish
+        publish, "publish_no_replace", replacing_publish
     ):
         # Publication either succeeds with the verified bytes (ext4 and
         # other filesystems that can link the still-named inode) or
@@ -1743,7 +1746,7 @@ def test_publish_downloads_publishes_held_inode_not_pathname(
         # the run is rolled back). Regardless of which happens, the
         # attacker's bytes never appear at the final name.
         try:
-            backups = backup.publish_downloads(
+            backups = publish.publish_downloads(
                 temp_paths,
                 [archive],
                 backup_dir,
@@ -1781,7 +1784,7 @@ def test_publish_downloads_rejects_final_replaced_during_verification(
     temp_paths = make_temp_set(backup_dir, archive)
     digests = digests_for(temp_paths)
 
-    original_assert = backup._assert_published_inode
+    original_assert = publish.assert_published_inode
 
     def replacing_after_first_check(handle: BinaryIO, final_path: Path):
         original_assert(handle, final_path)
@@ -1793,12 +1796,12 @@ def test_publish_downloads_rejects_final_replaced_during_verification(
             final_path.write_bytes(b"attacker-bytes")
 
     with unittest.mock.patch.object(
-        backup, "_assert_published_inode", replacing_after_first_check
+        publish, "assert_published_inode", replacing_after_first_check
     ):
         with pytest.raises(
             WPSSHBackupError, match="was replaced after verification"
         ):
-            backup.publish_downloads(
+            publish.publish_downloads(
                 temp_paths,
                 [archive],
                 backup_dir,
@@ -1833,7 +1836,7 @@ def test_publish_downloads_rejects_mutated_temp(
     temp_paths = make_temp_set(backup_dir, archive)
     digests = digests_for(temp_paths)
 
-    original_publish = backup._publish_no_replace
+    original_publish = publish.publish_no_replace
 
     def mutating_publish(
         handle: BinaryIO, temp_path: Path, final_path: Path
@@ -1846,10 +1849,10 @@ def test_publish_downloads_rejects_mutated_temp(
         return original_publish(handle, temp_path, final_path)
 
     with unittest.mock.patch.object(
-        backup, "_publish_no_replace", mutating_publish
+        publish, "publish_no_replace", mutating_publish
     ):
         with pytest.raises(ChecksumError, match="changed after verification"):
-            backup.publish_downloads(
+            publish.publish_downloads(
                 temp_paths,
                 [archive],
                 backup_dir,
@@ -2085,7 +2088,7 @@ def test_unlink_if_same_inode_atomic_restore_preserves_new_file(
             os.replace(newcomer, path)
 
     monkeypatch.setattr(os, "rename", renaming)
-    backup._unlink_if_same_inode_atomic(path, identity)
+    safe_fs.unlink_if_same_inode_atomic(path, identity)
 
     # The newcomer created after the claim is preserved, not clobbered
     # by the restore of the quarantined replacement.

@@ -8,22 +8,20 @@ database dump.
 from __future__ import annotations
 
 import argparse
-import errno
 import hashlib
-import os
 import posixpath
 import shlex
-import stat
 import sys
 import tarfile
 import time
-from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import BinaryIO, Iterator
+from typing import BinaryIO
 
 import paramiko
 
+from cli import add_scope_arguments, add_version_argument, resolve_scope
+import safe_fs
 from common import (
     ChecksumError,
     Config,
@@ -293,122 +291,6 @@ def upload_artifacts(
             handles[set_files[checksum_name(name)]],
             posixpath.join(staging, checksum_name(name)),
         )
-
-
-def _open_nofollow_regular(path: Path) -> int:
-    """
-    Open a local file through a file descriptor that cannot follow a
-    symlink at the final path component.
-
-    On POSIX, O_NOFOLLOW makes the open fail with ELOOP when the leaf is
-    a symlink. Windows has no O_NOFOLLOW, so the descriptor is opened
-    and then compared against lstat(): a symlink leaf resolves to a
-    different device/inode pair than the link itself, and the mismatch
-    is rejected the same way. The descriptor is also required to be a
-    regular file, so a directory (openable on some platforms) or any
-    other non-regular object is rejected.
-
-    Raises:
-        MissingArtifactError: If the path does not exist.
-        WPSSHBackupError: If the leaf is a symlink or not a regular
-            file.
-    """
-    flags = (
-        os.O_RDONLY
-        | getattr(os, "O_BINARY", 0)
-        # A no-op for regular files, but stops a planted FIFO from
-        # blocking the open forever on POSIX; the S_ISREG check below
-        # rejects it.
-        | getattr(os, "O_NONBLOCK", 0)
-    )
-    nofollow = getattr(os, "O_NOFOLLOW", 0)
-    try:
-        try:
-            return os.open(path, flags | nofollow)
-        except OSError as exc:
-            # ELOOP from open() always means a symlink problem: either
-            # O_NOFOLLOW rejected a symlinked leaf, or the path itself
-            # contains a symlink loop. Translate it either way.
-            if exc.errno in (errno.ELOOP, errno.EMLINK):
-                raise WPSSHBackupError(
-                    f"Refusing to upload through symlink: {path}"
-                ) from exc
-            if exc.errno == errno.ENOENT:
-                raise MissingArtifactError(
-                    f"Local file missing: {path}"
-                ) from exc
-            raise
-    except OSError as exc:
-        if exc.errno == errno.ENOENT:
-            raise MissingArtifactError(
-                f"Local file missing: {path}"
-            ) from exc
-        raise WPSSHBackupError(
-            f"Refusing to upload {path.name}: cannot open local file: {exc}"
-        ) from exc
-
-
-def _assert_nofollow_regular(fd: int, path: Path) -> None:
-    """Reject a descriptor whose leaf was (or is) a symlink or non-file.
-
-    On platforms without O_NOFOLLOW the open itself cannot detect a
-    symlinked leaf, so the descriptor's identity is compared against the
-    leaf's lstat(): a symlink resolves to the target's device/inode,
-    which differs from the link's own.
-    """
-    fd_stat = os.fstat(fd)
-    if not stat.S_ISREG(fd_stat.st_mode):
-        os.close(fd)
-        raise WPSSHBackupError(
-            f"Refusing to upload {path.name}: not a regular file"
-        )
-    if not getattr(os, "O_NOFOLLOW", 0):
-        leaf_stat = os.lstat(path)
-        if (leaf_stat.st_dev, leaf_stat.st_ino) != (
-            fd_stat.st_dev,
-            fd_stat.st_ino,
-        ):
-            os.close(fd)
-            raise WPSSHBackupError(
-                f"Refusing to upload through symlink: {path}"
-            )
-
-
-@contextmanager
-def _held_local_files(
-    paths: list[Path],
-) -> Iterator[dict[Path, BinaryIO]]:
-    """
-    Open each path once through a no-follow descriptor and hold it open
-    for the whole context.
-
-    Everything a restore reads from these paths — member-type
-    validation, digest computation and the uploaded bytes — must come
-    from the same opened file, so a writer that swaps the pathname for a
-    symlink (or replaces the file) after the initial check cannot make
-    the restore upload or validate different bytes than the ones it
-    already inspected.
-    """
-    handles: dict[Path, BinaryIO] = {}
-    try:
-        for path in paths:
-            fd = _open_nofollow_regular(path)
-            try:
-                _assert_nofollow_regular(fd, path)
-                handles[path] = os.fdopen(fd, "rb")
-            except BaseException:
-                # fdopen took ownership only on success; make sure a
-                # failed assertion does not leak the descriptor.
-                if path not in handles:
-                    try:
-                        os.close(fd)
-                    except OSError:
-                        pass
-                raise
-        yield handles
-    finally:
-        for handle in handles.values():
-            handle.close()
 
 
 def sftp_upload_checked(
@@ -1290,7 +1172,7 @@ def run_restore(
         # uploaded, so a writer swapping a pathname for a symlink (or a
         # different file) after the initial open cannot make the restore
         # upload or validate different bytes than the ones it inspected.
-        with _held_local_files(
+        with safe_fs.held_local_files(
             [set_files[name] for name in archive_names]
             + [set_files[checksum_name(name)] for name in archive_names]
         ) as handles:
@@ -1365,8 +1247,10 @@ def _now() -> float:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Restore a WordPress site from a WP SSH Backup set."
+        prog="restore.py",
+        description="Restore a WordPress site from a WP SSH Backup set.",
     )
+    add_version_argument(parser)
     parser.add_argument(
         "--timestamp",
         help="Backup set to restore: a full backup id (e.g. "
@@ -1374,27 +1258,14 @@ def main(argv: list[str] | None = None) -> int:
         "which must match exactly one set). Defaults to the latest "
         "matching set.",
     )
-    group = parser.add_mutually_exclusive_group()
-    group.add_argument(
-        "--files",
-        action="store_true",
-        help="Restore only the WordPress files.",
-    )
-    group.add_argument(
-        "--database",
-        action="store_true",
-        help="Restore only the WordPress database.",
-    )
-    group.add_argument(
-        "--all",
-        action="store_true",
-        help="Restore both files and database (the default).",
+    add_scope_arguments(
+        parser,
+        files_help="Restore only the WordPress files.",
+        database_help="Restore only the WordPress database.",
+        all_help="Restore both files and database (the default).",
     )
     args = parser.parse_args(argv)
-
-    neither = not (args.files or args.database)
-    include_files = args.files or args.all or neither
-    include_database = args.database or args.all or neither
+    include_files, include_database = resolve_scope(args)
 
     try:
         config = load_config()
