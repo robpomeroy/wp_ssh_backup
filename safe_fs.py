@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import errno
 import os
+import secrets
 import stat
 import sys
 from contextlib import contextmanager
@@ -42,9 +43,17 @@ __all__ = [
     "inode_identity",
     "open_nofollow_regular",
     "quarantine_name",
+    "remove_quarantine_reservation",
+    "reserve_quarantine_name",
     "unlink_if_same_inode",
     "unlink_if_same_inode_atomic",
 ]
+
+# How many candidate quarantine names to try before giving up. Each
+# attempt uses a fresh 128-bit random suffix, so a collision is
+# practically impossible; the loop exists only so a pathological case
+# (e.g. a filesystem that keeps failing the create) cannot spin.
+_QUARANTINE_RESERVE_ATTEMPTS = 8
 
 
 # ---------------------------------------------------------------------------
@@ -184,25 +193,102 @@ _quarantine_counter = 0
 
 
 def quarantine_name(path: Path) -> Path:
-    """A unique same-directory name only this process knows.
+    """An unguessable quarantine name in the same directory as path.
 
-    The name is generated in the same directory as path so the rename
-    below is atomic (same filesystem), and it is never guessable by a
-    concurrent writer: only the cleaner knows it, so a later
-    lstat/compare/unlink on the quarantine name cannot be raced by a
-    writer swapping the original pathname.
+    The name is generated in the same directory as path so a rename into
+    it is atomic (same filesystem). It carries a 128-bit random suffix:
+    the PID and a counter are both predictable, so a concurrent writer
+    could otherwise pre-create the name and make the quarantine
+    collide with a file of its own.
+
+    The name is only a CANDIDATE: it is not reserved, and the caller
+    must claim it with :func:`reserve_quarantine_name` (or create it
+    with O_CREAT|O_EXCL) before renaming anything into it.
 
     Args:
         path: The path the quarantine name is derived from.
 
     Returns:
-        The unique quarantine path.
+        A candidate quarantine path.
     """
     global _quarantine_counter
     _quarantine_counter += 1
+    suffix = secrets.token_hex(16)
     return path.with_name(
         f".{path.name}.quarantine-{os.getpid()}-{_quarantine_counter}"
+        f"-{suffix}"
     )
+
+
+def reserve_quarantine_name(path: Path) -> Path:
+    """Reserve an unguessable quarantine name and return it.
+
+    The name is created with O_CREAT | O_EXCL, so it is guaranteed not
+    to exist beforehand: a file already at that name is never replaced
+    and never unlinked. The reservation makes the name unpredictable to
+    a concurrent writer, which therefore cannot have pre-created it,
+    and it also means the name cannot be a leftover from an earlier run
+    that happened to reuse the same PID and counter.
+
+    The reserved entry is an empty regular file created with the
+    caller's own permissions. The caller moves the file it wants to
+    quarantine over it with os.replace() — which REPLACES the
+    destination, and that is safe precisely because the destination is
+    this process's own empty reservation. The caller must remove the
+    reservation if it does not move anything into it.
+
+    Args:
+        path: The path the quarantine name is derived from.
+
+    Returns:
+        The reserved quarantine path.
+
+    Raises:
+        WPSSHBackupError: If no quarantine name could be reserved.
+    """
+    for _ in range(_QUARANTINE_RESERVE_ATTEMPTS):
+        candidate = quarantine_name(path)
+        try:
+            fd = os.open(
+                candidate,
+                os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                0o600,
+            )
+        except FileExistsError:
+            # The name is taken (a leftover, or an improbable
+            # collision): try another one.
+            continue
+        except OSError as exc:
+            raise WPSSHBackupError(
+                f"Could not reserve a quarantine name for {path}: {exc}"
+            ) from exc
+        os.close(fd)
+        return candidate
+    raise WPSSHBackupError(
+        f"Could not reserve a quarantine name for {path}: "
+        f"{_QUARANTINE_RESERVE_ATTEMPTS} names were all taken"
+    )
+
+
+def remove_quarantine_reservation(quarantine: Path) -> None:
+    """Remove a quarantine reservation that was never used.
+
+    The reservation is this process's own empty file, created with
+    O_CREAT|O_EXCL. When the rename into it did not happen, the
+    reservation is still there and must be cleaned up, or the backup
+    directory accumulates empty hidden files.
+
+    Args:
+        quarantine: The reserved quarantine path.
+    """
+    try:
+        os.unlink(quarantine)
+    except OSError:
+        # The reservation could not be removed. It is an empty file
+        # under a hidden name, so it is harmless: it is never matched
+        # by the backup filename pattern and never mistaken for a
+        # backup set.
+        pass
 
 
 def unlink_if_same_inode_atomic(
@@ -239,6 +325,14 @@ def unlink_if_same_inode_atomic(
     POSIX and delete another process's file, so the quarantined entry
     is instead left in place whenever the pathname has reappeared.
 
+    The quarantine name is RESERVED before the source is renamed into
+    it (see :func:`reserve_quarantine_name`). A bare os.rename would
+    REPLACE whatever already sat at the quarantine name, deleting an
+    unrelated file — a leftover from an earlier run that happened to
+    reuse the same PID and counter, or an entry a concurrent writer
+    pre-created. Reserving the name first makes the rename safe: the
+    only entry it can replace is this process's own empty reservation.
+
     Args:
         path: The pathname to remove while it still references identity.
         identity: The (st_dev, st_ino) of the inode this run created;
@@ -256,13 +350,38 @@ def unlink_if_same_inode_atomic(
     """
     if identity is None:
         return
-    quarantine = quarantine_name(path)
     try:
-        os.rename(path, quarantine)
+        quarantine = reserve_quarantine_name(path)
+    except WPSSHBackupError as exc:
+        # No quarantine name could be reserved, so the claim cannot be
+        # made and the check-then-unlink is no longer atomic: the file
+        # must be left in place. This is a cleanup helper, so it warns
+        # rather than raises -- raising here would mask the error the
+        # caller is already handling.
+        if warn:
+            print(
+                "WARNING: "
+                + check_error_message.format(
+                    what=what, path=path, exc=exc
+                ),
+                file=sys.stderr,
+            )
+        return
+    try:
+        # os.replace, not os.rename: the destination is this process's
+        # own empty reservation, and os.replace overwrites it on both
+        # POSIX and Windows. (os.rename refuses to replace on Windows,
+        # and on POSIX it would replace whatever else had appeared at
+        # the name — which the reservation makes impossible.)
+        os.replace(path, quarantine)
     except FileNotFoundError:
         # Already gone (e.g. published and unlinked); nothing to do.
+        # The reservation is this process's own empty file, so it is
+        # removed here.
+        remove_quarantine_reservation(quarantine)
         return
     except OSError as exc:
+        remove_quarantine_reservation(quarantine)
         if warn:
             print(
                 "WARNING: "

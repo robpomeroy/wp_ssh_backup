@@ -29,6 +29,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sat under the quarantine name was silently deleted. The restore now uses
   a no-replace hard link, so a newcomer is preserved and the quarantined
   entry is left in place.
+- A quarantine no longer replaces an unrelated entry. The quarantine name
+  was built from the process ID and a counter, both of which are
+  predictable, and the move into it used `os.rename`, which replaces the
+  destination on POSIX. An entry left behind by an earlier run that
+  happened to reuse the same process ID and counter — or one a concurrent
+  writer pre-created at the predictable name — was therefore silently
+  deleted, violating the identity-bound cleanup guarantee. The name now
+  carries a 128-bit random suffix and is reserved with `O_CREAT | O_EXCL`
+  before the source is moved into it, retrying with a fresh name on
+  collision, so the only entry the move can replace is this process's own
+  empty reservation. A failed reservation is reported and the file is
+  left in place rather than removed unsafely.
 
 ## [0.1.0] - 2026-10-20
 

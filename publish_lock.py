@@ -210,14 +210,29 @@ def steal_stale_lock(lock: Path) -> bool:
         return False
     if pid_alive(pid):
         return False
-    stale = safe_fs.quarantine_name(lock)
+    # The quarantine name is RESERVED before the lock is moved into
+    # it: os.rename REPLACES whatever already sits at the destination,
+    # so a leftover entry (e.g. from an earlier run that reused the
+    # same PID and counter) would be silently deleted. The reservation
+    # is this process's own empty file, so the move can only replace
+    # that. os.replace is used rather than os.rename because it also
+    # overwrites on Windows, where os.rename refuses to replace.
     try:
-        os.rename(lock, stale)
+        stale = safe_fs.reserve_quarantine_name(lock)
+    except WPSSHBackupError:
+        # No quarantine name could be reserved, so the lock cannot be
+        # reclaimed safely. Report it as not reclaimed: the lock is
+        # left untouched and the caller retries the create.
+        return False
+    try:
+        os.replace(lock, stale)
     except FileNotFoundError:
         # Another process stole it first; the name is free, retry
-        # create.
+        # create. The reservation is this process's own empty file.
+        safe_fs.remove_quarantine_reservation(stale)
         return True
     except OSError:
+        safe_fs.remove_quarantine_reservation(stale)
         return False
     try:
         st = os.lstat(stale)
@@ -289,6 +304,10 @@ def try_create_publish_lock(lock: Path) -> tuple[int, int] | None:
         The (st_dev, st_ino) of the created lock, or None when the lock
         name is already taken (the caller retries or reclaims).
     """
+    # The staging name is created with O_CREAT|O_EXCL, so it can never
+    # replace an existing file. The random suffix also makes it
+    # unguessable, so a concurrent writer cannot pre-create it and
+    # deny this run the lock.
     tmp = safe_fs.quarantine_name(lock)
     try:
         fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
