@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import posixpath
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -67,11 +68,52 @@ def _get_int(name: str, default: int, minimum: int = 1) -> int:
     return value
 
 
+def _is_frozen() -> bool:
+    """Return whether the program is running as a bundled executable.
+
+    PyInstaller sets sys.frozen in the bundle it unpacks, so it is
+    true for a frozen binary and absent when the script is run from a
+    checkout.
+
+    Returns:
+        True if the program is a frozen executable, False otherwise.
+    """
+    return bool(getattr(sys, "frozen", False))
+
+
 def _find_env_file() -> Path:
+    """Locate the .env file to read.
+
+    The current directory is searched first, so running the tool from
+    the directory holding the configuration always works.
+
+    A frozen build (PyInstaller) is different: the bundle unpacks into
+    a temporary directory, so the module's own __file__ points into
+    that temporary directory and never at the user's files. The
+    directory holding the executable is searched instead, so a copy of
+    the program placed next to its .env finds it.
+
+    Args:
+        None.
+
+    Returns:
+        The path of the .env file to read. The path is not guaranteed
+        to exist; the caller reports the error, and the error names
+        the path that was searched so the user knows where to put the
+        file.
+    """
     cwd_env = Path.cwd() / ".env"
     if cwd_env.is_file():
-
         return cwd_env
+    if _is_frozen():
+        # sys.executable is the executable the user ran, so its
+        # directory is where the program was placed.
+        exe_env = Path(sys.executable).resolve().parent / ".env"
+        if exe_env.is_file():
+            return exe_env
+        # Nothing found: report the path next to the executable, since
+        # that is where the user would put it.
+        return exe_env
     return Path(__file__).resolve().parent / ".env"
 
 
@@ -84,8 +126,9 @@ def load_config(env_file: str | os.PathLike | None = None) -> Config:
 
     Args:
         env_file: Path to the .env file. If None, the function will attempt to
-            locate a .env file in the current working directory or the script's
-            directory.
+            locate an .env file in the current working directory, then next to
+            the program (the script's directory when run from source, the
+            executable's directory when run as a frozen binary).
 
     Returns:
         A Config object populated with the validated configuration.
@@ -100,9 +143,22 @@ def load_config(env_file: str | os.PathLike | None = None) -> Config:
     else:
         env_path = _find_env_file()
         if not env_path.is_file():
+            if _is_frozen():
+                # A frozen binary is a single file the user
+                # downloaded, so the .env belongs beside it. Saying
+                # only "no .env file found" would leave the user
+                # hunting for the place the file is expected.
+                raise ConfigError(
+                    "No .env file found. A standalone executable reads "
+                    "its configuration from a .env file beside the "
+                    f"executable: {env_path}\n"
+                    "Copy .env.example to that location and fill in your "
+                    "SSH and WordPress settings."
+                )
             raise ConfigError(
-                "No .env file found. Copy .env.example to .env and fill in "
-                "your SSH and WordPress settings."
+                f"No .env file found at {env_path}. Copy .env.example to "
+                "that location and fill in your SSH and WordPress "
+                "settings."
             )
     load_dotenv(env_path)
 

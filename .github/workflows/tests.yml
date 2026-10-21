@@ -22,7 +22,7 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
 
@@ -36,3 +36,88 @@ jobs:
 
       - name: Run offline tests
         run: pytest -m "not live"
+
+  build:
+    name: Build / ${{ matrix.platform }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux-x64
+          - os: windows-latest
+            platform: windows-x64
+          - os: macos-15
+            platform: macos-arm64
+          - os: macos-15-intel
+            platform: macos-x64
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.10"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt "pyinstaller>=6.0,<7.0"
+
+      # The release workflow builds the same executables from the same
+      # script. Building them on every pull request means a broken
+      # binary is caught here rather than after a release is published.
+      - name: Build executables
+        run: |
+          if [ "${{ matrix.platform }}" = "linux-x64" ]; then
+            python build_executables.py --container --suffix linux-x64
+          else
+            python build_executables.py --suffix ${{ matrix.platform }}
+          fi
+
+      - name: Smoke test the executables
+        shell: bash
+        run: |
+          cd dist
+          count=0
+          for exe in *-${{ matrix.platform }}*; do
+            # The checksum file matches the glob too, but it is not
+            # executable.
+            case "$exe" in
+              *.sha256) continue ;;
+            esac
+            [ -f "$exe" ] || continue
+            echo "Running $exe"
+            "./$exe" --version
+            count=$((count + 1))
+          done
+          if [ "$count" -ne 3 ]; then
+            echo "Expected 3 executables, found $count" >&2
+            exit 1
+          fi
+
+      # PyInstaller does not bundle the C library, so the Linux binary
+      # links against whatever glibc the build image has and fails to
+      # start on anything older. The floor is set by the interpreter
+      # that was bundled, not by the bootloader, so the check runs the
+      # binary on the oldest glibc the project supports. If the build
+      # ever picks up a newer baseline, this fails.
+      - name: Check the Linux binary runs on the oldest supported glibc
+        if: matrix.platform == 'linux-x64'
+        shell: bash
+        run: |
+          set -e
+          cd dist
+          # glibc 2.28 is the floor: Debian 10 and Ubuntu 20.04.
+          docker run --rm \
+            --entrypoint /bin/sh \
+            -v "$PWD:/dist:ro" \
+            quay.io/pypa/manylinux_2_28_x86_64:latest \
+            -c 'ldd --version | head -1;
+                for exe in /dist/wp-ssh-backup-linux-x64 \
+                             /dist/wp-ssh-backup-restore-linux-x64 \
+                             /dist/wp-ssh-backup-authorize-host-linux-x64; do
+                  echo "Running $exe on glibc 2.28"
+                  "$exe" --version
+                done'

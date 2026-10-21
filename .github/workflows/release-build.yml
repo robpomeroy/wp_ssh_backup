@@ -1,0 +1,97 @@
+name: Release Build
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to attach the binaries to"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build / ${{ matrix.platform }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The Linux binary is built inside a container (see the
+          # "Build executables" step), so the runner image does not
+          # decide the glibc floor. The container is Debian 10, which
+          # is the oldest baseline this project supports: the binary
+          # runs on Debian 10 and later, and on Ubuntu 20.04 and
+          # later.
+          - os: ubuntu-latest
+            platform: linux-x64
+          - os: windows-latest
+            platform: windows-x64
+          # Both macOS architectures are shipped. macos-15 is the
+          # current arm64 image and macos-15-intel the x64 one;
+          # macos-latest is arm64 and moves with the macOS release.
+          - os: macos-15
+            platform: macos-arm64
+          - os: macos-15-intel
+            platform: macos-x64
+
+    steps:
+      # The tag to build is resolved once, here, and used for both the
+      # checkout and the release. A published release supplies its own
+      # tag; a manual run supplies it as an input. Without this, a
+      # manual run would build whichever branch the Actions UI
+      # happened to select and attach those binaries to the tag.
+      - name: Resolve the tag
+        id: tag
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          tag="${RELEASE_TAG:-$INPUT_TAG}"
+          if [ -z "$tag" ]; then
+            echo "No tag to build: trigger a published release or supply the tag input." >&2
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ steps.tag.outputs.tag }}
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v7
+        with:
+          # 3.10 is the minimum supported version, so the binaries run
+          # on the oldest Python the project supports and on every
+          # newer release.
+          python-version: "3.10"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt "pyinstaller>=6.0,<7.0"
+
+      - name: Build executables
+        run: |
+          if [ "${{ matrix.platform }}" = "linux-x64" ]; then
+            python build_executables.py --container --suffix linux-x64
+          else
+            python build_executables.py --suffix ${{ matrix.platform }}
+          fi
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wp-ssh-backup-${{ matrix.platform }}
+          path: dist/
+          if-no-files-found: error
+
+      - name: Attach binaries to the GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          files: dist/*
+          fail_on_unmatched_files: true

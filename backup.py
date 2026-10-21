@@ -21,7 +21,12 @@ from typing import BinaryIO
 
 import paramiko
 
-from cli import add_scope_arguments, add_version_argument, resolve_scope
+from cli import (
+    add_scope_arguments,
+    add_version_argument,
+    program_name,
+    resolve_scope,
+)
 import safe_fs
 from publish import publish_downloads
 from common import (
@@ -553,7 +558,7 @@ def run_backup(
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        prog="backup.py",
+        prog=program_name("backup.py"),
         description="Back up a WordPress site over SSH.",
     )
     add_version_argument(parser)

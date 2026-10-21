@@ -28,7 +28,7 @@ from common import (
     known_hosts_entry,
     load_config,
 )
-from cli import add_version_argument
+from cli import add_version_argument, program_name
 
 
 def fetch_host_key(config: Config) -> paramiko.PKey:
@@ -179,7 +179,7 @@ def confirm_interactive(fp: str, hostname: str, port: int) -> bool:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        prog="authorize_host.py",
+        prog=program_name("authorize_host.py"),
         description=(
             "Authorise a WordPress host's SSH key for WP SSH Backup. "
             "Fetches the host key (no credentials sent), shows its "
