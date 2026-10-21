@@ -1,6 +1,6 @@
 # WP SSH Backup
 
-![Banner](images/banner.png)
+![Banner](images/banner.jpg)
 
 WP SSH Backup is a tool for taking backups of WordPress websites over SSH. This
 is most suitable for users who have SSH access to their WordPress hosting
@@ -85,10 +85,17 @@ There are three executables, one per entry point:
 | `wp-ssh-backup-authorize-host` | `authorize_host.py` |
 
 Each release also includes a `.sha256` file with the checksums of the
-binaries, so you can verify a download before running it:
+binaries, so you can verify a download before running it, e.g.:
 
 ```bash
+# Linux
 sha256sum --check wp-ssh-backup-linux-x64.sha256
+
+# macOS
+shasum -a 256 --check wp-ssh-backup-macos-arm64.sha256
+
+# Windows
+certutil -hashfile wp-ssh-backup-windows-x64.exe SHA256
 ```
 
 ### Where the .env file goes
