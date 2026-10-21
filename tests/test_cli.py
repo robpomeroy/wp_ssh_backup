@@ -261,4 +261,6 @@ def test_common_facade_reexports_every_public_name() -> None:
         for name in common.__all__
         if not hasattr(common, name)
     }
-    assert not undefined, f"common.__all__ lists unknown names: {sorted(undefined)}"
+    assert not undefined, (
+        f"common.__all__ lists unknown names: {sorted(undefined)}"
+    )
