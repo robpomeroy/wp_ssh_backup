@@ -1002,3 +1002,75 @@ def test_find_env_file_uses_the_module_directory_when_not_frozen(
 
     expected = Path(config.__file__).resolve().parent / ".env"
     assert config._find_env_file() == expected
+
+
+def test_load_config_error_names_the_executable_directory_when_frozen(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A frozen binary says where its .env belongs.
+
+    The executable is a single file the user downloaded, so the .env
+    goes next to it. The error must name that directory: a bare "no
+    .env file found" leaves the user guessing, and the directory the
+    program actually searched is not the one a user would guess.
+    """
+    import config
+
+    work = tmp_path / "work"
+    work.mkdir()
+    beside = tmp_path / "program"
+    beside.mkdir()
+
+    monkeypatch.chdir(work)
+    monkeypatch.setattr(config.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(config.sys, "executable", str(beside / "app.exe"))
+
+    with pytest.raises(ConfigError) as caught:
+        load_config()
+
+    message = str(caught.value)
+    assert str(beside / ".env") in message
+    # The temporary directory the bundle unpacked into must not be
+    # named: the user cannot put a file there.
+    assert "No .env file found" in message
+
+
+def test_load_config_error_names_the_path_it_searched_when_not_frozen(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Run from source, the error names the .env path that was searched.
+
+    The searched path is reported in every case, so the user is told
+    where the program looked rather than only that it looked.
+
+    The module directory is redirected to a temporary one, because the
+    project checkout may have a real .env next to it -- and a test
+    must not depend on the machine it runs on.
+    """
+    import config
+
+    work = tmp_path / "work"
+    work.mkdir()
+    module_dir = tmp_path / "module"
+    module_dir.mkdir()
+
+    monkeypatch.chdir(work)
+    monkeypatch.delattr(config.sys, "frozen", raising=False)
+    monkeypatch.setattr(config, "__file__", str(module_dir / "config.py"))
+
+    with pytest.raises(ConfigError) as caught:
+        load_config()
+
+    message = str(caught.value)
+    assert str(module_dir / ".env") in message
+
+
+def test_load_config_error_names_the_explicit_missing_file(
+    tmp_path: Path,
+) -> None:
+    """An explicitly named file that does not exist names that file."""
+    missing = tmp_path / "nope.env"
+    with pytest.raises(ConfigError) as caught:
+        load_config(missing)
+
+    assert str(missing) in str(caught.value)

@@ -21,6 +21,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   workflow and by the continuous integration build job, so a binary that
   cannot run is caught before a release is published.
 
+### Fixed
+
+- A standalone executable that cannot find a `.env` file now says where the
+  file belongs. The error names the path that was searched, which for a
+  frozen binary is the directory holding the executable, instead of a
+  generic message that left the user to guess.
+
 ## [0.2.0] - 2026-10-20
 
 ### Changed
