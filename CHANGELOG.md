@@ -27,6 +27,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   file belongs. The error names the path that was searched, which for a
   frozen binary is the directory holding the executable, instead of a
   generic message that left the user to guess.
+- The Linux executable is now built in a container based on Debian 10, so it
+  needs glibc 2.28 or later and runs on Debian 10 and later and on Ubuntu
+  20.04 and later. It was previously built on Ubuntu 22.04, which required
+  a newer glibc than the download advertised and stopped the executable from
+  starting on the older systems the project supports.
 
 ## [0.2.0] - 2026-10-20
 

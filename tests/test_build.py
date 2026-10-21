@@ -100,3 +100,43 @@ def test_write_checksums_without_a_suffix_uses_the_plain_name(
 
     path = build_executables.write_checksums([target], None)
     assert path.name == "wp-ssh-backup.sha256"
+
+
+def test_linux_build_image_is_pinned() -> None:
+    """The Linux build image is pinned by tag.
+
+    The image decides the glibc floor of the Linux executable, because
+    PyInstaller does not bundle the C library. A floating tag would
+    let the floor rise without anyone noticing, and the executable
+    would stop starting on the systems the project supports.
+    """
+    image = build_executables.LINUX_BUILD_IMAGE
+    assert ":" in image, f"{image} is not pinned to a specific tag"
+    tag = image.rsplit(":", 1)[1]
+    assert tag not in ("latest", "stable"), f"{image} floats"
+    # The tag names the distribution, which is what sets the glibc.
+    assert "buster" in tag or "bullseye" in tag or "bookworm" in tag
+
+
+def test_linux_build_glibc_is_the_documented_floor() -> None:
+    """The documented glibc floor matches the build image.
+
+    The README tells users which systems the Linux executable runs on.
+    That claim has to follow from the image the binary is built in, or
+    the documentation is a guess.
+    """
+    # Debian 10 (buster) ships glibc 2.28, Debian 11 (bullseye) 2.31
+    # and Debian 12 (bookworm) 2.36.
+    expected = {
+        "buster": "2.28",
+        "bullseye": "2.31",
+        "bookworm": "2.36",
+    }
+    tag = build_executables.LINUX_BUILD_IMAGE.rsplit(":", 1)[1]
+    for distribution, glibc in expected.items():
+        if distribution in tag:
+            assert build_executables.LINUX_BUILD_GLIBC == glibc
+            return
+    raise AssertionError(
+        f"{tag} names no distribution this test knows the glibc of"
+    )

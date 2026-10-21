@@ -25,6 +25,7 @@ import argparse
 import hashlib
 import subprocess
 import sys
+import uuid
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -55,6 +56,20 @@ HIDDEN_IMPORTS = [
 WORK_DIR = PROJECT_ROOT / "build"
 DIST_DIR = PROJECT_ROOT / "dist"
 SPEC_DIR = WORK_DIR / "spec"
+
+# The image the Linux binary is built in.
+#
+# PyInstaller does not bundle the C library: the executable links
+# against whatever glibc the build machine has, and fails to start on
+# anything older. The official python:3.10 images are named after the
+# distribution they come from, so this one fixes the floor at the
+# glibc of Debian 10 (2.28). That covers Debian 10 and later, and
+# Ubuntu 20.04 and later.
+#
+# The image is pinned by tag so the glibc floor cannot silently rise
+# when the tag moves.
+LINUX_BUILD_IMAGE = "python:3.10-buster"
+LINUX_BUILD_GLIBC = "2.28"
 
 
 def executable_name(name: str, suffix: str | None) -> str:
@@ -164,6 +179,126 @@ def write_checksums(paths: list[Path], suffix: str | None) -> Path:
     return checksum_path
 
 
+def build_in_container(suffix: str) -> None:
+    """Build the executables inside a Linux container.
+
+    The build runs in a container so the glibc floor of the resulting
+    binary is set by the image rather than by whichever runner
+    happened to build it. See LINUX_BUILD_IMAGE.
+
+    The source and the results travel as a tar stream through a
+    named volume, rather than as a bind mount of the checkout: a bind
+    mount of a network share is not visible inside the container.
+
+    Args:
+        suffix: The platform suffix for the executable names.
+    """
+    print(f"Building in {LINUX_BUILD_IMAGE} (glibc {LINUX_BUILD_GLIBC})...")
+
+    script = (
+        "set -e\n"
+        "cd /work/proj\n"
+        "python -m pip install -r requirements.txt "
+        "'pyinstaller>=6.0,<7.0'\n"
+        "python build_executables.py --suffix " + suffix + "\n"
+    )
+
+    # The script is delivered inside the archive, so it travels with
+    # the source.
+    script_path = WORK_DIR / "container_build.sh"
+    script_path.parent.mkdir(parents=True, exist_ok=True)
+    # newline="" keeps the line endings as written. A carriage return
+    # left at the end of a line would become part of the argument it
+    # ends, and the executable would be built with a stray \r in its
+    # name.
+    script_path.write_text(script, encoding="utf-8", newline="\n")
+
+    # A fresh volume per run, so nothing left behind by an earlier
+    # run can be picked up as if it were part of this build.
+    volume = "wpssh-build-" + uuid.uuid4().hex[:12]
+    try:
+        _build_in_container(volume, suffix)
+    finally:
+        subprocess.run(
+            ["docker", "volume", "rm", "-f", volume],
+            check=False,
+        )
+
+
+def _build_in_container(volume: str, suffix: str) -> None:
+    """Build in the given container volume.
+
+    Args:
+        volume: The name of the Docker volume to use.
+        suffix: The platform suffix for the executable names.
+    """
+    tar = subprocess.Popen(
+        ["tar", "-cf", "-", "--exclude=./venv", "--exclude=./dist",
+         "--exclude=./.git", "--exclude=./__pycache__",
+         "."],
+        cwd=PROJECT_ROOT,
+        stdout=subprocess.PIPE,
+    )
+    docker = subprocess.Popen(
+        [
+            "docker",
+            "run",
+            "--rm",
+            "-i",
+            "-v",
+            volume + ":/work",
+            LINUX_BUILD_IMAGE,
+            "bash",
+            "-c",
+            "mkdir -p /work/proj /work/out-dist && "
+            "tar -xf - -C /work/proj && "
+            "cd /work/proj && bash build/container_build.sh && "
+            "cp -f dist/* /work/out-dist/",
+        ],
+        stdin=tar.stdout,
+    )
+    if tar.stdout is not None:
+        tar.stdout.close()
+    docker_code = docker.wait()
+    tar_code = tar.wait()
+    if tar_code != 0 or docker_code != 0:
+        raise SystemExit(
+            f"container build failed (tar={tar_code}, docker={docker_code})"
+        )
+
+    # Copy the results back out of the volume as a tar stream, which
+    # avoids a bind mount of the checkout: a bind mount of a network
+    # share is not visible inside the container.
+    DIST_DIR.mkdir(parents=True, exist_ok=True)
+    copy = subprocess.run(
+        [
+            "docker",
+            "run",
+            "--rm",
+            "-v",
+            volume + ":/work",
+            LINUX_BUILD_IMAGE,
+            "tar", "-cf", "-", "-C", "/work/out-dist", ".",
+        ],
+        stdout=subprocess.PIPE,
+        check=True,
+    )
+    # The archive is rooted at ".", so the members have "./" in front
+    # of them; --strip-components=1 removes it.
+    subprocess.run(
+        [
+            "tar",
+            "-xf",
+            "-",
+            "-C",
+            str(DIST_DIR),
+            "--strip-components=1",
+        ],
+        input=copy.stdout,
+        check=True,
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Build the standalone WP SSH Backup executables.",
@@ -175,7 +310,20 @@ def main(argv: list[str] | None = None) -> int:
             "or 'macos-arm64'. Omit for the plain names."
         ),
     )
+    parser.add_argument(
+        "--container",
+        action="store_true",
+        help=(
+            "Build in a Linux container instead of on this machine. "
+            "Use this for the Linux binary: it pins the glibc floor "
+            "of the result."
+        ),
+    )
     args = parser.parse_args(argv)
+
+    if args.container:
+        build_in_container(args.suffix or "linux-x64")
+        return 0
 
     built: list[Path] = []
     for script, name in TARGETS:

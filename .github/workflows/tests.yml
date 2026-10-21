@@ -44,7 +44,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-22.04
+          - os: ubuntu-latest
             platform: linux-x64
           - os: windows-latest
             platform: windows-x64
@@ -69,7 +69,12 @@ jobs:
       # script. Building them on every pull request means a broken
       # binary is caught here rather than after a release is published.
       - name: Build executables
-        run: python build_executables.py --suffix ${{ matrix.platform }}
+        run: |
+          if [ "${{ matrix.platform }}" = "linux-x64" ]; then
+            python build_executables.py --container --suffix linux-x64
+          else
+            python build_executables.py --suffix ${{ matrix.platform }}
+          fi
 
       - name: Smoke test the executables
         shell: bash
@@ -91,3 +96,28 @@ jobs:
             echo "Expected 3 executables, found $count" >&2
             exit 1
           fi
+
+      # PyInstaller does not bundle the C library, so the Linux binary
+      # links against whatever glibc the build image has and fails to
+      # start on anything older. The floor is set by the interpreter
+      # that was bundled, not by the bootloader, so the check runs the
+      # binary on the oldest glibc the project supports. If the build
+      # ever picks up a newer baseline, this fails.
+      - name: Check the Linux binary runs on the oldest supported glibc
+        if: matrix.platform == 'linux-x64'
+        shell: bash
+        run: |
+          set -e
+          cd dist
+          # glibc 2.28 is the floor: Debian 10 and Ubuntu 20.04.
+          docker run --rm \
+            --entrypoint /bin/sh \
+            -v "$PWD:/dist:ro" \
+            quay.io/pypa/manylinux_2_28_x86_64:latest \
+            -c 'ldd --version | head -1;
+                for exe in /dist/wp-ssh-backup-linux-x64 \
+                             /dist/wp-ssh-backup-restore-linux-x64 \
+                             /dist/wp-ssh-backup-authorize-host-linux-x64; do
+                  echo "Running $exe on glibc 2.28"
+                  "$exe" --version
+                done'

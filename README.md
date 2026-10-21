@@ -69,12 +69,12 @@ Pre-built executables are attached to each
 Python installation is needed: download the file for your platform,
 make it executable and run it.
 
-| Platform | Download |
-| --- | --- |
-| Linux x86-64 | `wp-ssh-backup-linux-x64` |
-| macOS (Apple silicon) | `wp-ssh-backup-macos-arm64` |
-| macOS (Intel) | `wp-ssh-backup-macos-x64` |
-| Windows x86-64 | `wp-ssh-backup-windows-x64.exe` |
+| Platform | Download | Requires |
+| --- | --- | --- |
+| Linux x86-64 | `wp-ssh-backup-linux-x64` | glibc 2.28 or later |
+| macOS (Apple silicon) | `wp-ssh-backup-macos-arm64` | macOS 11 or later |
+| macOS (Intel) | `wp-ssh-backup-macos-x64` | macOS 10.15 or later |
+| Windows x86-64 | `wp-ssh-backup-windows-x64.exe` | Windows 10 or later |
 
 There are three executables, one per entry point:
 
@@ -97,6 +97,29 @@ shasum -a 256 --check wp-ssh-backup-macos-arm64.sha256
 # Windows
 certutil -hashfile wp-ssh-backup-windows-x64.exe SHA256
 ```
+
+### The Linux requirement
+
+The Linux executable needs **glibc 2.28 or later**. That means Debian 10
+("buster") and later, and Ubuntu 20.04 ("focal") and later. Older systems
+such as Ubuntu 18.04 or Debian 9 are not supported.
+
+This is a property of the Python interpreter that is bundled into the
+executable, not of the tool itself: the interpreter is linked against the
+C library of the machine that built it, and the C library cannot be
+bundled. The Linux binary is therefore built in a container based on
+Debian 10, which fixes the floor at glibc 2.28 whatever machine the
+build runs on.
+
+If you see an error like this, the system is too old:
+
+```
+Failed to load Python shared library: /lib64/libm.so.6: version
+`GLIBC_2.29' not found
+```
+
+The Windows and macOS executables have no equivalent requirement: they
+carry the libraries they need.
 
 ### Where the .env file goes
 
