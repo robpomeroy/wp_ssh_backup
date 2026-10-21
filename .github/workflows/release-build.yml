@@ -37,8 +37,29 @@ jobs:
             platform: macos-x64
 
     steps:
+      # The tag to build is resolved once, here, and used for both the
+      # checkout and the release. A published release supplies its own
+      # tag; a manual run supplies it as an input. Without this, a
+      # manual run would build whichever branch the Actions UI
+      # happened to select and attach those binaries to the tag.
+      - name: Resolve the tag
+        id: tag
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          tag="${RELEASE_TAG:-$INPUT_TAG}"
+          if [ -z "$tag" ]; then
+            echo "No tag to build: trigger a published release or supply the tag input." >&2
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
       - name: Check out repository
         uses: actions/checkout@v7
+        with:
+          ref: ${{ steps.tag.outputs.tag }}
 
       - name: Set up Python 3.10
         uses: actions/setup-python@v7
@@ -54,12 +75,6 @@ jobs:
       - name: Build executables
         run: python build_executables.py --suffix ${{ matrix.platform }}
 
-      - name: Record checksums
-        shell: bash
-        run: |
-          cd dist
-          sha256sum * > "wp-ssh-backup-${{ matrix.platform }}.sha256"
-
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
@@ -70,6 +85,6 @@ jobs:
       - name: Attach binaries to the GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.event.release.tag_name || inputs.tag }}
+          tag_name: ${{ steps.tag.outputs.tag }}
           files: dist/*
           fail_on_unmatched_files: true

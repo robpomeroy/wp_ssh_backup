@@ -77,6 +77,12 @@ jobs:
           cd dist
           count=0
           for exe in *-${{ matrix.platform }}*; do
+            # The checksum file matches the glob too, but it is not
+            # executable.
+            case "$exe" in
+              *.sha256) continue ;;
+            esac
+            [ -f "$exe" ] || continue
             echo "Running $exe"
             "./$exe" --version
             count=$((count + 1))

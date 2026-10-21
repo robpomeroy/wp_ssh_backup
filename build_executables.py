@@ -22,6 +22,7 @@ built on, which is what the release workflow attaches to a release:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import subprocess
 import sys
 from pathlib import Path
@@ -134,6 +135,35 @@ def verify(path: Path) -> None:
     print(f"  {result.stdout.strip()}")
 
 
+def write_checksums(paths: list[Path], suffix: str | None) -> Path:
+    """Write a SHA-256 checksum file for the built executables.
+
+    The file is written here rather than in the workflow because the
+    checksum command differs between platforms: GNU coreutils provides
+    "sha256sum" on Linux, BSD provides "shasum -a 256" on macOS, and
+    PowerShell has neither. Hashing in Python works everywhere and
+    produces the same output format on all of them, so a user can
+    check the file with whichever tool they have.
+
+    Args:
+        paths: The executables to checksum.
+        suffix: The platform suffix, used in the file name, or None.
+
+    Returns:
+        The path of the checksum file that was written.
+    """
+    name = f"wp-ssh-backup-{suffix}" if suffix else "wp-ssh-backup"
+    checksum_path = DIST_DIR / f"{name}.sha256"
+
+    lines = []
+    for path in sorted(paths):
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        lines.append(f"{digest}  {path.name}")
+
+    checksum_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return checksum_path
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Build the standalone WP SSH Backup executables.",
@@ -156,11 +186,14 @@ def main(argv: list[str] | None = None) -> int:
     for path in built:
         verify(path)
 
+    checksum_path = write_checksums(built, args.suffix)
+
     print()
     print("Built:")
     for path in built:
         size_mb = path.stat().st_size / 1024 / 1024
         print(f"  {path}  ({size_mb:.1f} MB)")
+    print(f"  {checksum_path}")
     return 0
 
 
