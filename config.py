@@ -152,8 +152,8 @@ def load_config(env_file: str | os.PathLike | None = None) -> Config:
                     "No .env file found. A standalone executable reads "
                     "its configuration from a .env file beside the "
                     f"executable: {env_path}\n"
-                    "Copy .env.example to that location and fill in your "
-                    "SSH and WordPress settings."
+                    "Copy .env.example from this repository to that location "
+                    "and fill in your SSH and WordPress settings."
                 )
             raise ConfigError(
                 f"No .env file found at {env_path}. Copy .env.example to "

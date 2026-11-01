@@ -75,6 +75,7 @@ jobs:
         run: pip install -r requirements.txt "pyinstaller>=6.0,<7.0"
 
       - name: Build executables
+        shell: bash
         run: |
           if [ "${{ matrix.platform }}" = "linux-x64" ]; then
             python build_executables.py --container --suffix linux-x64

@@ -69,6 +69,7 @@ jobs:
       # script. Building them on every pull request means a broken
       # binary is caught here rather than after a release is published.
       - name: Build executables
+        shell: bash
         run: |
           if [ "${{ matrix.platform }}" = "linux-x64" ]; then
             python build_executables.py --container --suffix linux-x64
