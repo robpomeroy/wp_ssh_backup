@@ -9,9 +9,11 @@ definitions in one place so the three programs cannot drift apart.
 from __future__ import annotations
 
 import argparse
+import sys
 import time
 from collections.abc import Generator
 from contextlib import contextmanager
+from pathlib import Path
 
 from version import __version__
 
@@ -19,10 +21,31 @@ __all__ = [
     "add_scope_arguments",
     "human_size",
     "add_version_argument",
+    "program_name",
     "resolve_scope",
     "timed",
     "version_string",
 ]
+
+
+def program_name(script: str) -> str:
+    """Return the name to show the user for the running program.
+
+    When the program is run from a checkout, that is the script name
+    ("backup.py"). When it is run as a bundled executable, the script
+    name is meaningless -- the user downloaded "wp-ssh-backup" -- so
+    the executable's own name is used instead.
+
+    Args:
+        script: The script name to use when not running as a frozen
+            executable.
+
+    Returns:
+        The name to display in usage and version output.
+    """
+    if not getattr(sys, "frozen", False):
+        return script
+    return Path(sys.executable).name
 
 
 def version_string(prog: str) -> str:

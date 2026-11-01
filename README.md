@@ -1,5 +1,7 @@
 # WP SSH Backup
 
+![Banner](images/banner.jpg)
+
 WP SSH Backup is a tool for taking backups of WordPress websites over SSH. This
 is most suitable for users who have SSH access to their WordPress hosting
 server.
@@ -59,6 +61,104 @@ server.
    cp .env.example .env
    ```
 6. Edit the `.env` file to configure your SSH and WordPress settings.
+
+## Standalone executables
+
+Pre-built executables are attached to each
+[release](https://github.com/robpomeroy/wp_ssh_backup/releases). No
+Python installation is needed: download the file for your platform,
+make it executable and run it.
+
+| Platform | Download | Requires |
+| --- | --- | --- |
+| Linux x86-64 | `wp-ssh-backup-linux-x64` | glibc 2.28 or later |
+| macOS (Apple silicon) | `wp-ssh-backup-macos-arm64` | macOS 11 or later |
+| macOS (Intel) | `wp-ssh-backup-macos-x64` | macOS 10.15 or later |
+| Windows x86-64 | `wp-ssh-backup-windows-x64.exe` | Windows 10 or later |
+
+There are three executables, one per entry point:
+
+| Executable | Replaces |
+| --- | --- |
+| `wp-ssh-backup` | `backup.py` |
+| `wp-ssh-backup-restore` | `restore.py` |
+| `wp-ssh-backup-authorize-host` | `authorize_host.py` |
+
+Each release also includes a `.sha256` file with the checksums of the
+binaries, so you can verify a download before running it, e.g.:
+
+```bash
+# Linux
+sha256sum --check wp-ssh-backup-linux-x64.sha256
+
+# macOS
+shasum -a 256 --check wp-ssh-backup-macos-arm64.sha256
+
+# Windows
+certutil -hashfile wp-ssh-backup-windows-x64.exe SHA256
+```
+
+### The Linux requirement
+
+The Linux executable needs **glibc 2.28 or later**. That means Debian 10
+("buster") and later, and Ubuntu 20.04 ("focal") and later. Older systems
+such as Ubuntu 18.04 or Debian 9 are not supported.
+
+This is a property of the Python interpreter that is bundled into the
+executable, not of the tool itself: the interpreter is linked against the
+C library of the machine that built it, and the C library cannot be
+bundled. The Linux binary is therefore built in a container based on
+Debian 10, which fixes the floor at glibc 2.28 whatever machine the
+build runs on.
+
+If you see an error like this, the system is too old:
+
+```
+Failed to load Python shared library: /lib64/libm.so.6: version
+`GLIBC_2.29' not found
+```
+
+The Windows and macOS executables have no equivalent requirement: they
+carry the libraries they need.
+
+### Where the .env file goes
+
+The executables look for `.env` in two places, in this order:
+
+1. The current working directory.
+2. The directory the executable is in.
+
+So a `.env` next to the executable is found no matter where you run it
+from, and a `.env` in the working directory overrides it. This differs
+from running the scripts from a checkout, where `.env` is read from
+the project directory.
+
+### macOS: the "cannot be opened" warning
+
+The macOS binaries are not signed or notarised, because this project
+has no Apple Developer account. Gatekeeper therefore blocks them on
+first run:
+
+```
+wp-ssh-backup-macos-arm64 cannot be opened because the developer
+cannot be verified.
+```
+
+The binary is a normal, unmodified PyInstaller build - the warning is
+about the missing signature, not about the contents. To run it:
+
+- **Right-click** the file in Finder and choose **Open**, then confirm.
+  This is a one-time step; the executable is allowed to run afterwards.
+- Or remove the quarantine flag from the command line:
+  ```bash
+  xattr -d com.apple.quarantine ./wp-ssh-backup-macos-arm64
+  ```
+
+`chmod +x` is needed first on Linux and macOS:
+
+```bash
+chmod +x wp-ssh-backup-linux-x64
+```
 
 ## Configuration
 
@@ -353,6 +453,27 @@ offline test suite on every push and pull request, against Python 3.10 (the
 minimum supported version) and 3.14 on Ubuntu. Live tests are excluded from
 CI, as no host or credentials are available there.
 
+The same workflow has a second job that builds the standalone executables on
+Linux, Windows and macOS and runs each one, so a binary that cannot start is
+caught on the pull request rather than after a release is published.
+
+### Building the executables
+
+The release workflow (`.github/workflows/release-build.yml`) builds the
+executables when a release is published and attaches them to it. To build
+them locally:
+
+```bash
+pip install -r requirements-dev.txt
+python build_executables.py
+```
+
+The three executables are written to `dist/`. Pass `--suffix` to name them
+for a platform, e.g. `python build_executables.py --suffix linux-x64`
+produces `dist/wp-ssh-backup-linux-x64`. The script runs each executable
+after building it, so a build that produced an unusable binary fails
+instead of shipping.
+
 ### Project layout
 
 The three entry points are thin: they parse arguments and orchestrate. The
@@ -367,6 +488,7 @@ work lives in focused modules.
 | `authorize_host.py` | Fetch and record a host key. |
 | `cli.py` | Shared command-line helpers (`--version`, the scope flags). |
 | `version.py` | The single source of truth for the version number. |
+| `build_executables.py` | Builds the standalone executables with PyInstaller. |
 
 ### Low-level layer
 

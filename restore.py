@@ -29,7 +29,12 @@ from archive_validation import (
     validate_local_member_types,
     validate_members,
 )
-from cli import add_scope_arguments, add_version_argument, resolve_scope
+from cli import (
+    add_scope_arguments,
+    add_version_argument,
+    program_name,
+    resolve_scope,
+)
 import safe_fs
 from selection import choose_set, list_backup_sets, ts_of
 from common import (
@@ -389,7 +394,7 @@ def run_restore(
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        prog="restore.py",
+        prog=program_name("restore.py"),
         description="Restore a WordPress site from a WP SSH Backup set.",
     )
     add_version_argument(parser)
