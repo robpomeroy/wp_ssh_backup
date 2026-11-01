@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://wpsshbackup.pomeroy.me/sitemap-index.xml

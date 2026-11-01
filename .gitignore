@@ -218,3 +218,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Astro site (Astro/)
+Astro/node_modules/
+Astro/dist/
+Astro/.astro/

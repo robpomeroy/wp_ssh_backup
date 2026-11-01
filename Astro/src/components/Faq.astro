@@ -1,0 +1,33 @@
+---
+import Icon from './ui/Icon.astro';
+import { faqs, site } from '../lib/site';
+---
+
+<section id="faq" class="mx-auto max-w-3xl scroll-mt-24 px-5 py-20 sm:px-8 sm:py-28">
+  <div class="text-center">
+    <p class="eyebrow">FAQ</p>
+    <h2 class="mt-3 text-3xl font-bold sm:text-4xl">Questions, answered</h2>
+  </div>
+
+  <div class="mt-10 divide-y divide-[var(--border)] border-y border-[var(--border)]">
+    {
+      faqs.map((faq) => (
+        <details class="group py-1">
+          <summary class="flex cursor-pointer list-none items-center justify-between gap-4 py-4 text-left text-base font-medium marker:hidden">
+            {faq.q}
+            <Icon
+              name="arrow"
+              class="size-4 shrink-0 rotate-90 text-[var(--muted)] transition group-open:-rotate-90"
+            />
+          </summary>
+          <p class="muted-strong pb-5 pr-8 text-sm leading-relaxed">{faq.a}</p>
+        </details>
+      ))
+    }
+  </div>
+
+  <p class="muted mt-8 text-center text-sm">
+    Something else?
+    <a href={site.issues} class="prose-link">Open an issue on GitHub</a>.
+  </p>
+</section>

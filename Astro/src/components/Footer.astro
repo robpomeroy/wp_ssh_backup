@@ -1,0 +1,76 @@
+---
+import Icon from './ui/Icon.astro';
+import { site } from '../lib/site';
+
+type Props = { version: string };
+const { version } = Astro.props;
+const year = new Date().getFullYear();
+---
+
+<footer class="border-t border-[var(--border)] bg-[var(--surface)]/40">
+  <div class="mx-auto max-w-6xl px-5 py-12 sm:px-8">
+    <div class="flex flex-col gap-10 md:flex-row md:justify-between">
+      <div class="max-w-sm">
+        <div class="flex items-center gap-2.5 font-semibold">
+          <span class="grid size-8 place-items-center rounded-lg bg-gradient-to-br from-brand to-brand-2 text-white">
+            <Icon name="database" class="size-[18px]" />
+          </span>
+          WP <span class="text-accent-2">SSH</span> Backup
+        </div>
+        <p class="muted mt-3 text-sm leading-relaxed">
+          Automated, secure, and reliable backups for your WordPress site. Free and open
+          source under the GPLv3.
+        </p>
+        <p class="muted mt-4 font-mono text-xs">v{version}</p>
+      </div>
+
+      <div class="grid grid-cols-2 gap-8 text-sm sm:grid-cols-3">
+        <div>
+          <h2 class="mb-3 text-xs font-semibold uppercase tracking-[0.14em] text-[var(--muted)]">
+            Project
+          </h2>
+          <ul class="space-y-2">
+            <li><a class="muted hover:text-[var(--page-fg)]" href={site.repo}>GitHub repository</a></li>
+            <li><a class="muted hover:text-[var(--page-fg)]" href={site.releases}>Releases</a></li>
+            <li><a class="muted hover:text-[var(--page-fg)]" href={site.changelog}>Changelog</a></li>
+            <li><a class="muted hover:text-[var(--page-fg)]" href={site.issues}>Report an issue</a></li>
+          </ul>
+        </div>
+        <div>
+          <h2 class="mb-3 text-xs font-semibold uppercase tracking-[0.14em] text-[var(--muted)]">
+            Documentation
+          </h2>
+          <ul class="space-y-2">
+            <li><a class="muted hover:text-[var(--page-fg)]" href={site.docs}>README</a></li>
+            <li><a class="muted hover:text-[var(--page-fg)]" href={`${site.docs}#configuration`}>Configuration</a></li>
+            <li><a class="muted hover:text-[var(--page-fg)]" href={`${site.docs}#restoring`}>Restoring</a></li>
+            <li><a class="muted hover:text-[var(--page-fg)]" href={`${site.docs}#scheduling`}>Scheduling</a></li>
+          </ul>
+        </div>
+        <div>
+          <h2 class="mb-3 text-xs font-semibold uppercase tracking-[0.14em] text-[var(--muted)]">
+            Legal
+          </h2>
+          <ul class="space-y-2">
+            <li><a class="muted hover:text-[var(--page-fg)]" href={site.licence}>GPLv3 licence</a></li>
+            <li><a class="muted hover:text-[var(--page-fg)]" href={site.repo}>Source code</a></li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+    <div
+      class="mt-10 flex flex-col gap-3 border-t border-[var(--border)] pt-6 text-xs text-[var(--muted)] sm:flex-row sm:items-center sm:justify-between"
+    >
+      <p>
+        © {year}
+        <a class="prose-link" href={site.authorUrl} rel="me">{site.author}</a>.
+        Released under the GNU General Public License v3.
+      </p>
+      <p>
+        Built with <a class="prose-link" href="https://astro.build">Astro</a> and
+        <a class="prose-link" href="https://tailwindcss.com">Tailwind CSS</a>.
+      </p>
+    </div>
+  </div>
+</footer>

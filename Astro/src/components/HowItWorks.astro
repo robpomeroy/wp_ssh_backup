@@ -1,0 +1,52 @@
+---
+import Icon from './ui/Icon.astro';
+import { steps } from '../lib/site';
+---
+
+<section
+  id="how-it-works"
+  class="scroll-mt-24 border-y border-[var(--border)] bg-[var(--surface)]/40 py-20 sm:py-28"
+>
+  <div class="mx-auto max-w-6xl px-5 sm:px-8">
+    <div class="max-w-2xl">
+      <p class="eyebrow">How it works</p>
+      <h2 class="mt-3 text-3xl font-bold sm:text-4xl">Four steps, no surprises</h2>
+      <p class="muted-strong mt-4 text-base leading-relaxed sm:text-lg">
+        Every run follows the same path. If any step fails, the run fails loudly and
+        nothing half-verified is ever published as a backup.
+      </p>
+    </div>
+
+    <ol class="mt-12 grid gap-5 md:grid-cols-2 lg:grid-cols-4">
+      {
+        steps.map((step, index) => (
+          <li class="relative rounded-2xl border border-[var(--border)] bg-[var(--page-bg)]/60 p-6">
+            <span class="font-mono text-xs font-semibold text-accent-2">
+              0{index + 1}
+            </span>
+            <h3 class="mt-3 text-base font-semibold">{step.title}</h3>
+            <p class="muted mt-2 text-sm leading-relaxed">{step.body}</p>
+            {index < steps.length - 1 && (
+              <Icon
+                name="arrow"
+                class="absolute -right-3 top-1/2 hidden size-5 -translate-y-1/2 text-[var(--muted)] lg:block"
+              />
+            )}
+          </li>
+        ))
+      }
+    </ol>
+
+    <div class="mt-10 flex flex-wrap items-center gap-3 rounded-2xl border border-[var(--border)] bg-[var(--page-bg)]/60 px-5 py-4">
+      <Icon name="terminal" class="size-5 shrink-0 text-accent-2" />
+      <p class="text-sm text-[var(--muted-strong)]">
+        Backups are named
+        <code class="rounded bg-[var(--surface-2)] px-1.5 py-0.5 font-mono text-xs">wp-files-&lt;id&gt;.tar.gz</code>
+        and
+        <code class="rounded bg-[var(--surface-2)] px-1.5 py-0.5 font-mono text-xs">wp-db-&lt;id&gt;.tar.gz</code>,
+        where the id is a UTC timestamp plus a random suffix — so two runs in the same
+        minute can never overwrite each other.
+      </p>
+    </div>
+  </div>
+</section>
