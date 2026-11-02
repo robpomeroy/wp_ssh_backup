@@ -48,7 +48,7 @@ export const features: Feature[] = [
   },
   {
     title: 'Atomic publication',
-    body: 'Verified downloads are published under their final names with a no-replace operation, so a concurrent run or a local attacker can never overwrite a good backup.',
+    body: 'Verified downloads are published under their final names with a no-replace operation, so a concurrent run can never overwrite a good backup.',
     icon: 'lock',
   },
   {
