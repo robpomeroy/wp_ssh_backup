@@ -1,0 +1,50 @@
+---
+import Icon from './ui/Icon.astro';
+import { configRows, site } from '../lib/site';
+---
+
+<section
+  id="configuration"
+  class="scroll-mt-24 border-y border-[var(--border)] bg-[var(--surface)]/40 py-20 sm:py-28"
+>
+  <div class="mx-auto max-w-6xl px-5 sm:px-8">
+    <div class="grid gap-10 lg:grid-cols-[0.85fr_1.15fr] lg:gap-14">
+      <div>
+        <p class="eyebrow">Configuration</p>
+        <h2 class="mt-3 text-3xl font-bold sm:text-4xl">One small <code class="font-mono text-2xl">.env</code></h2>
+        <p class="muted-strong mt-4 text-base leading-relaxed">
+          Everything is configured in a single file. No database, no daemon, no web
+          interface to secure.
+        </p>
+        <a href={`${site.docs}#configuration`} class="prose-link mt-5 inline-flex items-center gap-1.5 text-sm">
+          Full configuration reference
+          <Icon name="external" class="size-3.5" />
+        </a>
+      </div>
+
+      <div class="overflow-hidden rounded-2xl border border-[var(--border)] bg-[var(--page-bg)]/60">
+        <table class="w-full text-left text-sm">
+          <caption class="sr-only">Environment variables read from the .env file</caption>
+          <thead>
+            <tr class="border-b border-[var(--border)] text-xs uppercase tracking-[0.12em] text-[var(--muted)]">
+              <th scope="col" class="px-5 py-3 font-semibold">Setting</th>
+              <th scope="col" class="px-5 py-3 font-semibold">Description</th>
+            </tr>
+          </thead>
+          <tbody>
+            {
+              configRows.map(([key, description]) => (
+                <tr class="border-b border-[var(--border)] last:border-0">
+                  <th scope="row" class="whitespace-nowrap px-5 py-3 font-mono text-xs font-medium text-accent-2">
+                    {key}
+                  </th>
+                  <td class="muted px-5 py-3 text-xs leading-relaxed">{description}</td>
+                </tr>
+              ))
+            }
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</section>

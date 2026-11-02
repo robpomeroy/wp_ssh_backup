@@ -1,0 +1,77 @@
+---
+type Props = {
+  title?: string;
+  /** The snippet to display and copy. */
+  code: string;
+  class?: string;
+};
+
+const { title = 'bash', code, class: className = '' } = Astro.props;
+
+const escape = (value: string) =>
+  value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+// Highlight whole-line comments and shell prompts. Built as a string because
+// Astro's template compiler mangles literal newlines inside a mapped slot.
+const highlighted = code
+  .replace(/\s+$/, '')
+  .split('\n')
+  .map((line) => {
+    const trimmed = line.trimStart();
+    const text = escape(line);
+    if (trimmed.startsWith('#')) return `<span class="comment">${text}</span>`;
+    if (/^[$>]\s/.test(trimmed)) return `<span class="prompt">${text}</span>`;
+    return text;
+  })
+  .join('\n');
+---
+
+<div class={`terminal ${className}`}>
+  <div class="terminal-bar">
+    <span class="terminal-dot bg-[#ff5f57]"></span>
+    <span class="terminal-dot bg-[#febc2e]"></span>
+    <span class="terminal-dot bg-[#28c840]"></span>
+    <span class="ml-2 font-mono text-[0.7rem] text-[#6b8299]">{title}</span>
+    <button
+      type="button"
+      class="copy-btn ml-auto flex items-center gap-1.5 rounded-md px-2 py-1 font-mono text-[0.7rem] text-[#8fa3b8] transition hover:bg-white/5 hover:text-white"
+      data-copy={code}
+      aria-label="Copy to clipboard"
+    >
+      <svg
+        class="size-3.5"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        stroke-width="1.8"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+        aria-hidden="true"
+      >
+        <path d="M9 9h10v10H9z"></path>
+        <path d="M5 15V5h10"></path>
+      </svg>
+      <span class="copy-label">Copy</span>
+    </button>
+  </div>
+  <pre><code set:html={highlighted} /></pre>
+</div>
+
+<script>
+  document.querySelectorAll<HTMLButtonElement>('.copy-btn').forEach((button) => {
+    button.addEventListener('click', async () => {
+      const text = button.dataset.copy ?? '';
+      const label = button.querySelector('.copy-label');
+
+      try {
+        await navigator.clipboard.writeText(text);
+        if (label) {
+          label.textContent = 'Copied';
+          setTimeout(() => (label.textContent = 'Copy'), 1600);
+        }
+      } catch {
+        if (label) label.textContent = 'Press Ctrl+C';
+      }
+    });
+  });
+</script>

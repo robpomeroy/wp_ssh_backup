@@ -1,0 +1,34 @@
+---
+import Base from '../layouts/Base.astro';
+import Nav from '../components/Nav.astro';
+import Hero from '../components/Hero.astro';
+import TrustBar from '../components/TrustBar.astro';
+import FeatureGrid from '../components/FeatureGrid.astro';
+import HowItWorks from '../components/HowItWorks.astro';
+import QuickStart from '../components/QuickStart.astro';
+import ConfigTable from '../components/ConfigTable.astro';
+import SecurityNote from '../components/SecurityNote.astro';
+import Faq from '../components/Faq.astro';
+import DownloadCta from '../components/DownloadCta.astro';
+import Footer from '../components/Footer.astro';
+import { getRelease, formatDate } from '../lib/releases';
+
+const release = await getRelease();
+const publishedAt = formatDate(release.publishedAt);
+---
+
+<Base version={release.version}>
+  <Nav version={release.version} />
+  <main id="main">
+    <Hero version={release.version} publishedAt={publishedAt} />
+    <TrustBar />
+    <FeatureGrid />
+    <HowItWorks />
+    <QuickStart version={release.version} />
+    <ConfigTable />
+    <SecurityNote />
+    <Faq />
+    <DownloadCta release={release} />
+  </main>
+  <Footer version={release.version} />
+</Base>

@@ -1,0 +1,39 @@
+---
+import Icon from './ui/Icon.astro';
+---
+
+<button
+  type="button"
+  id="theme-toggle"
+  class="grid size-10 place-items-center rounded-xl border border-[var(--border)] bg-[color-mix(in_oklab,var(--surface)_70%,transparent)] text-[var(--muted-strong)] transition hover:text-[var(--page-fg)]"
+  aria-label="Switch colour theme"
+  title="Switch colour theme"
+>
+  <span class="theme-icon-dark"><Icon name="moon" class="size-[18px]" /></span>
+  <span class="theme-icon-light hidden"><Icon name="sun" class="size-[18px]" /></span>
+</button>
+
+<script>
+  const root = document.documentElement;
+  const button = document.getElementById('theme-toggle');
+
+  function sync() {
+    const light = root.dataset.theme === 'light';
+    button?.querySelector<HTMLElement>('.theme-icon-dark')?.classList.toggle('hidden', light);
+    button?.querySelector<HTMLElement>('.theme-icon-light')?.classList.toggle('hidden', !light);
+    button?.setAttribute('aria-pressed', String(light));
+  }
+
+  button?.addEventListener('click', () => {
+    const next = root.dataset.theme === 'light' ? 'dark' : 'light';
+    root.dataset.theme = next;
+    try {
+      localStorage.setItem('theme', next);
+    } catch {
+      /* ignore */
+    }
+    sync();
+  });
+
+  sync();
+</script>

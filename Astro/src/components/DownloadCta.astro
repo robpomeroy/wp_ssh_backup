@@ -1,0 +1,148 @@
+---
+import Icon from './ui/Icon.astro';
+import CodeBlock from './ui/CodeBlock.astro';
+import { site } from '../lib/site';
+import { platforms, downloadUrl, checksumUrl, type Release } from '../lib/releases';
+
+type Props = { release: Release };
+const { release } = Astro.props;
+
+const companions = [
+  { name: 'wp-ssh-backup-restore', purpose: 'Restore files and database from a backup set' },
+  { name: 'wp-ssh-backup-authorize-host', purpose: 'Fetch and record a server host key' },
+] as const;
+
+const suffixes = [
+  { id: 'linux-x64', label: 'Linux x86-64' },
+  { id: 'windows-x64.exe', label: 'Windows x86-64' },
+  { id: 'macos-arm64', label: 'macOS Apple silicon' },
+  { id: 'macos-x64', label: 'macOS Intel' },
+] as const;
+
+const companionRows = companions.map((companion) => ({
+  ...companion,
+  files: suffixes.map((suffix) => {
+    const name = `${companion.name}-${suffix.id}`;
+    const asset = release.assets.find((a) => a.name === name);
+    return { label: suffix.label, url: asset?.url ?? null };
+  }),
+}));
+
+const verifySnippet = `# Linux
+$ sha256sum --check wp-ssh-backup-linux-x64.sha256
+
+# macOS
+$ shasum -a 256 --check wp-ssh-backup-macos-arm64.sha256
+
+# Windows
+> certutil -hashfile wp-ssh-backup-windows-x64.exe SHA256`;
+---
+
+<section id="download" class="scroll-mt-24 px-5 pb-24 sm:px-8">
+  <div
+    class="relative mx-auto max-w-6xl overflow-hidden rounded-3xl border border-[var(--border)] bg-[var(--surface)] p-8 sm:p-12"
+  >
+    <div
+      class="pointer-events-none absolute -right-24 -top-24 size-72 rounded-full bg-brand/20 blur-3xl"
+      aria-hidden="true"
+    >
+    </div>
+    <div
+      class="pointer-events-none absolute -bottom-32 -left-20 size-72 rounded-full bg-accent/15 blur-3xl"
+      aria-hidden="true"
+    >
+    </div>
+
+    <div class="relative grid gap-10 lg:grid-cols-[1fr_1.1fr] lg:gap-14">
+      <div>
+        <p class="eyebrow">Download</p>
+        <h2 class="mt-3 text-3xl font-bold sm:text-4xl">Get WP SSH Backup v{release.version}</h2>
+        <p class="muted-strong mt-4 text-base leading-relaxed">
+          Standalone executables — no Python installation needed. Each release also
+          publishes <code class="font-mono text-sm">.sha256</code> files so you can verify
+          a download before running it.
+        </p>
+
+        <div class="mt-6 flex flex-wrap gap-3">
+          <a href={release.htmlUrl} class="btn btn-primary">
+            <Icon name="download" class="size-4" /> All releases
+          </a>
+          <a href={site.repo} class="btn btn-ghost">
+            <Icon name="github" class="size-4" /> Source code
+          </a>
+        </div>
+
+        <p class="muted mt-4 text-xs">
+          Licensed under the GPLv3. Free to use, extend and redistribute.
+        </p>
+      </div>
+
+      <div>
+        <ul class="grid gap-3 sm:grid-cols-2">
+          {
+            platforms.map((platform) => {
+              const href = downloadUrl(release, platform);
+              const checksum = checksumUrl(release, platform);
+              return (
+                <li class="rounded-xl border border-[var(--border)] bg-[var(--page-bg)]/60 p-4">
+                  <div class="flex items-baseline justify-between gap-2">
+                    <span class="text-sm font-semibold">{platform.label}</span>
+                    <span class="muted font-mono text-[0.7rem]">{platform.arch}</span>
+                  </div>
+                  <p class="muted mt-1 text-[0.7rem] leading-relaxed">{platform.requirement}</p>
+                  <a
+                    href={href}
+                    class="mt-3 inline-flex items-center gap-1.5 text-xs font-semibold text-accent-2 hover:underline"
+                  >
+                    <Icon name="download" class="size-3.5" />
+                    Download
+                  </a>
+                  {checksum && (
+                    <a
+                      href={checksum}
+                      class="muted ml-3 inline-flex items-center gap-1 text-[0.7rem] hover:text-[var(--page-fg)]"
+                    >
+                      .sha256
+                    </a>
+                  )}
+                </li>
+              );
+            })
+          }
+        </ul>
+
+        <CodeBlock title="verify a download" code={verifySnippet} class="mt-4" />
+
+        <div class="mt-4 rounded-xl border border-[var(--border)] bg-[var(--page-bg)]/60 p-4">
+          <h3 class="text-xs font-semibold uppercase tracking-[0.12em] text-[var(--muted)]">
+            Also in every release
+          </h3>
+          <ul class="mt-3 space-y-3">
+            {
+              companionRows.map((row) => (
+                <li>
+                  <p class="font-mono text-[0.7rem] text-accent-2">{row.name}</p>
+                  <p class="muted mt-0.5 text-[0.7rem]">{row.purpose}</p>
+                  <p class="mt-1.5 flex flex-wrap gap-x-3 gap-y-1">
+                    {row.files.map((file) =>
+                      file.url ? (
+                        <a
+                          href={file.url}
+                          class="text-[0.7rem] text-[var(--muted-strong)] underline decoration-dotted underline-offset-2 hover:text-[var(--page-fg)]"
+                        >
+                          {file.label}
+                        </a>
+                      ) : (
+                        <span class="text-[0.7rem] text-[var(--muted)]">{file.label}</span>
+                      ),
+                    )}
+                  </p>
+                </li>
+              ))
+            }
+          </ul>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>

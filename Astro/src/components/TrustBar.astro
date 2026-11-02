@@ -1,0 +1,30 @@
+---
+import Icon from './ui/Icon.astro';
+
+const items = [
+  { icon: 'shield', title: 'Secure', body: 'Uses SSH for encrypted transfers.' },
+  { icon: 'clock', title: 'Automated', body: 'Set it and forget it.' },
+  { icon: 'database', title: 'Complete', body: 'Backs up your database, files, and more.' },
+  { icon: 'github', title: 'Open Source', body: 'Free to use, extend, and improve.' },
+] as const;
+---
+
+<section class="border-y border-[var(--border)] bg-[var(--surface)]/50">
+  <div class="mx-auto max-w-6xl px-5 py-10 sm:px-8">
+    <ul class="grid grid-cols-2 gap-8 sm:grid-cols-4">
+      {
+        items.map((item) => (
+          <li class="flex items-start gap-3">
+            <span class="mt-0.5 grid size-9 shrink-0 place-items-center rounded-lg bg-accent/12 text-accent-2">
+              <Icon name={item.icon} class="size-[18px]" />
+            </span>
+            <div>
+              <h2 class="text-sm font-semibold">{item.title}</h2>
+              <p class="muted mt-1 text-xs leading-relaxed">{item.body}</p>
+            </div>
+          </li>
+        ))
+      }
+    </ul>
+  </div>
+</section>

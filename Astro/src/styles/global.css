@@ -1,0 +1,332 @@
+@import 'tailwindcss';
+
+/* Latin subsets only: the full packages ship Cyrillic, Greek and Vietnamese
+   files that this site never renders. */
+@font-face {
+  font-family: 'Inter Variable';
+  font-style: normal;
+  font-display: swap;
+  font-weight: 100 900;
+  src: url('@fontsource-variable/inter/files/inter-latin-wght-normal.woff2')
+    format('woff2-variations');
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA,
+    U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193,
+    U+2212, U+2215, U+FEFF, U+FFFD;
+}
+
+@font-face {
+  font-family: 'JetBrains Mono Variable';
+  font-style: normal;
+  font-display: swap;
+  font-weight: 100 800;
+  src: url('@fontsource-variable/jetbrains-mono/files/jetbrains-mono-latin-wght-normal.woff2')
+    format('woff2-variations');
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA,
+    U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193,
+    U+2212, U+2215, U+FEFF, U+FFFD;
+}
+
+/* Dark is the default; the light theme is opted into with data-theme="light". */
+@custom-variant light (&:where([data-theme='light'], [data-theme='light'] *));
+
+@theme {
+  --font-sans: 'Inter Variable', ui-sans-serif, system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono Variable', ui-monospace, SFMono-Regular, monospace;
+
+  --color-ink: #0b1626;
+  --color-ink-2: #0f1e33;
+  --color-navy: #16283f;
+  --color-navy-2: #1d3450;
+  --color-brand: #1e6fd9;
+  --color-brand-2: #4a92f0;
+  --color-accent: #22a45d;
+  --color-accent-2: #34c47a;
+  --color-mist: #f4f8fc;
+  --color-slate: #8fa3b8;
+  --color-slate-2: #b6c6d6;
+
+  --radius-xl2: 1.25rem;
+
+  --shadow-glow: 0 0 0 1px rgb(255 255 255 / 0.06), 0 24px 60px -20px rgb(0 0 0 / 0.7);
+  --shadow-lift: 0 18px 40px -18px rgb(11 22 38 / 0.45);
+}
+
+@layer base {
+  :root {
+    color-scheme: dark;
+    --page-bg: var(--color-ink);
+    --page-fg: #e8eef6;
+    --surface: var(--color-navy);
+    --surface-2: var(--color-navy-2);
+    --border: rgb(255 255 255 / 0.09);
+    --muted: var(--color-slate);
+    --muted-strong: var(--color-slate-2);
+  }
+
+  [data-theme='light'] {
+    color-scheme: light;
+    --page-bg: var(--color-mist);
+    --page-fg: #0d1b2a;
+    --surface: #ffffff;
+    --surface-2: #eef4fb;
+    --border: rgb(13 27 42 / 0.1);
+    --muted: #5b7189;
+    --muted-strong: #3d5468;
+  }
+
+  html {
+    scroll-behavior: smooth;
+    scroll-padding-top: 5.5rem;
+    -webkit-text-size-adjust: 100%;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    html {
+      scroll-behavior: auto;
+    }
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.001ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.001ms !important;
+    }
+  }
+
+  body {
+    background-color: var(--page-bg);
+    color: var(--page-fg);
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  ::selection {
+    background: color-mix(in oklab, var(--color-accent) 35%, transparent);
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--color-accent-2);
+    outline-offset: 3px;
+    border-radius: 4px;
+  }
+
+  h1,
+  h2,
+  h3 {
+    letter-spacing: -0.025em;
+    text-wrap: balance;
+  }
+
+  p {
+    text-wrap: pretty;
+  }
+}
+
+@layer components {
+  .surface {
+    background-color: var(--surface);
+    border: 1px solid var(--border);
+  }
+
+  .muted {
+    color: var(--muted);
+  }
+
+  .muted-strong {
+    color: var(--muted-strong);
+  }
+
+  .hairline {
+    border-color: var(--border);
+  }
+
+  /* Hero backdrop: navy wash, radial glow, faint grid. */
+  .hero-backdrop {
+    background:
+      radial-gradient(60rem 32rem at 78% -10%, rgb(30 111 217 / 0.28), transparent 70%),
+      radial-gradient(42rem 26rem at 12% 8%, rgb(34 164 93 / 0.16), transparent 72%),
+      linear-gradient(180deg, var(--color-ink) 0%, var(--color-ink-2) 55%, var(--page-bg) 100%);
+  }
+
+  [data-theme='light'] .hero-backdrop {
+    background:
+      radial-gradient(60rem 32rem at 78% -10%, rgb(30 111 217 / 0.16), transparent 70%),
+      radial-gradient(42rem 26rem at 12% 8%, rgb(34 164 93 / 0.12), transparent 72%),
+      linear-gradient(180deg, #ffffff 0%, var(--color-mist) 60%, var(--page-bg) 100%);
+  }
+
+  .hero-grid {
+    background-image:
+      linear-gradient(to right, rgb(255 255 255 / 0.045) 1px, transparent 1px),
+      linear-gradient(to bottom, rgb(255 255 255 / 0.045) 1px, transparent 1px);
+    background-size: 64px 64px;
+    mask-image: radial-gradient(70% 60% at 50% 0%, #000 20%, transparent 100%);
+  }
+
+  [data-theme='light'] .hero-grid {
+    background-image:
+      linear-gradient(to right, rgb(13 27 42 / 0.05) 1px, transparent 1px),
+      linear-gradient(to bottom, rgb(13 27 42 / 0.05) 1px, transparent 1px);
+  }
+
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.5rem;
+    border-radius: 0.75rem;
+    padding: 0.75rem 1.25rem;
+    font-size: 0.9375rem;
+    font-weight: 600;
+    line-height: 1;
+    transition:
+      transform 160ms ease,
+      background-color 160ms ease,
+      border-color 160ms ease,
+      box-shadow 160ms ease;
+  }
+
+  .btn:hover {
+    transform: translateY(-1px);
+  }
+
+  .btn-primary {
+    background: linear-gradient(180deg, var(--color-accent-2), var(--color-accent));
+    color: #04140b;
+    box-shadow: 0 10px 30px -12px rgb(34 164 93 / 0.8);
+  }
+
+  .btn-primary:hover {
+    box-shadow: 0 14px 36px -12px rgb(34 164 93 / 0.95);
+  }
+
+  .btn-ghost {
+    background-color: color-mix(in oklab, var(--surface) 70%, transparent);
+    border: 1px solid var(--border);
+    color: var(--page-fg);
+  }
+
+  .btn-ghost:hover {
+    border-color: color-mix(in oklab, var(--color-brand-2) 55%, transparent);
+  }
+
+  .card {
+    background-color: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-xl2);
+    transition:
+      border-color 200ms ease,
+      transform 200ms ease,
+      box-shadow 200ms ease;
+  }
+
+  .card:hover {
+    border-color: color-mix(in oklab, var(--color-brand-2) 40%, var(--border));
+    transform: translateY(-2px);
+    box-shadow: var(--shadow-lift);
+  }
+
+  .chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+    background-color: color-mix(in oklab, var(--surface) 60%, transparent);
+    padding: 0.3rem 0.7rem;
+    font-size: 0.8125rem;
+    color: var(--muted-strong);
+  }
+
+  .eyebrow {
+    font-size: 0.75rem;
+    font-weight: 700;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--color-accent-2);
+  }
+
+  /* Terminal card used for the quick-start snippets. */
+  .terminal {
+    border-radius: 0.9rem;
+    border: 1px solid rgb(255 255 255 / 0.1);
+    background: #07101c;
+    overflow: hidden;
+  }
+
+  .terminal-bar {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    border-bottom: 1px solid rgb(255 255 255 / 0.08);
+    background: #0b1626;
+    padding: 0.55rem 0.85rem;
+  }
+
+  .terminal-dot {
+    width: 0.6rem;
+    height: 0.6rem;
+    border-radius: 999px;
+  }
+
+  .terminal pre {
+    margin: 0;
+    overflow-x: auto;
+    padding: 1rem 1.1rem;
+    font-family: var(--font-mono);
+    font-size: 0.8125rem;
+    line-height: 1.7;
+    color: #d7e3f2;
+  }
+
+  .terminal .prompt {
+    color: var(--color-accent-2);
+    user-select: none;
+  }
+
+  .terminal .comment {
+    color: #6b8299;
+  }
+
+  .prose-link {
+    color: var(--color-brand-2);
+    text-decoration: underline;
+    text-decoration-color: color-mix(in oklab, var(--color-brand-2) 40%, transparent);
+    text-underline-offset: 3px;
+  }
+
+  .prose-link:hover {
+    text-decoration-color: currentColor;
+  }
+}
+
+@layer utilities {
+  .reveal {
+    animation: reveal 700ms cubic-bezier(0.22, 1, 0.36, 1) both;
+  }
+
+  .reveal-1 {
+    animation-delay: 80ms;
+  }
+  .reveal-2 {
+    animation-delay: 160ms;
+  }
+  .reveal-3 {
+    animation-delay: 240ms;
+  }
+  .reveal-4 {
+    animation-delay: 320ms;
+  }
+
+  @keyframes reveal {
+    from {
+      opacity: 0;
+      transform: translateY(14px);
+    }
+    to {
+      opacity: 1;
+      transform: none;
+    }
+  }
+}

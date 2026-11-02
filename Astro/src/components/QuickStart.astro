@@ -1,0 +1,170 @@
+---
+import Icon from './ui/Icon.astro';
+import CodeBlock from './ui/CodeBlock.astro';
+import { site } from '../lib/site';
+
+type Props = { version: string };
+const { version } = Astro.props;
+
+const binarySnippet = `# 1. Download the binary for your platform from the releases page
+#    https://github.com/robpomeroy/wp_ssh_backup/releases
+
+# 2. Make it executable (Linux and macOS)
+$ chmod +x wp-ssh-backup-linux-x64
+
+# 3. Put your .env next to the binary, then authorise the server's host key
+$ ./wp-ssh-backup-authorize-host-linux-x64
+
+# 4. Take your first backup
+$ ./wp-ssh-backup-linux-x64 --all`;
+
+const sourceSnippet = `$ git clone https://github.com/robpomeroy/wp_ssh_backup.git
+$ cd wp_ssh_backup
+
+$ python -m venv .venv
+$ source .venv/bin/activate      # Windows: .venv\\Scripts\\Activate.ps1
+
+$ pip install -r requirements.txt
+$ cp .env.example .env           # then edit .env
+
+$ python authorize_host.py       # trust the server's host key
+$ python backup.py --all`;
+
+const envSnippet = `SSH_HOST=example.com
+SSH_PORT=22
+SSH_USER=myuser
+SSH_KEY_PATH=~/.ssh/id_ed25519
+WP_SITE_ROOT=/home/myuser/public_html
+BACKUP_DIR=./backups
+RETENTION_DAYS=30`;
+---
+
+<section id="quick-start" class="mx-auto max-w-6xl scroll-mt-24 px-5 py-20 sm:px-8 sm:py-28">
+  <div class="max-w-2xl">
+    <p class="eyebrow">Quick start</p>
+    <h2 class="mt-3 text-3xl font-bold sm:text-4xl">Running in under five minutes</h2>
+    <p class="muted-strong mt-4 text-base leading-relaxed sm:text-lg">
+      Grab a standalone binary and skip Python entirely, or run it from a source
+      checkout. Either way, authorise your server's host key first — WP SSH Backup
+      refuses servers it has not been told to trust.
+    </p>
+  </div>
+
+  <div class="mt-10" data-tabs>
+    <div
+      class="inline-flex rounded-xl border border-[var(--border)] bg-[var(--surface)] p-1"
+      role="tablist"
+      aria-label="Installation method"
+    >
+      <button
+        type="button"
+        role="tab"
+        id="tab-binary"
+        aria-controls="panel-binary"
+        aria-selected="true"
+        data-tab="binary"
+        class="tab rounded-lg px-4 py-2 text-sm font-medium transition"
+      >
+        Standalone binary
+      </button>
+      <button
+        type="button"
+        role="tab"
+        id="tab-source"
+        aria-controls="panel-source"
+        aria-selected="false"
+        data-tab="source"
+        class="tab rounded-lg px-4 py-2 text-sm font-medium transition"
+      >
+        From source
+      </button>
+    </div>
+
+    <div
+      id="panel-binary"
+      role="tabpanel"
+      aria-labelledby="tab-binary"
+      data-panel="binary"
+      class="mt-6 grid gap-6 lg:grid-cols-[1.15fr_1fr]"
+    >
+      <CodeBlock title="terminal — standalone binary" code={binarySnippet} />
+
+      <div class="card p-6">
+        <h3 class="text-base font-semibold">What you need</h3>
+        <ul class="mt-4 space-y-3 text-sm">
+          <li class="flex gap-2.5">
+            <Icon name="check" class="mt-0.5 size-4 shrink-0 text-accent-2" />
+            <span class="muted-strong">SSH access to your WordPress host, ideally with key authentication.</span>
+          </li>
+          <li class="flex gap-2.5">
+            <Icon name="check" class="mt-0.5 size-4 shrink-0 text-accent-2" />
+            <span class="muted-strong">GNU tar, gzip and sha256sum on the server — standard on virtually every Linux host.</span>
+          </li>
+          <li class="flex gap-2.5">
+            <Icon name="check" class="mt-0.5 size-4 shrink-0 text-accent-2" />
+            <span class="muted-strong">WP-CLI or mysqldump for database backups.</span>
+          </li>
+          <li class="flex gap-2.5">
+            <Icon name="check" class="mt-0.5 size-4 shrink-0 text-accent-2" />
+            <span class="muted-strong">A <code class="font-mono text-xs">.env</code> file — the binary looks in the working directory first, then beside itself.</span>
+          </li>
+        </ul>
+        <a
+          href={site.latestRelease}
+          class="btn btn-primary mt-6 w-full"
+        >
+          <Icon name="download" class="size-4" /> Download v{version}
+        </a>
+      </div>
+    </div>
+
+    <div
+      id="panel-source"
+      role="tabpanel"
+      aria-labelledby="tab-source"
+      data-panel="source"
+      class="mt-6 hidden grid gap-6 lg:grid-cols-[1.15fr_1fr]"
+    >
+      <CodeBlock title="terminal — from source" code={sourceSnippet} />
+
+      <div class="card p-6">
+        <h3 class="text-base font-semibold">A minimal <code class="font-mono text-sm">.env</code></h3>
+        <p class="muted mt-2 text-sm">
+          Copy <code class="font-mono text-xs">.env.example</code> and fill in your values.
+        </p>
+        <CodeBlock title=".env" code={envSnippet} class="mt-4" />
+        <p class="muted mt-4 text-xs leading-relaxed">
+          Requires Python 3.10 or later. Keep <code class="font-mono">.env</code> out of
+          version control — it holds your credentials.
+        </p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<script>
+  const root = document.querySelector<HTMLElement>('[data-tabs]');
+  if (root) {
+    const tabs = [...root.querySelectorAll<HTMLButtonElement>('[data-tab]')];
+    const panels = [...root.querySelectorAll<HTMLElement>('[data-panel]')];
+
+    function select(name: string) {
+      tabs.forEach((tab) => {
+        const active = tab.dataset.tab === name;
+        tab.setAttribute('aria-selected', String(active));
+        tab.classList.toggle('bg-[var(--surface-2)]', active);
+        tab.classList.toggle('text-[var(--page-fg)]', active);
+        tab.classList.toggle('text-[var(--muted)]', !active);
+      });
+      panels.forEach((panel) => {
+        panel.classList.toggle('hidden', panel.dataset.panel !== name);
+      });
+    }
+
+    tabs.forEach((tab) => {
+      tab.addEventListener('click', () => select(tab.dataset.tab ?? 'binary'));
+    });
+
+    select('binary');
+  }
+</script>
